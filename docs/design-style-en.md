@@ -661,12 +661,14 @@ never truncates that text a second time. The fixed-size hint and toast keep thei
 **Empty state.** Centered `caption` text in `text_muted`; no illustration unless the surface is a
 first-run surface (onboarding).
 
-**Keystroke display.** A horizontal stream (bottom/top placement) sizes each keycap to its content
+**Keystroke display.** A chord splits into one keycap per key, in either stream, with no grouping
+tray: a modifier keeps its accent tint and the key it combines with stays neutral, and the keycaps
+are separated by the same stream gap as any two presses, so a chord reads as the keys it is made
+of. A horizontal stream (bottom/top placement) sizes each keycap to its content
 with a 32pt minimum so single-glyph keys have visual weight comparable to a Command modifier cell,
-shows a chord's keys side by side inside a slim tray, and appends a merge count inline with no
-separator (`A×99`). A vertical stream (side placement) draws every keycap independently at ONE
-fixed width: a chord splits into one keycap per key (modifiers keep their tint) with no grouping
-tray, so the rail — and the panel behind it — never changes as keys come and go. The drag handle
+and appends a merge count inline with no separator (`A×99`). A vertical stream (side placement)
+draws every keycap independently at ONE fixed width, so the rail — and the panel behind it — never
+changes as keys come and go. The drag handle
 has a transparent 48×20pt hit area (rotated for horizontal streams), larger than its three visible
 dots; it stays localized to the handle rather than making the whole panel draggable. In a column,
 the hit area starts 4pt inside the top edge while the visible dots sit near its outer side, clear
@@ -683,10 +685,10 @@ measured over the **full alpha chain** — backdrop → frost wash (`window_bg` 
 backdrop are the two ends; the light panel lands at `(247,248,250)` over white and `(225,226,228)`
 over black):
 
-| Mode | Keycap fill | Tray behind a chord | Cap vs panel (white / black) | Text on the cap (white / black) |
-| --- | --- | --- | --- | --- |
-| Light | `field_bg` (inset field surface) + `card_border` | `card_bg` + `card_border` | 1.12:1 / 1.11:1 | 11.61 / 9.64 primary, 4.62 / 3.83 muted |
-| Dark | `card_bg` at 80% + `card_border` | `field_bg` + `card_border` | 1.04:1 / 1.19:1 | 12.67 / 13.46 primary, 5.19 / 5.51 muted |
+| Mode | Keycap fill | Cap vs panel (white / black) | Text on the cap (white / black) |
+| --- | --- | --- | --- |
+| Light | `field_bg` (inset field surface) + `card_border` | 1.12:1 / 1.11:1 | 11.61 / 9.64 primary, 4.62 / 3.83 muted |
+| Dark | `card_bg` at 80% + `card_border` | 1.04:1 / 1.19:1 | 12.67 / 13.46 primary, 5.19 / 5.51 muted |
 
 **Keycap text is a recorded class**, not §3.3's 12:1 `text_primary` floor: that floor belongs to text
 on `window_bg` and `card_bg`, which do not move, while a cap sits on a translucent wash and therefore

@@ -2359,7 +2359,16 @@ fn application_reopen_smoke() -> bool {
 /// App entry: the full startup/smoke/run loop (called by the thin bin wrapper; behavior
 /// is unchanged by the lib/bin split).
 pub fn run() {
-    let is_smoke_process = std::env::args().any(|arg| arg.starts_with("--smoke-"));
+    let is_smoke_process = crate::dev_flags::any_prefix("--smoke-");
+    // Every smoke launch runs the isolated clipboard session, so no runner has to remember a
+    // switch: the developer's own config normally has the clipboard enabled, and startup would
+    // otherwise load their real (encrypted) history and read the master key from the login
+    // keychain -- which prompts, because the cargo binary a smoke spawns is not the build the
+    // key item's ACL admits. Smoke mode keeps the history and the image cache in a process-scoped
+    // temporary directory and uses the fixed test key instead (see `clipboard::smoke`).
+    if is_smoke_process {
+        clipboard::set_smoke_mode();
+    }
     // GUI smoke entry points are test subprocesses and may run alongside the development app;
     // every normal launch channel shares one lock.
     let is_gui_smoke_process = std::env::args().any(|arg| {
@@ -2401,9 +2410,8 @@ pub fn run() {
         unsafe {
             let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
             init_app();
-            // Smoke mode: isolate the history/cache into a dedicated directory so the
-            // injected entries can never touch the user's real data.
-            clipboard::set_smoke_mode();
+            // The isolated clipboard session is already on: every `--smoke-*` launch enables it
+            // (see the top of `run`), so injected entries can never touch the user's real data.
             drop(CONFIG.read().unwrap()); // force CONFIG initialization, matching a normal launch
             let ok = clipboard::smoke_runner();
             let _: () = msg_send![pool, drain];

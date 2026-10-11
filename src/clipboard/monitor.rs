@@ -4,6 +4,14 @@ use super::*;
 
 /// Poll once: read the text into history when changeCount changed.
 pub(super) fn poll_clipboard() {
+    // A smoke launch records nothing from the developer's real pasteboard: its history is
+    // encrypted with the fixed test key (published in the source) inside a temporary directory, so
+    // real clipboard content recorded there is readable by anyone. This guard sits here as well as
+    // in `start` because the process-wide observer and the picker's own copy path call this
+    // directly; a smoke that needs entries injects them (`--smoke-clipboard`).
+    if SMOKE_MODE.load(Ordering::SeqCst) {
+        return;
+    }
     // The pasteboard notification may in principle be delivered on another thread; the poll
     // touches AppKit and global UI state, so hop back to the main thread first when needed.
     if !crate::is_main_thread() {
@@ -218,7 +226,14 @@ pub(crate) fn start() {
             expire_entries(&mut hist, now_secs(), ttl_secs());
         }
         // Then record the current pasteboard, or the first summon would show an empty list.
-        poll_clipboard();
+        // A smoke launch does neither that nor the monitoring below: it must not read the real
+        // pasteboard at all (see `poll_clipboard`), so it installs no observer and no timer -- the
+        // tier-A smoke asserts that state. The load, the expiry pass and the picker warm-up still
+        // run, so the storage state and the rows the smokes exercise are unchanged.
+        let smoke = SMOKE_MODE.load(Ordering::SeqCst);
+        if !smoke {
+            poll_clipboard();
+        }
         // Following Maccy's model, warm the long-lived panel and initial row tree while hidden;
         // the shortcut only presents content that is already ready.
         PICKER_REFRESH_PENDING.store(false, Ordering::SeqCst);
@@ -228,6 +243,9 @@ pub(crate) fn start() {
         // first summon does not make orderFrontRegardless pay for the entire list and glass.
         if let Some(window) = *PICKER_WINDOW.lock().unwrap() {
             let _: () = msg_send![window.0, displayIfNeeded];
+        }
+        if smoke {
+            return;
         }
         // Register the pasteboard-change notification: instant recording on every change, so
         // rapid consecutive copies between polling samples are not lost.
@@ -246,6 +264,15 @@ pub(crate) fn start() {
             POLL_INTERVAL
         );
     }
+}
+
+/// Whether this process is monitoring the system pasteboard (the polling timer is installed). A
+/// smoke launch leaves it uninstalled -- see `start` -- which is the state the tier-A smoke asserts.
+pub(super) fn polling_active() -> bool {
+    crate::debug_assert_main_thread();
+    POLL_TIMER
+        .get()
+        .is_some_and(|holder| !holder.lock().unwrap().0.is_null())
 }
 
 /// Stop polling (idempotent).

@@ -1,16 +1,17 @@
-//! The clipboard subsystem's smoke mode: the --smoke-clipboard end-to-end GUI run.
-//! History file and image cache are redirected to a dedicated directory, never
-//! touching real user data.
+//! The clipboard subsystem's smoke mode: every `--smoke-*` launch runs in it, so a smoke
+//! process never reads the developer's keychain or touches their real history. History file,
+//! image cache and purge markers are redirected to a process-scoped temporary directory.
 
 use super::*;
 
-/// Smoke mode (--smoke-clipboard): the history file and the image cache are redirected to
-/// a dedicated directory, never touching real user data (cfg!(test) is off in the real
-/// binary, so this is the only isolation available).
+/// Smoke mode (every `--smoke-*` launch): the history file and the image cache are redirected
+/// to a process-scoped temporary directory and the master key is the fixed test key, never the
+/// login keychain (`cfg!(test)` is off in the real binary, so this is the only isolation
+/// available there).
 pub(super) static SMOKE_MODE: AtomicBool = AtomicBool::new(false);
 
-/// Enable smoke mode (called by main.rs on the --smoke-clipboard branch, before
-/// smoke_runner).
+/// Enable smoke mode (called at the top of `run` for every `--smoke-*` launch, before anything
+/// can read the config, the storage or the keychain).
 pub(crate) fn set_smoke_mode() {
     SMOKE_MODE.store(true, Ordering::SeqCst);
 }

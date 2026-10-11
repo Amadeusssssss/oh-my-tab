@@ -10,11 +10,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::state::{
-    column_display_badges, estimated_stream_width, repeat_suffix_row, Badge, BadgeCell, BadgeKind,
-    Orientation, BADGE_CELL_GAP, BADGE_CELL_INSET_Y, BADGE_CELL_PADDING_X,
-    BADGE_CONTAINER_PADDING_X, BADGE_CONTAINER_PADDING_Y, BADGE_GAP, BADGE_H,
-    BADGE_HORIZONTAL_PADDING, BADGE_MIN_WIDTH, BADGE_REPEAT_SUFFIX_H, KEYCAP_RAIL_W,
-    PANEL_SIDE_PADDING,
+    estimated_stream_width, repeat_suffix_row, split_chord_badges, Badge, BadgeCell, BadgeKind,
+    Orientation, BADGE_GAP, BADGE_H, BADGE_HORIZONTAL_PADDING, BADGE_MIN_WIDTH,
+    BADGE_REPEAT_SUFFIX_H, BADGE_SUFFIX_ROW_INSET_Y, KEYCAP_RAIL_W, PANEL_SIDE_PADDING,
 };
 use crate::config::KeystrokeDisplayPosition;
 use crate::event_tap;
@@ -543,14 +541,11 @@ pub(super) fn render(
             let badge_container = state
                 .badge_container
                 .expect("a created keystroke panel has a badge container");
-            // A column draws every keycap independently: chords are split into one lone
-            // keycap per key (modifiers keep their tint, no grouping tray), so the whole
-            // stream is lone keycaps. A row keeps trayed chord cells.
-            let column_badges = orientation
-                .is_vertical()
-                .then(|| column_display_badges(badges));
-            let display: &[Badge] = column_badges.as_deref().unwrap_or(badges);
-            let labels = badge_labels(display);
+            // Every keycap is drawn independently in either orientation: chords are split into
+            // one lone keycap per key (modifiers keep their tint, no grouping tray), so the
+            // whole stream is lone keycaps whether it runs as a row or as a column.
+            let display = split_chord_badges(badges);
+            let labels = badge_labels(&display);
             let mut extents = Vec::with_capacity(display.len());
             for badge in display.iter() {
                 extents.push(cached_badge_extent(
@@ -775,6 +770,20 @@ pub(super) fn reset() {
 
 pub(super) fn smoke_runner() -> bool {
     crate::debug_assert_main_thread();
+    // This runner is a `--smoke-*` launch, and a smoke launch must not touch the developer's own
+    // clipboard: reading the real keychain prompts for the login password (the cargo binary a smoke
+    // spawns is not the build the key item's ACL admits), and recording the real pasteboard would
+    // write that content into a temporary history encrypted with the test key published in the
+    // source. Assert both here, in a runner that would otherwise do exactly that, so losing the
+    // rule fails a tier-A check instead of a person's password dialog and their clipboard content.
+    let key_provider = crate::clipboard::key_provider_label();
+    let pasteboard_monitored = crate::clipboard::pasteboard_monitor_active();
+    let smoke_process_isolated = key_provider != "keychain" && !pasteboard_monitored;
+    if !smoke_process_isolated {
+        eprintln!(
+            "[keystroke-display-smoke] smoke launch isolation lost: key_provider={key_provider} pasteboard_monitored={pasteboard_monitored}"
+        );
+    }
     // A `--panel-material=` launch switch selects exactly one surface, including development-only ones
     // whose checks (system material present, palette surface painted) describe the shipped materials and
     // not this surface. Structure and geometry are asserted either way; the shipped set is asserted in
@@ -1184,6 +1193,153 @@ pub(super) fn smoke_runner() -> bool {
             }
         })
     };
+    let row_split_valid = {
+        // A row draws the same independent keycaps a column does. The tray this replaced nested
+        // one bordered view per key inside a bordered container, so counting a view's own
+        // subviews is what detects it: a lone keycap holds one label field, two when the merge
+        // count rides it. A row also keeps content-sized keycaps, so neither cap may land on the
+        // column rail width.
+        let chord = Badge {
+            text: "⌥q".into(),
+            kind: BadgeKind::Chord,
+            repeats: 1,
+            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("q".into())],
+        };
+        // Hide first: the panel keeps its size for the rest of a shown session once the stream
+        // has hit the cap, and the earlier rail render is long enough to pin it.
+        let _ = render(
+            &[],
+            false,
+            false,
+            PanelPlacement {
+                display_position: "main",
+                initial_position: "bottom",
+                position: saved_position,
+            },
+            smoke_now,
+            None,
+        );
+        let _ = render(
+            std::slice::from_ref(&chord),
+            true,
+            false,
+            PanelPlacement {
+                display_position: "main",
+                initial_position: "bottom",
+                position: saved_position,
+            },
+            smoke_now,
+            None,
+        );
+        PANEL.with(|panel| {
+            let state = panel.borrow();
+            let Some(container) = state.badge_container else {
+                return false;
+            };
+            unsafe {
+                let views: *mut AnyObject = msg_send![container, subviews];
+                let count: usize = msg_send![views, count];
+                if count != chord.cells.len() {
+                    eprintln!("[keystroke-display-smoke] row count={count} (expected a keycap per key)");
+                    return false;
+                }
+                let mut frames = Vec::with_capacity(count);
+                for index in 0..count {
+                    let view: *mut AnyObject = msg_send![views, objectAtIndex: index as isize];
+                    let frame: NSRect = msg_send![view, frame];
+                    let subs: *mut AnyObject = msg_send![view, subviews];
+                    let sub_count: usize = msg_send![subs, count];
+                    if sub_count == 0 || sub_count > 2 {
+                        eprintln!(
+                            "[keystroke-display-smoke] row view {index} has {sub_count} subviews (tray?)"
+                        );
+                        return false;
+                    }
+                    frames.push(frame);
+                }
+                let side_by_side = frames.len() == 2
+                    && (frames[0].origin.y - frames[1].origin.y).abs() < 0.5
+                    && frames[1].origin.x
+                        >= frames[0].origin.x + frames[0].size.width + BADGE_GAP - 0.5;
+                let content_sized = frames
+                    .iter()
+                    .all(|frame| frame.size.width < KEYCAP_RAIL_W - 0.5);
+                let ok = side_by_side && content_sized;
+                eprintln!(
+                    "[keystroke-display-smoke] row count={count} widths={:?} side_by_side={side_by_side} content_sized={content_sized} ok={ok}",
+                    frames.iter().map(|frame| frame.size.width).collect::<Vec<f64>>()
+                );
+                ok
+            }
+        })
+    };
+    let column_pair_margins_valid = {
+        // A column of two keycaps must sit centered between the panel's ends: the centering unit
+        // test only covers a single keycap, and this stream is two keycaps plus a gap. A panel
+        // pinned by a longer stream is not the shape being measured, hence the hide first.
+        let chord = Badge {
+            text: "⌥q".into(),
+            kind: BadgeKind::Chord,
+            repeats: 1,
+            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("q".into())],
+        };
+        let _ = render(
+            &[],
+            false,
+            false,
+            PanelPlacement {
+                display_position: "main",
+                initial_position: "right",
+                position: saved_position,
+            },
+            smoke_now,
+            None,
+        );
+        let _ = render(
+            std::slice::from_ref(&chord),
+            true,
+            false,
+            PanelPlacement {
+                display_position: "main",
+                initial_position: "right",
+                position: saved_position,
+            },
+            smoke_now,
+            None,
+        );
+        PANEL.with(|panel| {
+            let state = panel.borrow();
+            let Some(container) = state.badge_container else {
+                return false;
+            };
+            unsafe {
+                let views: *mut AnyObject = msg_send![container, subviews];
+                let count: usize = msg_send![views, count];
+                if count != chord.cells.len() {
+                    eprintln!(
+                        "[keystroke-display-smoke] column pair count={count} (expected a keycap per key)"
+                    );
+                    return false;
+                }
+                let bounds: NSRect = msg_send![container, bounds];
+                let mut top = f64::NEG_INFINITY;
+                let mut bottom = f64::INFINITY;
+                for index in 0..count {
+                    let view: *mut AnyObject = msg_send![views, objectAtIndex: index as isize];
+                    let frame: NSRect = msg_send![view, frame];
+                    top = top.max(frame.origin.y + frame.size.height);
+                    bottom = bottom.min(frame.origin.y);
+                }
+                let top_margin = bounds.origin.y + bounds.size.height - top;
+                let bottom_margin = bottom - bounds.origin.y;
+                let ok = (top_margin - bottom_margin).abs() < 0.5;
+                eprintln!(
+                    "[keystroke-display-smoke] column pair count={count} top_margin={top_margin:.1} bottom_margin={bottom_margin:.1} ok={ok}"
+                );
+                ok
+            }
+        })
+    };
     let single_key = Badge {
         text: "J".into(),
         kind: BadgeKind::Chord,
@@ -1254,6 +1410,7 @@ pub(super) fn smoke_runner() -> bool {
     let config_restored = crate::config::flush_config_sync().is_ok();
     reset();
     if !(valid
+        && smoke_process_isolated
         && rail_geometry_valid
         && stream_alignment_valid
         && grip_valid
@@ -1262,11 +1419,14 @@ pub(super) fn smoke_runner() -> bool {
         && (dev_material_forced || theme_refresh_retints_surface))
     {
         crate::log_info!(
-            "[smoke-keystroke-display-panel] which: structure={valid} rail={rail_geometry_valid} stream={stream_alignment_valid} grip={grip_valid} config={config_restored} surface={every_material_paints_its_surface} theme={theme_refresh_retints_surface}"
+            "[smoke-keystroke-display-panel] which: structure={valid} isolated={smoke_process_isolated} rail={rail_geometry_valid} row={row_split_valid} column_pair={column_pair_margins_valid} stream={stream_alignment_valid} grip={grip_valid} config={config_restored} surface={every_material_paints_its_surface} theme={theme_refresh_retints_surface}"
         );
     }
     valid
+        && smoke_process_isolated
         && rail_geometry_valid
+        && row_split_valid
+        && column_pair_margins_valid
         && stream_alignment_valid
         && grip_valid
         && config_restored
@@ -1996,92 +2156,33 @@ struct BadgeExtent {
     thickness: f64,
 }
 
+/// Every badge reaching this point is a lone keycap: chords were already split into one keycap
+/// per key. Its natural size is the same in both orientations, but which of that size is "along
+/// the stream" swaps: a row advances across its width, a column down its height. In a column the
+/// merge count takes its own row below the glyph (the render mirrors it), so the height grows by
+/// that row while the width stays the plain label's; in a row the count rides inline and widens
+/// the cap instead.
 fn cached_badge_extent(
     cache: &mut HashMap<String, f64>,
     badge: &Badge,
     orientation: Orientation,
 ) -> BadgeExtent {
     crate::debug_assert_main_thread();
-    if badge.cells.len() > 1 {
-        // A container holding one keycap per key: side by side in a row, stacked in a column.
-        let cells_width = cached_cells_width(cache, badge);
-        let cells_height = cached_cells_height(cache, badge);
-        if orientation.is_vertical() {
-            let cell_w = badge
-                .cells
-                .iter()
-                .map(|cell| cached_label_width(cache, cell.text()) + BADGE_CELL_PADDING_X * 2.0)
-                .fold(0.0_f64, f64::max);
-            let suffix_w = if badge.repeats > 1 {
-                cached_label_width(cache, &format!("×{}", badge.repeats))
-            } else {
-                0.0
-            };
-            BadgeExtent {
-                length: cells_height,
-                thickness: BADGE_CONTAINER_PADDING_X * 2.0 + cell_w.max(suffix_w),
-            }
-        } else {
-            let thickness = BADGE_H;
-            let _ = cells_height;
-            BadgeExtent {
-                length: cells_width,
-                thickness,
-            }
+    let width = cached_label_width(cache, &badge.text) + BADGE_HORIZONTAL_PADDING;
+    if orientation.is_vertical() {
+        BadgeExtent {
+            length: BADGE_H + repeat_suffix_row(badge.repeats),
+            thickness: width,
         }
     } else {
-        // A lone keycap keeps its natural size in both orientations, but which of that size is
-        // "along the stream" swaps with the orientation: a row advances across its width, a
-        // column down its height. In a column the merge count takes its own row below the
-        // glyph (the render mirrors a chord's suffix row), so the height grows by that row
-        // while the width stays the plain label's.
-        let width = cached_label_width(cache, &badge.text) + BADGE_HORIZONTAL_PADDING;
-        if orientation.is_vertical() {
-            BadgeExtent {
-                length: BADGE_H + repeat_suffix_row(badge.repeats),
-                thickness: width,
-            }
-        } else {
-            let length =
-                (cached_label_width(cache, &badge_display_text(&badge.text, badge.repeats))
-                    + BADGE_HORIZONTAL_PADDING)
-                    .max(BADGE_MIN_WIDTH);
-            BadgeExtent {
-                length,
-                thickness: BADGE_H,
-            }
+        let length = (cached_label_width(cache, &badge_display_text(&badge.text, badge.repeats))
+            + BADGE_HORIZONTAL_PADDING)
+            .max(BADGE_MIN_WIDTH);
+        BadgeExtent {
+            length,
+            thickness: BADGE_H,
         }
     }
-}
-
-fn cached_cells_width(cache: &mut HashMap<String, f64>, badge: &Badge) -> f64 {
-    let mut width = BADGE_CONTAINER_PADDING_X * 2.0;
-    for (index, cell) in badge.cells.iter().enumerate() {
-        if index > 0 {
-            width += BADGE_CELL_GAP;
-        }
-        width += cached_label_width(cache, cell.text()) + BADGE_CELL_PADDING_X * 2.0;
-    }
-    if badge.repeats > 1 {
-        width += BADGE_CELL_GAP + cached_label_width(cache, &format!("×{}", badge.repeats));
-    }
-    width
-}
-
-fn cached_cells_height(cache: &mut HashMap<String, f64>, badge: &Badge) -> f64 {
-    let cell_h = (BADGE_H - BADGE_CELL_INSET_Y * 2.0).max(1.0);
-    let mut height = BADGE_CONTAINER_PADDING_Y * 2.0;
-    for index in 0..badge.cells.len() {
-        if index > 0 {
-            height += BADGE_CELL_GAP;
-        }
-        height += cell_h;
-    }
-    if badge.repeats > 1 {
-        let _ = cache;
-        height += BADGE_CELL_GAP + BADGE_REPEAT_SUFFIX_H;
-    }
-    height
 }
 
 fn cached_label_width(cache: &mut HashMap<String, f64>, label: &str) -> f64 {
@@ -2146,123 +2247,6 @@ unsafe fn add_badge_label(parent: *mut AnyObject, frame: NSRect, text: &str, tex
     CFRelease(title as *const c_void);
     let _: () = msg_send![parent, addSubview: field];
     release_obj(field);
-}
-
-/// Draw the keycap cells of a multi-key badge inside its container, one per key: modifiers keep
-/// the accent tint while the key they combine with stays neutral.
-unsafe fn layout_badge_cells(
-    parent: *mut AnyObject,
-    badge: &Badge,
-    palette: &crate::theme::UiPalette,
-    orientation: Orientation,
-    badge_size: NSSize,
-) {
-    let cell_h = (BADGE_H - BADGE_CELL_INSET_Y * 2.0).max(1.0);
-    let inner_radius = crate::theme::rounded_inset_radius(
-        crate::theme::RADIUS_CONTROL - BADGE_CONTAINER_PADDING_X,
-        100.0,
-        cell_h,
-    );
-    // Each cell keeps its natural keycap size in both orientations; only the axis they advance
-    // along changes. A column therefore holds the same keycaps a row would, stacked.
-    if orientation.is_vertical() {
-        // Center each keycap horizontally in the container so a column of differing widths reads
-        // as one stack rather than a ragged left edge. Coordinates are non-flipped, so the first
-        // keycap sits at the top and each subsequent one steps down; the repeat suffix, when
-        // present, takes the row below the stack.
-        let mut y = badge_size.height - BADGE_CONTAINER_PADDING_Y - cell_h;
-        for cell in &badge.cells {
-            let cell_w = (measure_text_width(cell.text()) + BADGE_CELL_PADDING_X * 2.0)
-                .min((badge_size.width - BADGE_CONTAINER_PADDING_X * 2.0).max(1.0));
-            let x = (badge_size.width - cell_w) / 2.0;
-            add_badge_cell(
-                parent,
-                cell,
-                NSRect::new(NSPoint::new(x, y), NSSize::new(cell_w, cell_h)),
-                inner_radius,
-                palette,
-            );
-            y -= cell_h + BADGE_CELL_GAP;
-        }
-        if badge.repeats > 1 {
-            let suffix = format!("×{}", badge.repeats);
-            // Full-width centered field: a frame of exactly the measured text width clips
-            // the count's last digit (the text cell keeps a small inset of its own).
-            add_badge_label(
-                parent,
-                NSRect::new(
-                    NSPoint::new(0.0, BADGE_CONTAINER_PADDING_Y),
-                    NSSize::new(badge_size.width, BADGE_REPEAT_SUFFIX_H),
-                ),
-                &suffix,
-                palette.muted_text,
-            );
-        }
-        return;
-    }
-    let mut x = BADGE_CONTAINER_PADDING_X;
-    let y = BADGE_CELL_INSET_Y;
-    for cell in &badge.cells {
-        let cell_w = measure_text_width(cell.text()) + BADGE_CELL_PADDING_X * 2.0;
-        add_badge_cell(
-            parent,
-            cell,
-            NSRect::new(NSPoint::new(x, y), NSSize::new(cell_w, cell_h)),
-            inner_radius,
-            palette,
-        );
-        x += cell_w + BADGE_CELL_GAP;
-    }
-    if badge.repeats > 1 {
-        let suffix = format!("×{}", badge.repeats);
-        let suffix_w = measure_text_width(&suffix);
-        // +8pt slack over the measured text: the text cell keeps a small inset of its own,
-        // and an exact-width field clips the count's last digit.
-        add_badge_label(
-            parent,
-            NSRect::new(NSPoint::new(x, 0.0), NSSize::new(suffix_w + 8.0, BADGE_H)),
-            &suffix,
-            palette.muted_text,
-        );
-    }
-}
-
-/// Draw one keycap cell: tinted by role, with its glyph centered inside it.
-unsafe fn add_badge_cell(
-    parent: *mut AnyObject,
-    cell: &BadgeCell,
-    frame: NSRect,
-    inner_radius: f64,
-    palette: &crate::theme::UiPalette,
-) {
-    let cell_w = frame.size.width;
-    let cell_h = frame.size.height;
-    let cell_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let cell_view: *mut AnyObject = msg_send![cell_view, initWithFrame: frame];
-    let _: () = msg_send![cell_view, setWantsLayer: true];
-    let cell_layer: *mut AnyObject = msg_send![cell_view, layer];
-    let _: () = msg_send![cell_layer, setCornerRadius: inner_radius];
-    let _: () = msg_send![cell_layer, setBorderWidth: 1.0f64];
-    let (background, border, text_color) = if cell.is_accented_modifier() {
-        (
-            accent_keycap_surface(palette),
-            palette.keycap_accent_border,
-            palette.keycap_accent_text,
-        )
-    } else {
-        let (fill, border, _) = neutral_keycap_surface(palette);
-        (fill, border, palette.primary_text)
-    };
-    layer_set_background(cell_layer, hex_to_cg_color(background));
-    layer_set_border(cell_layer, hex_to_cg_color(border));
-    add_badge_label(
-        cell_view,
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(cell_w, cell_h)),
-        cell.text(),
-        text_color,
-    );
-    let _: () = msg_send![parent, addSubview: cell_view];
-    release_obj(cell_view);
 }
 
 fn centered_stream_cursor(panel_length: f64, estimated_total: f64, vertical: bool) -> f64 {
@@ -2331,104 +2315,96 @@ unsafe fn rebuild_badges(
         let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
 
-        if badge.cells.len() > 1 {
-            // One container holding one keycap per key. The container is a subtle tray so the
-            // cells and their per-role tints stay legible against it.
-            // The tray is the surface *behind* the keys, so the keys stay visible against it in
-            // both modes (see `neutral_keycap_surface`).
-            layer_set_background(layer, hex_to_cg_color(neutral_keycap_surface(&palette).2));
-            layer_set_border(layer, hex_to_cg_color(palette.card_border));
-            layout_badge_cells(badge_view, badge, &palette, orientation, badge_size);
+        let (background, border, text_color) = if uses_accent_fill(badge.kind) {
+            (
+                accent_keycap_surface(&palette),
+                palette.keycap_accent_border,
+                palette.keycap_accent_text,
+            )
         } else {
-            let (background, border, text_color) = if uses_accent_fill(badge.kind) {
-                (
-                    accent_keycap_surface(&palette),
-                    palette.keycap_accent_border,
-                    palette.keycap_accent_text,
-                )
-            } else {
-                let (fill, border, _) = neutral_keycap_surface(&palette);
-                (fill, border, palette.primary_text)
-            };
-            // The chip is an opaque surface: the panel behind it is the user's material, so the text
-            // floors cannot depend on what the panel happens to cover (see `opaque_over`).
-            layer_set_background(layer, hex_to_cg_color(background));
-            layer_set_border(layer, hex_to_cg_color(border));
-            if orientation.is_vertical() && badge.repeats > 1 {
-                // A merged keycap in a column keeps its glyph in the top cap-height zone and
-                // puts the count on its own small row below (non-flipped coordinates: the top
-                // zone starts at height - BADGE_H), mirroring a chord's suffix row, so the
-                // count never widens the keycap.
-                add_badge_label(
-                    badge_view,
-                    NSRect::new(
-                        NSPoint::new(0.0, badge_size.height - BADGE_H),
-                        NSSize::new(badge_size.width, BADGE_H),
+            let (fill, border) = neutral_keycap_surface(&palette);
+            (fill, border, palette.primary_text)
+        };
+        // The chip is an opaque surface: the panel behind it is the user's material, so the text
+        // floors cannot depend on what the panel happens to cover (see `opaque_over`).
+        layer_set_background(layer, hex_to_cg_color(background));
+        layer_set_border(layer, hex_to_cg_color(border));
+        if orientation.is_vertical() && badge.repeats > 1 {
+            // A merged keycap in a column keeps its glyph in the top cap-height zone and
+            // puts the count on its own small row below (non-flipped coordinates: the top
+            // zone starts at height - BADGE_H), so the count never widens the keycap.
+            add_badge_label(
+                badge_view,
+                NSRect::new(
+                    NSPoint::new(0.0, badge_size.height - BADGE_H),
+                    NSSize::new(badge_size.width, BADGE_H),
+                ),
+                label,
+                text_color,
+            );
+            let suffix = format!("×{}", badge.repeats);
+            // Full-width centered field: a frame of exactly the measured text width
+            // clips the count's last digit (the text cell keeps a small inset of its own).
+            add_badge_label(
+                badge_view,
+                NSRect::new(
+                    NSPoint::new(0.0, BADGE_SUFFIX_ROW_INSET_Y),
+                    NSSize::new(badge_size.width, BADGE_REPEAT_SUFFIX_H),
+                ),
+                &suffix,
+                palette.muted_text,
+            );
+        } else if badge.repeats > 1 {
+            // Merged inline: the name keeps the keycap's text color and the count rides
+            // ADJACENT to it (no gap) in muted text -- the count is metadata about the
+            // press, not part of the key's name.
+            let count = format!("×{}", badge.repeats);
+            let label_w = measure_text_width(label);
+            let count_w = measure_text_width(&count);
+            // Each centered NSTextField has 8pt of extra width to absorb its cell inset;
+            // account for half that slack here so the actual text run stays capsule-centered.
+            let start = inline_badge_label_start(badge_size.width, label_w, count_w);
+            add_badge_label(
+                badge_view,
+                NSRect::new(
+                    NSPoint::new(start, 0.0),
+                    NSSize::new(
+                        label_w + BADGE_INLINE_FIELD_SLACK_X,
+                        badge_size.height.min(BADGE_H),
                     ),
-                    label,
-                    text_color,
-                );
-                let suffix = format!("×{}", badge.repeats);
-                // Full-width centered field: a frame of exactly the measured text width
-                // clips the count's last digit (the text cell keeps a small inset of its own).
-                add_badge_label(
-                    badge_view,
-                    NSRect::new(
-                        NSPoint::new(0.0, BADGE_CONTAINER_PADDING_Y),
-                        NSSize::new(badge_size.width, BADGE_REPEAT_SUFFIX_H),
+                ),
+                label,
+                text_color,
+            );
+            add_badge_label(
+                badge_view,
+                NSRect::new(
+                    NSPoint::new(start + label_w, 0.0),
+                    NSSize::new(
+                        count_w + BADGE_INLINE_FIELD_SLACK_X,
+                        badge_size.height.min(BADGE_H),
                     ),
-                    &suffix,
-                    palette.muted_text,
-                );
-            } else if badge.repeats > 1 {
-                // Merged inline: the name keeps the keycap's text color and the count rides
-                // ADJACENT to it (no gap) in muted text -- the count is metadata about the
-                // press, not part of the key's name.
-                let count = format!("×{}", badge.repeats);
-                let label_w = measure_text_width(label);
-                let count_w = measure_text_width(&count);
-                // Each centered NSTextField has 8pt of extra width to absorb its cell inset;
-                // account for half that slack here so the actual text run stays capsule-centered.
-                let start = inline_badge_label_start(badge_size.width, label_w, count_w);
-                add_badge_label(
-                    badge_view,
-                    NSRect::new(
-                        NSPoint::new(start, 0.0),
-                        NSSize::new(
-                            label_w + BADGE_INLINE_FIELD_SLACK_X,
-                            badge_size.height.min(BADGE_H),
-                        ),
-                    ),
-                    label,
-                    text_color,
-                );
-                add_badge_label(
-                    badge_view,
-                    NSRect::new(
-                        NSPoint::new(start + label_w, 0.0),
-                        NSSize::new(
-                            count_w + BADGE_INLINE_FIELD_SLACK_X,
-                            badge_size.height.min(BADGE_H),
-                        ),
-                    ),
-                    &count,
-                    palette.muted_text,
-                );
-            } else {
-                let display_text = badge_display_text(label, badge.repeats);
-                add_badge_label(
-                    badge_view,
-                    NSRect::new(
-                        NSPoint::new(0.0, 0.0),
-                        NSSize::new(badge_size.width, badge_size.height.min(BADGE_H)),
-                    ),
-                    &display_text,
-                    text_color,
-                );
-            }
+                ),
+                &count,
+                palette.muted_text,
+            );
+        } else {
+            let display_text = badge_display_text(label, badge.repeats);
+            add_badge_label(
+                badge_view,
+                NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(badge_size.width, badge_size.height.min(BADGE_H)),
+                ),
+                &display_text,
+                text_color,
+            );
         }
         let _: () = msg_send![content, addSubview: badge_view];
         release_obj(badge_view);
+        // Advance past this keycap and one stream gap. The row also adds the gap after the last
+        // keycap; the cursor is past the stream either way, and every position comes from an
+        // `origin` computed above, so the extra step moves nothing.
         if orientation.is_vertical() {
             cursor -= BADGE_GAP;
         } else {
@@ -2437,7 +2413,7 @@ unsafe fn rebuild_badges(
     }
 }
 
-/// The surface of a neutral keycap and of the tray a chord's keys sit in: `(fill, border, tray)`.
+/// The surface of a neutral keycap: `(fill, border)`.
 ///
 /// The two modes need different fills, and the reason is measurable text contrast:
 /// - **Light**: the card surface at 80% alpha composited to white on the near-white panel (1.05:1),
@@ -2445,19 +2421,14 @@ unsafe fn rebuild_badges(
 ///   text measures 11.6:1 primary / 4.6:1 muted (the values the design doc records for light keycaps).
 /// - **Dark**: the same lighter inset surface dropped the cap's text to 9.77:1 primary and 4.00:1
 ///   muted, under the palette's 12:1 and 4.5:1 floors, because light text needs a *dark* cap. Dark
-///   therefore keeps the card surface at 80% (12.67:1 / 5.19:1), and its tray stays `field_bg`.
-fn neutral_keycap_surface(palette: &crate::theme::UiPalette) -> (u32, u32, u32) {
+///   therefore keeps the card surface at 80% (12.67:1 / 5.19:1).
+fn neutral_keycap_surface(palette: &crate::theme::UiPalette) -> (u32, u32) {
     if palette.dark {
-        (
-            palette.card_bg,
-            palette.card_border,
-            opaque_over(palette.field_bg, palette.card_bg),
-        )
+        (palette.card_bg, palette.card_border)
     } else {
         (
             opaque_over(palette.field_bg, palette.card_bg),
             palette.card_border,
-            palette.card_bg,
         )
     }
 }
@@ -2821,10 +2792,10 @@ mod tests {
     use super::{
         accent_keycap_surface, centered_stream_cursor, default_edge_frame, neutral_keycap_surface,
         opaque_over, resize_frame_preserving_center, resolve_panel_frame, target_screen_index,
-        uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry, BADGE_H,
+        uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry, BADGE_GAP, BADGE_H,
     };
     use crate::config::KeystrokeDisplayPosition;
-    use crate::keystroke_display::state::{BadgeKind, KEYCAP_RAIL_W};
+    use crate::keystroke_display::state::{estimated_badge_width, BadgeKind, KEYCAP_RAIL_W};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
@@ -2858,7 +2829,7 @@ mod tests {
         const KEYCAP_TEXT_MUTED_FLOOR: f64 = 3.25;
         for dark in [false, true] {
             let palette = crate::theme::ui_palette_for_mode(dark);
-            let (fill, border, tray) = neutral_keycap_surface(&palette);
+            let (fill, border) = neutral_keycap_surface(&palette);
             let cap_text = palette.primary_text;
             let accent_text = palette.keycap_accent_text;
             let keycaps = [
@@ -2884,22 +2855,16 @@ mod tests {
                     );
                 }
             }
-            // The fill and tray identity per mode (the choice this test documents).
+            // The fill identity per mode (the choice this test documents).
             assert_eq!(border, palette.card_border, "dark={dark}");
             if dark {
                 assert_eq!(fill, palette.card_bg, "dark keycaps are the card surface");
-                assert_eq!(
-                    tray,
-                    opaque_over(palette.field_bg, palette.card_bg),
-                    "dark chord tray"
-                );
             } else {
                 assert_eq!(
                     fill,
                     opaque_over(palette.field_bg, palette.card_bg),
                     "light keycaps use the inset surface, flattened"
                 );
-                assert_eq!(tray, palette.card_bg, "light chord tray");
             }
             // Every chip is opaque, which is what makes the text floors independent of the panel
             // material the user selected: a chip that took its colour from the panel would carry its
@@ -3152,8 +3117,9 @@ mod tests {
         assert!(centered_y > visible.origin.y);
     }
 
-    /// Horizontal and vertical extents differ for a chord: a row grows sideways, a column grows
-    /// downward, and a lone keycap is the same either way.
+    /// A chord measures as the split keycaps it is drawn as, along either axis: a row lays them
+    /// out sideways with the stream gap between them, a column stacks them downward. A lone
+    /// keycap keeps its size and only swaps which axis is "along the stream".
     #[test]
     fn orientation_decides_which_axis_a_chord_grows_along() {
         assert_eq!(
@@ -3184,15 +3150,14 @@ mod tests {
             repeats: 1,
             cells: vec![BadgeCell::Modifier("⌘".into()), BadgeCell::Key("Q".into())],
         };
-        let row = chord.estimated_extent(Orientation::Horizontal);
-        let column = chord.estimated_extent(Orientation::Vertical);
-        assert!(
-            column > row,
-            "a stacked chord must be taller than it is wide ({column} vs {row})"
+        assert_eq!(
+            chord.estimated_extent(Orientation::Horizontal),
+            estimated_badge_width("⌘", 1) + BADGE_GAP + estimated_badge_width("Q", 1),
+            "a row splits a chord into standalone keycaps with stream spacing"
         );
         assert_eq!(
-            column,
-            2.0 * BADGE_H + super::BADGE_GAP,
+            chord.estimated_extent(Orientation::Vertical),
+            2.0 * BADGE_H + BADGE_GAP,
             "a column splits a chord into standalone keycaps with stream spacing"
         );
         let triple_chord = Badge {
@@ -3204,8 +3169,16 @@ mod tests {
             ..chord.clone()
         };
         assert_eq!(
+            triple_chord.estimated_extent(Orientation::Horizontal),
+            estimated_badge_width("⌘", 1)
+                + BADGE_GAP
+                + estimated_badge_width("⇧", 1)
+                + BADGE_GAP
+                + estimated_badge_width("Q", 1)
+        );
+        assert_eq!(
             triple_chord.estimated_extent(Orientation::Vertical),
-            3.0 * BADGE_H + 2.0 * super::BADGE_GAP
+            3.0 * BADGE_H + 2.0 * BADGE_GAP
         );
 
         // A lone keycap is the same size either way, but its extent along the stream swaps:

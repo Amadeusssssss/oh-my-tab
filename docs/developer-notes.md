@@ -206,7 +206,7 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
 
 剪贴板功能开启期间，它落盘的每一个字节都是密封的：历史 TOML、图片原始字节、缩略图与详情图预览都走 `src/clipboard/crypto.rs` 的信封（AES-256-GCM；`magic | kind | key_id | object_id | nonce | ct+tag`，AAD 绑定 magic、kind、key_id、object_id）。信封里的内容格式不变，所以 TOML 结构与 `HISTORY_VERSION` 仍然描述历史本身。读取方按它请求的逻辑名重算 `object_id`，并拒绝头部与之不一致的文件，因此两个完整的同类文件无法互换。
 
-主密钥是登录钥匙串里的一个通用密码项（`com.eacryo.oh-my-tab.clipboard-history` / `master-key`，值 `key_id || key`），用 `SecItemAdd` 语义创建——**从不更新**，所以另一个构建渠道（`.dev` bundle）不会覆盖 release 的密钥。dev 与 release 刻意共用这一项，因为它们共用同一个历史文件；探针显示「身份与 bundle identifier 相同、Info.plist 不变」的重建之间静默可读，换 bundle identifier 会弹框。开发构建曾每次启动都重新签名（时间戳构建号写进 Info.plist）而**每次启动都弹、且「始终允许」不跨重启生效**：**2026-10-08 已定位并修复**——项的 ACL 按「创建该项的应用的签名身份」判定，而这一项是 ad-hoc 构建创建的；开发包改用 Developer ID 签名并一次性重置了该项，此后重建后的开发包 67ms 静默读完（实测）。完整规则与未验证边界见下方「钥匙串授权」。开发运行请优先用 `--clip-no-keychain`。
+主密钥是登录钥匙串里的一个通用密码项（`com.eacryo.oh-my-tab.clipboard-history` / `master-key`，值 `key_id || key`），用 `SecItemAdd` 语义创建——**从不更新**，所以另一个构建渠道（`.dev` bundle）不会覆盖 release 的密钥。dev 与 release 刻意共用这一项，因为它们共用同一个历史文件；探针显示「身份与 bundle identifier 相同、Info.plist 不变」的重建之间静默可读，换 bundle identifier 会弹框。开发构建曾每次启动都重新签名（时间戳构建号写进 Info.plist）而**每次启动都弹、且「始终允许」不跨重启生效**：**2026-10-08 已定位并修复**——项的 ACL 按「创建该项的应用的签名身份」判定，而这一项是 ad-hoc 构建创建的；开发包改用 Developer ID 签名并一次性重置了该项，此后重建后的开发包 67ms 静默读完（实测）。完整规则与未验证边界见下方「钥匙串授权」。每个 `--smoke-*` 启动都已与钥匙串隔离；其余不需要钥匙串的开发运行再用 `--clip-no-keychain`。
 
 `src/clipboard/storage.rs` 掌握本次会话的状态，所有写盘、清扫、删除入口都先问它：
 
@@ -220,12 +220,12 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
 
 删除是一个事务（`purge-pending`）：先写意图（历史文件旁边，失败则退回 `~/Library/Application Support/oh-my-tab/`——绝不用 `~/Library/Caches`，系统会清理它），再失效在飞任务，然后删除并逐项验证，最后撤销意图。只有删除与撤销都确认成功才恢复写盘；陈旧标记会继续禁止写盘，从而不会删掉刚写入的新历史。待清理任务在启动时与每次配置变更时处理，且都早于任何加载或写入。
 
-测试与冒烟从不碰真实钥匙串：`cfg(test)` 与 `--smoke-*` 使用固定测试密钥并配合临时存储目录，`--clip-no-keychain` 强制走 `Unavailable`，让不可用分支保持可达。`--e2e-state` 报告 `clipboard_storage`（`state` / `reason` / `key_provider` / `plaintext_leftover` / `keychain_acl`）；断言「已加密」的场景仍必须自己读磁盘文件——应用自述不算证据。
+测试与冒烟从不碰真实钥匙串，也不碰真实剪贴板：`cfg(test)` 与 `--smoke-*` 使用固定测试密钥并配合临时存储目录（每个 `--smoke-*` 启动都在 `run` 的最开头进入这个隔离会话，早于读取配置与存储），而且冒烟进程不安装粘贴板观察者、不建轮询定时器，因此什么都不会记录用户复制的内容——那种记录会用源码里公开的测试密钥加密，等于人人可读。`--clip-no-keychain` 强制走 `Unavailable`，让不可用分支保持可达。`--e2e-state` 报告 `clipboard_storage`（`state` / `reason` / `key_provider` / `plaintext_leftover` / `keychain_acl`）；断言「已加密」的场景仍必须自己读磁盘文件——应用自述不算证据。
 两条运行观察。
 
 **离线加载与耗时**：加载之所以放在主线程之外，是因为钥匙串读取可能阻塞（开发构建实测：读取本身约 11 秒，其余决策 0.2 秒；期间应用完全可用，这正是拆分的意义所在）；因此 `clipboard_storage.state` 在加载落地之前会读作 `uninitialized`，断言它的场景必须等待并触发一次新的快照。
 
-**钥匙串授权**（已实测、推断与未验证必须分清）：**2026-10-08 定位并修复**。判定规则（三个 C 探针 + 实机）：**钥匙串项的 ACL 按「创建该项的那个应用的签名身份」判定**。自签名/ad-hoc 构建创建的项，二进制一变就不再被承认（探针：重建同一路径、重新签名后读取即弹框）——这是历史现象，已不再适用于本机（2026-10-08 一次性重置后，项由 Developer ID 身份创建，重建后实测 67ms 静默读完）。Developer ID 构建创建的项跨同样的重建仍被承认（探针：静默；实机：重建后的开发包无弹框）。**注意不要把 ACL 的文本形态当成稳定性判据**：macOS 用废弃读取 API 对非 Apple 锚定的应用一律报「路径」，`--e2e-state` 的 `keychain_acl`（`requirement` / `foreign-requirement` / `path` / `none` / `unknown`）只是形态报告。**应用无法认领别人的项**：用 Developer ID 签名去删异签名创建的项返回 `errSecInvalidOwnerEdit`（-25244，实测），所以历史遗留项只能由用户删掉一次、再由应用新建（旧存储集合按设计改名保留为 `*.failed-<ts>`）。**未验证**：正式构建（Developer ID）安装在没有重置过的旧环境时的行为——「最多弹一次后静默」是预期而非保证。纯 UI 验证可用 `--clip-no-keychain` 完全绕开钥匙串。
+**钥匙串授权**（已实测、推断与未验证必须分清）：**2026-10-08 定位并修复**。判定规则（三个 C 探针 + 实机）：**钥匙串项的 ACL 按「创建该项的那个应用的签名身份」判定**。自签名/ad-hoc 构建创建的项，二进制一变就不再被承认（探针：重建同一路径、重新签名后读取即弹框）——这是历史现象，已不再适用于本机（2026-10-08 一次性重置后，项由 Developer ID 身份创建，重建后实测 67ms 静默读完）。Developer ID 构建创建的项跨同样的重建仍被承认（探针：静默；实机：重建后的开发包无弹框）。**注意不要把 ACL 的文本形态当成稳定性判据**：macOS 用废弃读取 API 对非 Apple 锚定的应用一律报「路径」，`--e2e-state` 的 `keychain_acl`（`requirement` / `foreign-requirement` / `path` / `none` / `unknown`）只是形态报告。**应用无法认领别人的项**：用 Developer ID 签名去删异签名创建的项返回 `errSecInvalidOwnerEdit`（-25244，实测），所以历史遗留项只能由用户删掉一次、再由应用新建（旧存储集合按设计改名保留为 `*.failed-<ts>`）。**未验证**：正式构建（Developer ID）安装在没有重置过的旧环境时的行为——「最多弹一次后静默」是预期而非保证。每个 `--smoke-*` 启动都已隔离（测试密钥 + 临时目录），A1 冒烟既不读钥匙串也不会弹框；其余纯 UI 验证可用 `--clip-no-keychain` 完全绕开钥匙串。
 
 
 

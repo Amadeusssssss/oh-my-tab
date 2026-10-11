@@ -206,11 +206,17 @@ pub(crate) unsafe fn will_present_smoke_check() -> bool {
     static OPTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     let delegate = ensure_delegate_registered();
-    let center: *mut AnyObject =
-        msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
-    if delegate.is_null() || center.is_null() {
+    if delegate.is_null() {
         return false;
     }
+    // The center is only handed back to the callback, which ignores it (see
+    // `will_present_notification`), so this check takes a null one instead of asking
+    // `+[UNUserNotificationCenter currentNotificationCenter]`: that call raises
+    // `NSInternalInconsistencyException` ("bundleProxyForCurrentProcess is nil") when the process
+    // was launched from a bare executable rather than a bundle -- which is exactly how the tier-A
+    // smokes launch this binary. The argument slots and the completion block are what this check
+    // is for, and they are identical with a null center.
+    let center: *mut AnyObject = std::ptr::null_mut();
     // The callback ignores the notification object, so the request stands in for it: what has to be
     // proven is that the three arguments arrive in the right slots and the block is called.
     let content: *mut AnyObject = msg_send![class!(UNMutableNotificationContent), new];

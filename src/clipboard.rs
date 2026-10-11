@@ -118,6 +118,13 @@ pub(crate) fn key_provider_label() -> &'static str {
     keyring::backend_label(keyring::current_backend())
 }
 
+/// Whether this process monitors the system pasteboard. A smoke launch never does (it would record
+/// the developer's real clipboard into a temporary history under the fixed test key), and the
+/// tier-A smoke asserts it.
+pub(crate) fn pasteboard_monitor_active() -> bool {
+    monitor::polling_active()
+}
+
 /// The one-line "clipboard history is unavailable right now" copy for the current storage state, in
 /// the active locale. Used by the settings page and by the picker, so all three surfaces (including
 /// the system notification) say the same thing.
