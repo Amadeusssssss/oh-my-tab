@@ -75,6 +75,8 @@ for arg in "$@"; do
             echo "             --pseudo-locale, --layout-debug, --test-update-notice[=available],"
             echo "             --smoke-update-prompts (opens 12 key windows and takes focus; run only with consent),"
             echo "             --show-clipboard (open the clipboard picker without its hotkey),"
+            echo "             --no-settings-prewarm (skip the startup settings warm-up; the cold-open"
+            echo "             counter-example for scripts/e2e/settings-open-latency.sh),"
             echo "             --e2e-state=<path> (JSON state snapshots for scripts/e2e/*.sh)"
             echo "No environment variable is read, forwarded or echoed (see the header)."
             exit 0

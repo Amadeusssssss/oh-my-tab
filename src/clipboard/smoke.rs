@@ -286,6 +286,141 @@ pub(crate) fn smoke_runner() -> bool {
         }
     }
 
+    /// The handle view inside the header strip, found by its class name (the theme check needs it).
+    unsafe fn grip_view_in_header() -> *mut AnyObject {
+        let header = (*super::PICKER_HEADER_STRIP.lock().unwrap())
+            .expect("the picker header strip must be built")
+            .0;
+        let subviews: *mut AnyObject = msg_send![header, subviews];
+        let count: usize = msg_send![subviews, count];
+        for index in 0..count {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            let class: *mut AnyObject = msg_send![view, class];
+            let name = crate::ffi::nsstring_to_rust(msg_send![class, description]);
+            if name == "OhMyTabClipboardGripView" {
+                return view;
+            }
+        }
+        std::ptr::null_mut()
+    }
+
+    /// The header controls' translated strings must follow a locale switch: the picker window is reused, so
+    /// a label captured at build time keeps the language that was active when it was built (and VoiceOver
+    /// keeps announcing it). Reads the live properties back, which is also what an assistive client sees.
+    unsafe fn assert_header_strings_are_localized() {
+        let grip = grip_view_in_header();
+        assert!(!grip.is_null(), "the handle view must be in the header");
+        let label: *mut AnyObject = msg_send![grip, accessibilityLabel];
+        assert!(
+            !label.is_null(),
+            "the handle must carry an accessibility label"
+        );
+        assert_eq!(
+            crate::ffi::nsstring_to_rust(label),
+            super::t("clipboard.grip_label"),
+            "the handle's accessibility label must follow the locale"
+        );
+        let tooltip: *mut AnyObject = msg_send![grip, toolTip];
+        assert!(!tooltip.is_null(), "the handle must carry a tooltip");
+        assert_eq!(
+            crate::ffi::nsstring_to_rust(tooltip),
+            super::t("clipboard.grip_tooltip"),
+            "the handle's tooltip must follow the locale"
+        );
+        if let Some(button) = *super::PICKER_SETTINGS_BUTTON.lock().unwrap() {
+            let label: *mut AnyObject = msg_send![button.0, accessibilityLabel];
+            assert!(
+                !label.is_null(),
+                "the settings button must carry an accessibility label"
+            );
+            assert_eq!(
+                crate::ffi::nsstring_to_rust(label),
+                super::t("clipboard.open_settings"),
+                "the settings button's accessibility label must follow the locale"
+            );
+            let tooltip: *mut AnyObject = msg_send![button.0, toolTip];
+            assert!(
+                !tooltip.is_null(),
+                "the settings button must carry a tooltip"
+            );
+            assert_eq!(
+                crate::ffi::nsstring_to_rust(tooltip),
+                super::t("clipboard.open_settings"),
+                "the settings button's tooltip must follow the locale"
+            );
+        }
+    }
+
+    /// The header's two new controls must exist in the LIVE view tree, not merely as geometry in a
+    /// pure function: the handle the A2 drag scenario grabs, and a settings button wired to the
+    /// action that opens the settings page. Both are found by class/action, so a rename that
+    /// silently left the header without them fails here.
+    unsafe fn assert_header_controls_are_live() {
+        let header = (*super::PICKER_HEADER_STRIP.lock().unwrap())
+            .expect("the picker header strip must be built")
+            .0;
+        let (search, gear, close) = super::picker_header_frames();
+        let grip = super::picker_grip_frame();
+
+        let subviews: *mut AnyObject = msg_send![header, subviews];
+        let count: usize = msg_send![subviews, count];
+        let mut found_grip = false;
+        let mut found_settings: *mut AnyObject = std::ptr::null_mut();
+        let mut found_close = false;
+        for index in 0..count {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            let class: *mut AnyObject = msg_send![view, class];
+            let name: *mut AnyObject = msg_send![class, description];
+            let name = crate::ffi::nsstring_to_rust(name);
+            if name == "OhMyTabClipboardGripView" {
+                found_grip = true;
+                let frame: NSRect = msg_send![view, frame];
+                assert_eq!(
+                    frame, grip,
+                    "the handle must sit on the band the geometry names"
+                );
+                // A handle with no tracking area never shows the hand cursor, and one whose frame
+                // drifts from its tracking rect stops responding where it is drawn.
+                let areas: *mut AnyObject = msg_send![view, trackingAreas];
+                let area_count: usize = msg_send![areas, count];
+                let covered = (0..area_count).any(|i| {
+                    let area: *mut AnyObject = msg_send![areas, objectAtIndex: i as isize];
+                    let rect: NSRect = msg_send![area, rect];
+                    (rect.size.width - grip.size.width).abs() < 0.5
+                        && (rect.size.height - grip.size.height).abs() < 0.5
+                });
+                assert!(covered, "the handle needs a tracking area over its band");
+            }
+            let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+            if !is_button {
+                continue;
+            }
+            let action: Sel = msg_send![view, action];
+            if action == sel!(openClipboardSettings:) {
+                found_settings = view;
+            } else if action == sel!(pickerClose:) {
+                found_close = true;
+            }
+        }
+        assert!(found_grip, "the header must carry the drag handle");
+        assert!(found_close, "the header must still carry the close button");
+        assert!(
+            !found_settings.is_null(),
+            "the header's settings button must exist and target openClipboardSettings:"
+        );
+        let gear_frame: NSRect = msg_send![found_settings, frame];
+        assert_eq!(
+            gear_frame, gear,
+            "the settings button must sit in the frame the geometry reserves for it"
+        );
+        // The three controls share the search row and may not overlap: the search field gives up
+        // both buttons' width, and the button frames are the ones the geometry names.
+        assert!(search.origin.x + search.size.width <= gear.origin.x);
+        assert!(gear.origin.x + gear.size.width <= close.origin.x);
+        let settings_hidden: bool = msg_send![found_settings, isHidden];
+        assert!(!settings_hidden, "the settings button must be visible");
+    }
+
     // Footer shortcut legends must survive the fonts they are drawn with, in every shipped
     // locale: a label whose frame was sized for a smaller font than the one it renders with
     // wraps out of its one-line-high field and silently loses its tail.
@@ -305,6 +440,7 @@ pub(crate) fn smoke_runner() -> bool {
                 footer_legends_layout_is_sane(),
                 "clipboard footer legends must render fully in locale={locale}"
             );
+            assert_header_strings_are_localized();
             // A locale refresh re-measures the reservation and re-applies the current scope; it
             // used to reset both to the two short labels.
             assert_clear_actions_match_scope();
@@ -434,6 +570,47 @@ pub(crate) fn smoke_runner() -> bool {
     // (the × key, the field's Esc, a fresh summon) restores the category wording. Clearing the
     // query by hand in the list-focus Esc branch used to leave a stale scope on the buttons.
     unsafe {
+        assert_header_controls_are_live();
+        // The handle's dots must follow a theme switch: the picker window is reused across showings, so an
+        // ink captured when the handle was built kept the previous mode's colour. This drives the real
+        // refresh (the coordinator the settings switch runs) and reads the layer the dots are painted with.
+        {
+            let grip = grip_view_in_header();
+            assert!(!grip.is_null(), "the handle view must be in the header");
+            let first_dot_color = |grip: *mut AnyObject| -> Vec<f64> {
+                let marks: *mut AnyObject = msg_send![grip, subviews];
+                let count: usize = msg_send![marks, count];
+                assert!(count >= 3, "the handle must hold its three dots");
+                let mark: *mut AnyObject = msg_send![marks, objectAtIndex: 0isize];
+                let layer: *mut AnyObject = msg_send![mark, layer];
+                let color = crate::ffi::layer_background_color(layer);
+                assert!(!color.is_null(), "a dot must be painted");
+                let number = crate::ffi::CGColorGetNumberOfComponents(color as *const c_void);
+                let components = crate::ffi::CGColorGetComponents(color as *const c_void);
+                (0..number).map(|i| *components.add(i)).collect()
+            };
+            let original_theme = CONFIG.read().unwrap().appearance.theme.clone();
+            CONFIG.write().unwrap().appearance.theme = "light".to_string();
+            crate::ui_coordinator::apply_theme_and_locale_refresh();
+            let light = first_dot_color(grip);
+            CONFIG.write().unwrap().appearance.theme = "dark".to_string();
+            crate::ui_coordinator::apply_theme_and_locale_refresh();
+            let dark = first_dot_color(grip);
+            assert!(
+                light != dark,
+                "the handle's dots must be repainted on a theme switch (light {light:?} vs dark {dark:?})"
+            );
+            CONFIG.write().unwrap().appearance.theme = original_theme;
+            crate::ui_coordinator::apply_theme_and_locale_refresh();
+        }
+        // The moved position lasts exactly one showing and never reaches the configuration file (the
+        // A2 drag scenario asserts the across-a-relaunch half of the same promise).
+        super::grip::set_session_origin(NSPoint::new(42.0, 42.0));
+        super::grip::on_picker_hidden();
+        assert!(
+            super::grip::session_origin().is_none(),
+            "hiding the picker must forget the dragged position"
+        );
         super::with_clipboard_ui(|ui| ui.search_query = "apple".to_string());
         update_clear_action_labels();
         assert_eq!(
@@ -509,6 +686,231 @@ pub(crate) fn smoke_runner() -> bool {
             for step in 1..=5u8 {
                 let _: () = msg_send![c.0, scrollPoint: NSPoint::new(0.0, step as f64 * 30.0)];
             }
+        }
+    }
+    // The drag handle end to end: move the panel through the real gesture path, then check every claim
+    // the feature makes -- the window follows, the detail round trip keeps the dragged position, the
+    // double-click reset returns to the configured one, and a hidden-then-reshown picker is back at the
+    // configured position (the "one showing" promise, through the REAL hide path rather than the
+    // cleanup helper the assertions above call directly). Without this, a `hide_picker()` that forgot
+    // the cleanup would pass every other check in this file.
+    unsafe {
+        let panel_rect = || -> (f64, f64, f64, f64) {
+            super::picker_frame_top_left().expect("the picker must have a frame while it is shown")
+        };
+        let baseline = panel_rect();
+        // Grab the handle's own band, so the gesture goes through the same containment check a real
+        // press does: the band is reported in the panel's points, top-left based.
+        let grip = super::picker_grip_rect_top_left().expect("the handle must be built");
+        let screen_height = crate::overlay::hover::primary_screen_frame()
+            .expect("a primary screen")
+            .size
+            .height;
+        // Screen coordinates (AppKit, bottom-left origin) for the press point and the target: the panel's
+        // top-left is top-left based, so y flips through the primary screen's height.
+        let to_appkit = |x: f64, y: f64| NSPoint::new(x, screen_height - y);
+        let from = to_appkit(
+            baseline.0 + grip.0 + grip.2 / 2.0,
+            baseline.1 + grip.1 + grip.3 / 2.0,
+        );
+        let dx = 90.0;
+        let dy = 60.0;
+        let to = NSPoint::new(from.x + dx, from.y - dy);
+
+        // The whole top bar is the handle, not the three dots: a press near the band's LEFT end must drag
+        // the panel too (before this change only the centered 48pt band was a target, so this point was
+        // inert). Reset afterwards so the rest of this block measures from the configured position.
+        // 20pt from the PANEL's left edge, deliberately NOT derived from the band: the band this used to
+        // be started at (PICKER_W - 48)/2 = 256pt, so a point taken relative to the band would have been
+        // inside it in both geometries and would have proved nothing.
+        let near_left = to_appkit(baseline.0 + 20.0, baseline.1 + grip.1 + grip.3 / 2.0);
+        super::grip::e2e_drag(
+            near_left,
+            NSPoint::new(near_left.x + 25.0, near_left.y - 15.0),
+        );
+        let dragged_from_the_edge = panel_rect();
+        assert!(
+            (dragged_from_the_edge.0 - (baseline.0 + 25.0)).abs() < 1.5
+                && (dragged_from_the_edge.1 - (baseline.1 + 15.0)).abs() < 1.5,
+            "a press inside the top bar but far from the dots must drag the panel (moved to {},{}, expected {},{})",
+            dragged_from_the_edge.0,
+            dragged_from_the_edge.1,
+            baseline.0 + 25.0,
+            baseline.1 + 15.0
+        );
+        super::picker::reset_picker_to_configured_position();
+        let restored = panel_rect();
+        assert!(
+            (restored.0 - baseline.0).abs() < 1.5 && (restored.1 - baseline.1).abs() < 1.5,
+            "the reset after the edge drag must return the panel to the configured position"
+        );
+
+        // A click on the handle, and a wobble under the threshold: neither may move the panel, and neither
+        // may leave the closed hand pushed (the press does that regardless of travel).
+        let before_click = panel_rect();
+        super::grip::e2e_drag(from, from);
+        assert!(
+            !super::grip::e2e_cursor_is_closed(),
+            "a click on the handle must not leave the closed hand cursor held"
+        );
+        assert_eq!(
+            panel_rect(),
+            before_click,
+            "a click on the handle must not move the panel"
+        );
+        super::grip::e2e_drag(from, NSPoint::new(from.x + 1.0, from.y - 1.0));
+        assert!(
+            !super::grip::e2e_cursor_is_closed(),
+            "a wobble under the drag threshold must not leave the closed hand cursor held"
+        );
+        assert_eq!(
+            panel_rect(),
+            before_click,
+            "a wobble under the drag threshold must not move the panel"
+        );
+
+        super::grip::e2e_drag(from, to);
+        let dragged = panel_rect();
+        assert!(
+            (dragged.0 - (baseline.0 + dx)).abs() < 1.5
+                && (dragged.1 - (baseline.1 + dy)).abs() < 1.5,
+            "the panel must follow the handle: dragged to ({},{}), expected ({},{})",
+            dragged.0,
+            dragged.1,
+            baseline.0 + dx,
+            baseline.1 + dy
+        );
+        // The anchor is what a detail panel's close restores, so it has to be where the drag ENDED. It is a
+        // point in AppKit screen coordinates (bottom-left origin, the panel's bottom edge), while the
+        // reported rect is top-left based, so the comparison converts the dragged rect's top edge back.
+        let anchor = super::grip::session_origin().expect("a finished drag must leave an anchor");
+        let dragged_appkit_origin_y = screen_height - dragged.1 - dragged.3;
+        assert!(
+            (anchor.x - dragged.0).abs() < 1.5
+                && (anchor.y - dragged_appkit_origin_y).abs() < 1.5,
+            "the anchor must be the dragged position ({} ,{}), not the press-time one (panel top-left {},{})",
+            anchor.x,
+            anchor.y,
+            dragged.0,
+            dragged.1
+        );
+
+        // Detail round trip: opening it must not move the panel horizontally (the defect was that the
+        // group layout re-derived x and snapped a dragged panel back), and the position a close restores
+        // must be the dragged anchor rather than where the gesture started.
+        //
+        // Close whatever earlier steps left open first, then open TWICE: the first open goes through the
+        // open animation, whose model frame has not landed without a run-loop turn, while the second takes
+        // the "already visible" path and applies the frames immediately. That second path is also the one a
+        // selection change while the detail is open takes -- exactly the case that re-derived the x.
+        super::hide_detail();
+        assert!(
+            !super::detail_visible(),
+            "the detail must be closed before the round trip under test"
+        );
+        super::set_picker_selection(0);
+        rebuild_rows();
+        super::picker::show_detail_for_sel();
+        assert!(
+            super::detail_visible(),
+            "the detail panel must open for the selected entry"
+        );
+        // The origin a close restores: this is the wiring that returns the panel to where the drag ended.
+        let restore_origin = (*super::DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap())
+            .expect("opening the detail must capture the origin its close restores");
+        assert!(
+            (restore_origin.x - anchor.x).abs() < 1.5 && (restore_origin.y - anchor.y).abs() < 1.5,
+            "the origin a detail close restores must be the dragged anchor ({},{}), found ({},{})",
+            anchor.x,
+            anchor.y,
+            restore_origin.x,
+            restore_origin.y
+        );
+        super::picker::show_detail_for_sel();
+        let opened = panel_rect();
+        // The rule the layout must follow with an anchor: keep the anchor, and move the picker left ONLY by
+        // what the group needs to fit inside the screen's edge margins. Stated as arithmetic here rather
+        // than by calling the layout again -- a test that re-runs its subject proves nothing.
+        let detail_w = super::DETAIL_WINDOW
+            .lock()
+            .unwrap()
+            .map(|window| crate::glass::panel_frame_of(window.0).size.width)
+            .expect("the detail window must exist while its panel is open");
+        let group_w = super::PICKER_W + super::DETAIL_GAP + detail_w;
+        let screen_w = crate::overlay::hover::primary_screen_frame()
+            .expect("a primary screen")
+            .size
+            .width;
+        let fitted =
+            (screen_w - super::PICKER_EDGE_MARGIN - group_w).max(super::PICKER_EDGE_MARGIN);
+        let expected_x = if dragged.0 + group_w <= screen_w - super::PICKER_EDGE_MARGIN {
+            dragged.0
+        } else {
+            fitted
+        };
+        assert!(
+            (opened.0 - expected_x).abs() < 1.5,
+            "a layout with the detail open must keep the dragged x {} unless the group needs room (expected {}, found {})",
+            dragged.0,
+            expected_x,
+            opened.0
+        );
+        super::hide_detail();
+        assert!(
+            !super::detail_visible(),
+            "the detail must close again for the reset below"
+        );
+
+        // Double-click reset: back to the configured position, which is where this showing started.
+        super::picker::reset_picker_to_configured_position();
+        let reset = panel_rect();
+        assert!(
+            (reset.0 - baseline.0).abs() < 1.5 && (reset.1 - baseline.1).abs() < 1.5,
+            "the reset must return the panel to the configured position ({},{}), found ({},{})",
+            baseline.0,
+            baseline.1,
+            reset.0,
+            reset.1
+        );
+
+        // The lifecycle: drag, hide through the real path, summon again -- the configured position decides
+        // again, and nothing of the drag survives.
+        super::grip::e2e_drag(from, to);
+        assert!(super::grip::session_origin().is_some());
+        super::hide_picker();
+        assert!(
+            super::grip::session_origin().is_none(),
+            "hiding the picker must forget the dragged position through the real hide path"
+        );
+        super::show_picker();
+        let reshown = panel_rect();
+        assert!(
+            (reshown.0 - baseline.0).abs() < 1.5 && (reshown.1 - baseline.1).abs() < 1.5,
+            "a re-summoned picker must be back at the configured position ({},{}), found ({},{})",
+            baseline.0,
+            baseline.1,
+            reshown.0,
+            reshown.1
+        );
+
+        // A detail closed a moment ago, then a grab of the handle before its queued orderOut runs: the queued
+        // call belongs to a detail the app already considers closed, so it must still complete. Cancelling it
+        // (what the first version of the drag did) left the window ordered front, transparent and collapsed
+        // with nothing left to retry. This runs last because the run-loop turn below can also deliver the
+        // picker's own resign-key handling.
+        super::picker::show_detail_for_sel();
+        super::hide_detail();
+        let detail_window = super::DETAIL_WINDOW.lock().unwrap().map(|w| w.0);
+        super::grip::e2e_drag(from, to);
+        let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
+        let limit: *mut AnyObject = msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 0.6f64];
+        let _: () = msg_send![run_loop, runUntilDate: limit];
+        if let Some(window) = detail_window {
+            let visible: bool = msg_send![window, isVisible];
+            assert!(
+                !visible,
+                "the detail window must be ordered out after its close, even when the handle is grabbed before the queued call runs"
+            );
         }
     }
     // Detail/pin smoke: → opens the detail (text), ↓ follows it (stays open), ← pins while
@@ -976,6 +1378,44 @@ pub(crate) fn smoke_runner() -> bool {
             leftovers.is_empty(),
             "the image cache must be empty after a discard, found {leftovers:?}"
         );
+    }
+    // The header's settings button: run the action the live button targets and require the whole
+    // promise -- the panel goes away, and the settings window lands on the clipboard page. It starts on
+    // a DIFFERENT page, because a sidebar already sitting on the target page cannot tell a button that
+    // navigated from one whose action did nothing.
+    //
+    // A1 rather than A2: opening the settings window fronts the app, which the focus-safe A2 scenarios
+    // must not do, while the button's existence, frame, visibility and action selector are asserted on
+    // the live view tree by `assert_header_controls_are_live` above.
+    {
+        crate::settings::show_settings_page(0);
+        assert_eq!(
+            crate::settings::e2e_selected_sidebar(),
+            0,
+            "the settings window must start on the General page"
+        );
+        show_picker();
+        super::notifications::open_clipboard_settings(
+            std::ptr::null_mut(),
+            sel!(openClipboardSettings:),
+            std::ptr::null_mut(),
+        );
+        assert!(
+            !super::picker_is_visible(),
+            "opening the settings page must take the panel down"
+        );
+        assert_eq!(
+            crate::settings::e2e_selected_sidebar(),
+            crate::settings::SETTINGS_CLIPBOARD_PAGE_INDEX,
+            "the settings button must park the sidebar on the clipboard page"
+        );
+        // Whether the window APPEARED on that page (rather than being switched to it afterwards) is asserted
+        // by the app-reopen smoke: this process never runs the lifecycle that presents it, so the page it
+        // appears on is not observable here (the presented-page static stays unset).
+        // The settings *window* being on screen is asserted by the app-reopen smoke instead: this
+        // process never ran the lifecycle that builds it, so `isVisible` here would test the harness,
+        // not the button. What this process uniquely owns is the panel half (above) and that the
+        // navigation parks the sidebar on the page the header promises.
     }
     hide_picker();
     true

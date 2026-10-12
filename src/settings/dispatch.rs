@@ -922,6 +922,7 @@ pub(crate) extern "C" fn on_control_text_did_change(
             return;
         };
         let _ = raw;
+        EDITED_TEXT_FIELDS.fetch_or(text_field_bit(field), Ordering::SeqCst);
         write_text_field_config(field, value, false);
         schedule_config_persist();
         log_debug!(
@@ -946,6 +947,15 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
         };
         match parse_text_field(field) {
             Some((value, _)) => {
+                // Only a field the user actually typed into commits here. An untouched field is AppKit
+                // resigning the window's automatic initial first responder (see `EDITED_TEXT_FIELDS`), and
+                // committing it would rewrite the config file on every open.
+                if !take_edited_field(&EDITED_TEXT_FIELDS, field) {
+                    log_debug!(
+                        "[settings] numeric field {field:?} untouched on end editing; not persisted"
+                    );
+                    return;
+                }
                 write_text_field_config(field, value, true);
                 persist_config_now();
                 log_debug!(
@@ -954,6 +964,8 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
                 );
             }
             None => {
+                // The edit session is over either way, so the bit does not outlive it.
+                let _ = take_edited_field(&EDITED_TEXT_FIELDS, field);
                 // Do not commit invalid values; restore the last effective config value.
                 let cfg = CONFIG.read().unwrap().clone();
                 let text = match field {
@@ -1021,9 +1033,37 @@ unsafe fn parse_text_field(field: TextField) -> Option<(TextFieldValue, String)>
     })
 }
 
+#[derive(Clone, Copy)]
 enum TextFieldValue {
     F64(f64),
     U32(u32),
+}
+
+/// One bit per numeric field, set by a real keystroke and consumed by the commit on end editing.
+///
+/// The distinction matters because `on_control_text_did_change` already wrote a valid keystroke into
+/// `CONFIG`, so "did this field change?" cannot tell the two cases apart. What can is whether the user ever
+/// typed into the field at all: the prewarmed settings window takes AppKit's automatic initial first
+/// responder, so the first real open resigns a field nobody touched, and committing that would rewrite
+/// `config.toml` on every open.
+static EDITED_TEXT_FIELDS: AtomicU32 = AtomicU32::new(0);
+
+fn text_field_bit(field: TextField) -> u32 {
+    match field {
+        TextField::CornerRadius => 1 << 0,
+        TextField::ClipboardMaxEntries => 1 << 1,
+    }
+}
+
+/// Consume the field's "the user edited this" bit. Takes the mask so the contract is testable without the
+/// global.
+fn take_edited_field(mask: &AtomicU32, field: TextField) -> bool {
+    mask.fetch_and(!text_field_bit(field), Ordering::SeqCst) & text_field_bit(field) != 0
+}
+
+/// Every numeric control is new after a content rebuild: no field carries an edit any more.
+pub(super) fn note_text_fields_rebuilt() {
+    EDITED_TEXT_FIELDS.store(0, Ordering::SeqCst);
 }
 
 /// Write a valid numeric value into the in-memory CONFIG.
@@ -1258,13 +1298,13 @@ fn smooth_slider_value(value: f64, minimum: f64, maximum: f64) -> f64 {
 /// speed under linear tracking and the acceleration curve's strength otherwise, a different
 /// meaning (see the module comment in mouse/pointer.rs) -- so it is neither shared nor shown
 /// while off.
-unsafe fn update_pointer_accel_visibility(ui: &SettingsUi) {
+pub(super) unsafe fn update_pointer_accel_visibility(ui: &SettingsUi) {
     let state: isize = msg_send![ui.disable_pointer_accel, state];
     ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, state == 1);
 }
 
 /// Refresh the conditional line and smooth controls from the selected mode.
-unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
+pub(super) unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
     let mode = selected_scroll_mode(ui);
     ui.page_canvases[2].set_group_visible(RowGroup::LineCount, mode == ScrollMode::Line);
     ui.page_canvases[2].set_group_visible(RowGroup::SmoothScrolling, mode == ScrollMode::Smooth);
@@ -1466,6 +1506,10 @@ pub(crate) fn refresh_service_controls_from_config() {
 /// a hidden settings window to the foreground.
 pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
     let cfg = CONFIG.read().unwrap().clone();
+    // A config change is exactly what makes the mouse page stale, and that is true whether the window is
+    // hidden, on another page, or showing the mouse page. Recording it here -- not inside the visibility
+    // branch below -- is what keeps the lazy fill from showing the values a reload replaced.
+    super::note_mouse_page_dirty();
     unsafe {
         with_settings_ui(|ui| {
             let Some(u) = ui.as_mut() else {
@@ -1480,14 +1524,8 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
             set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording, None);
 
-            ensure_selected_device();
-            let resolved = resolve_selected_from(&cfg);
-            let _: () = msg_send![
-                u.enable_mouse,
-                setState: if cfg.mouse.enabled { 1isize } else { 0isize }
-            ];
-            fill_mouse_device_controls(u, &resolved);
-            update_mouse_controls_enabled(u);
+            // Not mouse-specific: the display-mode pair and the clipboard-delete rows need this on every
+            // config change, whatever page is on screen.
             update_conditional_rows(u);
 
             let modifier_idx: isize = if cfg.keyboard.modifier == "command" {
@@ -1549,6 +1587,10 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             update_display_mode_dependent_visibility(u);
         });
     }
+    // Outside the borrow (the refill re-borrows the settings slot): if the mouse page is the one on screen,
+    // fill it from the reloaded config -- including the mapping rows and the device popup, which the old
+    // in-place patch skipped while it still marked the page clean.
+    super::materialize_mouse_page_if_visible();
 }
 
 /// Mapping from popup-item index to DeviceKey (1:1 with popup items), used by
@@ -1684,6 +1726,10 @@ pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
 /// SELECTED_DEVICE, so unsaved choices survive. No-op when the window isn't open (it is
 /// rebuilt on next open via load_settings_values anyway).
 pub(crate) fn refresh_device_popup_if_open() {
+    // The device list is an input of the mouse page, and this path only rebuilds the popup -- and only
+    // while the window is visible. A hot-plug with the window hidden must still invalidate the page, or the
+    // next open would show the device list it had before the change.
+    super::note_mouse_page_dirty();
     unsafe {
         with_settings_ui(|ui| {
             if let Some(u) = ui.as_ref() {
@@ -1722,6 +1768,7 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
                 update_mouse_controls_enabled(u);
                 update_mode_dependent_visibility(u);
                 update_pointer_accel_visibility(u);
+                super::note_mouse_page_materialized_after_direct_fill();
                 // Device switch: reload the in-edit mappings from the new device's own profile.
                 let dev = current_selected_device();
                 let prof_idx = find_profile_index(&cfg, dev);
@@ -1803,7 +1850,7 @@ fn suggested_export_log_name() -> String {
 mod tests {
     use super::{
         clipboard_delete_dependent_visibility_from_config, smooth_slider_display,
-        smooth_slider_value, Config,
+        smooth_slider_value, take_edited_field, text_field_bit, Config, Ordering, TextField,
     };
 
     #[test]
@@ -1814,6 +1861,34 @@ mod tests {
 
         cfg.clipboard.delete_after_paste = true;
         assert!(clipboard_delete_dependent_visibility_from_config(&cfg));
+    }
+
+    #[test]
+    fn only_a_field_the_user_edited_commits_on_end_editing() {
+        let mask = std::sync::atomic::AtomicU32::new(0);
+        assert!(
+            !take_edited_field(&mask, TextField::CornerRadius),
+            "an untouched field must not commit (the prewarmed window resigns it on every open)"
+        );
+        mask.fetch_or(text_field_bit(TextField::CornerRadius), Ordering::SeqCst);
+        assert!(
+            take_edited_field(&mask, TextField::CornerRadius),
+            "a field the user typed into must commit on blur"
+        );
+        assert!(
+            !take_edited_field(&mask, TextField::CornerRadius),
+            "one edit must commit once, not on every later resign"
+        );
+        assert!(
+            !take_edited_field(&mask, TextField::ClipboardMaxEntries),
+            "the two fields must not share a bit"
+        );
+        mask.store(0, Ordering::SeqCst);
+        mask.fetch_or(
+            text_field_bit(TextField::ClipboardMaxEntries),
+            Ordering::SeqCst,
+        );
+        assert!(take_edited_field(&mask, TextField::ClipboardMaxEntries));
     }
 
     #[test]

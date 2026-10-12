@@ -93,6 +93,13 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 picker_close as *mut c_void,
                 types.as_ptr(),
             );
+            // The header's settings button opens the settings window on the clipboard page.
+            class_addMethod(
+                cls,
+                sel!(openClipboardSettings:),
+                open_clipboard_settings as *mut c_void,
+                types.as_ptr(),
+            );
             // The picker's empty state offers the same action as the settings banner; the panel's
             // buttons target this class, so the selector has to exist here too.
             class_addMethod(
@@ -1100,6 +1107,77 @@ extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c
 /// The header's corner close button: the same dismissal as Esc with no query / an outside click.
 extern "C" fn picker_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     hide_picker();
+}
+
+/// The header's settings button: leave the panel and land on the clipboard page of the settings
+/// window. The panel goes first -- it is a floating overlay and the settings window is a real
+/// window, so keeping both up would leave a stale panel behind the window the user just asked for.
+/// `pub(super)` so the smoke runner can run the very action the button targets.
+/// The gear click's full in-app response, in milliseconds: from the timestamp the click's event carries, past
+/// the settings window coming up, to the panel being down (see `e2e_settings_click_ms`).
+static SETTINGS_CLICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The part of `SETTINGS_CLICK_MS` spent before this handler ran (event delivery), so the number above can
+/// be read apart from the wait for the main thread.
+static SETTINGS_CLICK_DELIVERY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The click path's measurement, published in `--e2e-state` as `settings_click_ms`. It is wider than
+/// `settings_open_ms` (the window build/select/present alone) and is what a "how long until the settings
+/// window is up" bound should use.
+pub(crate) fn e2e_settings_click_ms() -> u64 {
+    SETTINGS_CLICK_MS.load(Ordering::SeqCst)
+}
+
+/// The event-delivery part of `e2e_settings_click_ms`, published as `settings_click_delivery_ms`: a bound on
+/// the whole path is only meaningful if this is measured too, not assumed to be zero.
+pub(crate) fn e2e_settings_click_delivery_ms() -> u64 {
+    SETTINGS_CLICK_DELIVERY_MS.load(Ordering::SeqCst)
+}
+
+pub(super) extern "C" fn open_clipboard_settings(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    // Bring the settings window up FIRST, then take the panel down: the other order left a moment with
+    // neither surface on screen (the panel gone, the window not yet composed), which read as a stall on
+    // top of the window's own build cost.
+    let started = std::time::Instant::now();
+    // How long the click waited before this handler ran. `NSEvent.timestamp` and
+    // `NSProcessInfo.systemUptime` share the clock (seconds since boot), so the difference is the part of
+    // the response the handler itself cannot see -- measured rather than assumed to be zero.
+    let delivery_ms = unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let event: *mut AnyObject = msg_send![nsapp, currentEvent];
+        if event.is_null() {
+            0.0
+        } else {
+            let timestamp: f64 = msg_send![event, timestamp];
+            let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+            let uptime: f64 = msg_send![info, systemUptime];
+            ((uptime - timestamp) * 1000.0).max(0.0)
+        }
+    };
+    crate::settings::show_clipboard_page();
+    let shown = started.elapsed();
+    hide_picker();
+    let total = started.elapsed();
+    // Debug-level, click-path timing, and the number the A2 latency scenario bounds: from the click the
+    // event carries to the moment the panel is down and the window is up. Only the WindowServer's own
+    // compositing after this point is outside what the app can measure.
+    SETTINGS_CLICK_DELIVERY_MS.store(delivery_ms.round() as u64, Ordering::SeqCst);
+    SETTINGS_CLICK_MS.store(
+        (total.as_millis() + delivery_ms.round() as u128).min(u64::MAX as u128) as u64,
+        Ordering::SeqCst,
+    );
+    log_debug!(
+        "[settings-timing] gear_click delivery={}ms show={}ms hide={}ms total={}ms",
+        delivery_ms.round() as u64,
+        shown.as_millis(),
+        total.as_millis().saturating_sub(shown.as_millis()),
+        total.as_millis() + delivery_ms.round() as u128
+    );
 }
 
 /// Clear the visible history scope (see `remove_history_scope`) and release the cache files of the

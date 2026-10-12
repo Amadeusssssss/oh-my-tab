@@ -10,7 +10,7 @@ use objc2_foundation::{NSEdgeInsets, NSPoint, NSRange, NSRect, NSSize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -69,7 +69,12 @@ const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
 pub(super) const SETTINGS_PAGE_COUNT: usize = 8;
 pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize = 6;
-pub(super) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = 3;
+/// The clipboard history page. `pub(crate)` because the clipboard module's smoke runner asserts that
+/// its header button navigates HERE -- the page is named once, and the assertion cannot drift from it.
+pub(crate) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = 3;
+/// The Mouse page. Its controls are the only ones that cost real time to fill (they resolve the selected
+/// device and its mappings), so they are filled on demand rather than on every settings open.
+pub(super) const SETTINGS_MOUSE_PAGE_INDEX: usize = 2;
 pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = 7;
 
 /// Fixed width of the settings navigation pane, shared by layout and transient feedback.
@@ -531,10 +536,11 @@ pub(crate) use dispatch::{
     refresh_switcher_keystroke_and_mouse_controls_from_config,
 };
 pub(crate) use window::{
-    close_settings_from_switcher, invalidate_settings_window, refresh_permission_ui_if_visible,
-    refresh_system_appearance, reopen_for_app_activation, settings_collapsible_row_smoke_runner,
-    settings_layout_smoke_runner, settings_mouse_profile_callback_smoke_runner,
-    settings_state_sync_smoke_runner, settings_window_is_visible,
+    close_settings_from_switcher, e2e_presented_page, invalidate_settings_window,
+    refresh_permission_ui_if_visible, refresh_system_appearance, reopen_for_app_activation,
+    settings_collapsible_row_smoke_runner, settings_layout_smoke_runner,
+    settings_mouse_profile_callback_smoke_runner, settings_state_sync_smoke_runner,
+    settings_window_is_visible,
 };
 
 fn parse_f64(s: &str) -> Result<f64, ()> {
@@ -765,24 +771,48 @@ pub(crate) fn e2e_selected_sidebar() -> usize {
     SIDEBAR_SELECTED.load(Ordering::SeqCst)
 }
 
+/// Whether the About page is the one actually on screen: the window is visible AND that page is selected.
+/// The updater renders its prompt into the About page's host, so "the settings window exists" (or even "is
+/// visible" while the user sits on another page) is not the same question.
+pub(crate) fn about_page_is_visible() -> bool {
+    settings_window_is_visible()
+        && SIDEBAR_SELECTED.load(Ordering::SeqCst) == SETTINGS_ABOUT_PAGE_INDEX
+}
+
 /// Development-switch helper: open the settings window on a specific page (0=General .. 7=About).
 /// Unlike `open_about_updates` it triggers no update check; it only parks the window on a page.
 pub(crate) fn show_settings_page(page: usize) {
-    show_settings();
-    // Select twice: the first call animates (previous_idx != idx) and the spring never commits while
-    // the window is still off-screen, leaving the pill behind; the second call sees previous_idx == idx
-    // and takes the no-animation path, parking the pill on the target row for real.
-    select_sidebar(page.min(SETTINGS_PAGE_COUNT - 1));
-    select_sidebar(page.min(SETTINGS_PAGE_COUNT - 1));
+    // Present directly on the requested page: `show_settings_inner` selects it (twice, for the pill
+    // commit) while the window is still hidden, so the page is right on the first frame. Selecting after
+    // the presentation showed General first and then jumped to the target.
+    window::show_settings_on_page(page.min(SETTINGS_PAGE_COUNT - 1));
+}
+
+/// Build the settings window ahead of its first open (see `window::prewarm_settings_window`).
+pub(crate) fn prewarm_settings_window() {
+    window::prewarm_settings_window();
+}
+
+/// Whether the settings window has been built in this process (shown or not): the state the startup warm-up
+/// creates, and the precondition the latency scenario waits for before it clicks.
+pub(crate) fn settings_window_is_built() -> bool {
+    with_settings_ui(|ui| ui.is_some())
+}
+
+/// Wall time of the last settings open (see `window::e2e_last_open_ms`).
+pub(crate) fn e2e_last_open_ms() -> u64 {
+    window::e2e_last_open_ms()
+}
+
+/// Open the settings window on the clipboard history page. The page index stays private to this
+/// module; callers that mean "the clipboard settings" name that, not a number.
+pub(crate) fn show_clipboard_page() {
+    show_settings_page(SETTINGS_CLIPBOARD_PAGE_INDEX);
 }
 
 pub(crate) fn open_about_updates() {
-    show_settings();
-    // show_settings resets to the General page on every open; switch to About here.
-    // Same as show_settings_page: a second call takes the no-animation path so the highlight cannot
-    // stay behind when the window is being built for the first time.
-    select_sidebar(SETTINGS_ABOUT_PAGE_INDEX);
-    select_sidebar(SETTINGS_ABOUT_PAGE_INDEX);
+    // Same presenting call as every other entry: the page is selected before the window appears.
+    show_settings_page(SETTINGS_ABOUT_PAGE_INDEX);
     unsafe {
         with_settings_ui(|ui| {
             if let Some(u) = ui.as_ref() {
@@ -1254,14 +1284,118 @@ fn log_config_changes(old: &Config, new: &Config) {
 
 /// Populate settings controls from current CONFIG (refreshed on each open). Rebuilds the device
 /// popup to reflect hot-plug changes.
-fn load_settings_values() {
+/// Whether the mouse page's controls must be (re)filled right now. Pure, so both orderings the caller can
+/// present are testable: `requested` is the page this open is FOR (`None` for an in-place refresh) and
+/// `selected` is the page currently on screen, which only matters for a refresh.
+///
+/// The page is expensive (it resolves the selected device and renders its mappings, and asking which
+/// devices are connected used to cost ~170ms), and the settings window opens on General or Clipboard far
+/// more often than on Mouse, so filling it for every open was pure waste.
+fn mouse_page_needs_fill(
+    requested: Option<usize>,
+    selected: usize,
+    materialized: bool,
+    dirty: bool,
+) -> bool {
+    let target = requested.unwrap_or(selected);
+    target == SETTINGS_MOUSE_PAGE_INDEX && (!materialized || dirty)
+}
+
+/// Whether the mouse page's controls currently hold data (false after a content rebuild).
+static MOUSE_PAGE_MATERIALIZED: AtomicBool = AtomicBool::new(false);
+/// Whether the mouse page's data may have changed since it was filled (a config or permission change, or
+/// a fresh rebuild).
+static MOUSE_PAGE_DIRTY: AtomicBool = AtomicBool::new(true);
+
+/// The window's content was rebuilt: every control is new, so the mouse page has to be filled again.
+pub(super) fn note_settings_content_rebuilt() {
+    MOUSE_PAGE_MATERIALIZED.store(false, Ordering::SeqCst);
+    MOUSE_PAGE_DIRTY.store(true, Ordering::SeqCst);
+    // The numeric fields are new too: an edit recorded against the old controls must not commit through a
+    // fresh field the user has never touched.
+    dispatch::note_text_fields_rebuilt();
+}
+
+/// The mouse page was just filled from the live config.
+fn note_mouse_page_materialized() {
+    MOUSE_PAGE_MATERIALIZED.store(true, Ordering::SeqCst);
+    MOUSE_PAGE_DIRTY.store(false, Ordering::SeqCst);
+}
+
+/// A dispatch path filled every mouse-page control itself (the user picked another device): the page holds
+/// the reloaded device's values, so the lazy loader has nothing left to do.
+pub(super) fn note_mouse_page_materialized_after_direct_fill() {
+    note_mouse_page_materialized();
+}
+
+/// The mouse page's inputs changed (a device was plugged or unplugged): whatever it holds is stale, so the
+/// next time it is the page in use it must be filled again. Used by the hot-plug path, which only rebuilds
+/// the device popup and only while the window is visible.
+pub(super) fn note_mouse_page_dirty() {
+    MOUSE_PAGE_DIRTY.store(true, Ordering::SeqCst);
+}
+
+/// E2E: whether the mouse page's controls hold data (the lazy fill is observable state, not an
+/// implementation detail a test can infer).
+pub(crate) fn e2e_mouse_page_materialized() -> bool {
+    MOUSE_PAGE_MATERIALIZED.load(Ordering::SeqCst)
+}
+
+/// E2E: the mouse page's master switch state (0/1), which a scenario can read back to see that a reload
+/// really refilled this page's controls. 0 when there is no window.
+pub(crate) fn e2e_mouse_enabled_state() -> isize {
+    unsafe {
+        with_settings_ui(|ui_guard| {
+            let Some(ui) = ui_guard.as_ref() else {
+                return 0;
+            };
+            if ui.enable_mouse.is_null() {
+                return 0;
+            }
+            msg_send![ui.enable_mouse, state]
+        })
+    }
+}
+
+/// E2E: the text the mouse page shows for the pointer's line count, which is what "the page is filled"
+/// means in user terms (empty before the page is materialized).
+pub(crate) fn e2e_mouse_line_count_text() -> String {
+    unsafe {
+        with_settings_ui(|ui_guard| {
+            let Some(ui) = ui_guard.as_ref() else {
+                return String::new();
+            };
+            if ui.line_count_value_label.is_null() {
+                return String::new();
+            }
+            let text: *mut AnyObject = msg_send![ui.line_count_value_label, stringValue];
+            if text.is_null() {
+                String::new()
+            } else {
+                crate::ffi::nsstring_to_rust(text)
+            }
+        })
+    }
+}
+
+/// Load the settings controls from the live config for a page that is being opened (`Some(page)`) or for an
+/// in-place refresh (`None`).
+fn load_settings_values_for(requested_page: Option<usize>) {
+    if requested_page.is_none() {
+        // An in-place refresh means the values may have changed: whatever the mouse page shows is stale.
+        MOUSE_PAGE_DIRTY.store(true, Ordering::SeqCst);
+    }
     let cfg = CONFIG.read().unwrap().clone();
-    load_settings_from(&cfg);
+    load_settings_from(&cfg, requested_page);
+}
+
+fn load_settings_values() {
+    load_settings_values_for(None);
 }
 
 /// Populate settings controls from a given config (shared by normal open and post-restore
 /// refill).
-fn load_settings_from(cfg: &Config) {
+fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
     let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     unsafe {
         with_settings_ui(|ui_guard| {
@@ -1410,38 +1544,19 @@ fn load_settings_from(cfg: &Config) {
             ];
             update_windows_controls_enabled(ui);
 
-            // Mouse page: populate controls from the effective config of the selected device
-            // (merging "All Mice" + this device).
-            // Calibrate SELECTED_DEVICE first (against the current device list; falls back to the
-            // first device when uninitialized/unplugged), then resolve, so the UI shows the actually
-            // effective device's config (fixes the wrong-profile display on first open).
-            ensure_selected_device();
-            // Resolve the selected device's effective config from the given cfg (Config::default()
-            // during the restore-defaults preview).
-            let resolved = resolve_selected_from(cfg);
-            // enable_mouse (master switch) always reads the global flag.
-            let _: () = msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
-            // Fill the mouse page's per-device controls (reverse/accel/mode/line count/preset).
-            fill_mouse_device_controls(ui, &resolved);
-
-            // The mappings in-edit = the selected device's OWN profile mappings (not the merged
-            // values: edits/deletes only touch this device's dedicated profile; the wildcard
-            // "All Mice" profile has no UI entry, so it isn't edited here).
-            let dev = current_selected_device();
-            let prof_idx = find_profile_index(cfg, dev);
-            *MAPPING_EDITS.lock().unwrap() = prof_idx
-                .map(|i| cfg.mouse.profiles[i].button_mappings.clone())
-                .unwrap_or_default();
-
-            render_mapping_rows_locked(ui);
-
-            // Rebuild the device popup (refreshed on each settings open to reflect hot-plug).
-            rebuild_device_popup(ui);
-
-            // Freeze/unfreeze the controls below based on the enable_mouse state.
-            update_mouse_controls_enabled(ui);
-            // Recompute the three conditional row blocks (line count, tracking speed, the
-            // thumbnail-only pair) from their own conditions.
+            // Mouse page: filled only when it is the page being opened, or when it is the page on screen
+            // and its data is stale. Everything else in this function is a cheap control assignment; this
+            // block resolves a device and renders its mappings.
+            if mouse_page_needs_fill(
+                requested_page,
+                SIDEBAR_SELECTED.load(Ordering::SeqCst),
+                MOUSE_PAGE_MATERIALIZED.load(Ordering::SeqCst),
+                MOUSE_PAGE_DIRTY.load(Ordering::SeqCst),
+            ) {
+                materialize_mouse_page(ui, cfg);
+            }
+            // Not part of the mouse fill: this one helper also recomputes the display-mode pair (General)
+            // and the clipboard-delete rows (Clipboard), so every open needs it whatever page it is for.
             update_conditional_rows(ui);
 
             // Clipboard page: populate the recorded chord from the global config.
@@ -1575,6 +1690,71 @@ fn load_settings_from(cfg: &Config) {
             update_clipboard_controls_enabled(ui);
             update_window_control_controls_enabled(ui);
             update_quick_actions_controls_enabled(ui);
+        });
+    }
+}
+
+/// Fill every mouse-page control from `cfg`: the master switch, the per-device controls, the device popup,
+/// the mappings in edit, and the conditional rows that depend on them.
+///
+/// Extracted from `load_settings_from` so the page can be materialized on demand (see
+/// `mouse_page_needs_fill`) and from outside the value load (the sidebar selection).
+unsafe fn materialize_mouse_page(ui: &mut SettingsUi, cfg: &Config) {
+    // Calibrate SELECTED_DEVICE first (against the current device list; falls back to the first device
+    // when uninitialized/unplugged), then resolve, so the UI shows the actually effective device's config
+    // (fixes the wrong-profile display on first open).
+    ensure_selected_device();
+    // Resolve the selected device's effective config from the given cfg (Config::default() during the
+    // restore-defaults preview).
+    let resolved = resolve_selected_from(cfg);
+    // enable_mouse (master switch) always reads the global flag.
+    let _: () =
+        msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
+    // Fill the mouse page's per-device controls (reverse/accel/mode/line count/preset).
+    fill_mouse_device_controls(ui, &resolved);
+
+    // The mappings in-edit = the selected device's OWN profile mappings (not the merged values:
+    // edits/deletes only touch this device's dedicated profile; the wildcard "All Mice" profile has no UI
+    // entry, so it isn't edited here).
+    let dev = current_selected_device();
+    let prof_idx = find_profile_index(cfg, dev);
+    *MAPPING_EDITS.lock().unwrap() = prof_idx
+        .map(|i| cfg.mouse.profiles[i].button_mappings.clone())
+        .unwrap_or_default();
+
+    render_mapping_rows_locked(ui);
+
+    // Rebuild the device popup (refreshed on each settings open to reflect hot-plug).
+    rebuild_device_popup(ui);
+
+    // Freeze/unfreeze the controls below based on the enable_mouse state, and recompute the two conditional
+    // row groups THIS page owns (the line-count and tracking-speed blocks). The combined
+    // `update_conditional_rows` also covers the display-mode pair and the clipboard-delete rows, which
+    // belong to other pages: it stays in the value load so those pages keep being refreshed on every open.
+    update_mouse_controls_enabled(ui);
+    update_mode_dependent_visibility(ui);
+    update_pointer_accel_visibility(ui);
+
+    note_mouse_page_materialized();
+}
+
+/// Fill the mouse page if the page on screen is the Mouse page and its data is stale. Called after a
+/// sidebar selection (never from inside `with_settings_ui`: the value load re-borrows the settings slot).
+pub(super) fn materialize_mouse_page_if_visible() {
+    if !mouse_page_needs_fill(
+        None,
+        SIDEBAR_SELECTED.load(Ordering::SeqCst),
+        MOUSE_PAGE_MATERIALIZED.load(Ordering::SeqCst),
+        MOUSE_PAGE_DIRTY.load(Ordering::SeqCst),
+    ) {
+        return;
+    }
+    let cfg = CONFIG.read().unwrap().clone();
+    unsafe {
+        with_settings_ui(|ui_guard| {
+            if let Some(ui) = ui_guard.as_mut() {
+                materialize_mouse_page(ui, &cfg);
+            }
         });
     }
 }
@@ -1840,6 +2020,35 @@ unsafe fn grow_short_page_documents() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod mouse_page_lazy_fill_tests {
+    use super::*;
+
+    /// The two orderings the caller can present, plus the staleness rules. Filling the mouse page costs a
+    /// device resolution and a mapping render, and it used to happen on EVERY settings open -- including
+    /// the ones that open on General or Clipboard.
+    #[test]
+    fn the_mouse_page_is_filled_only_when_it_is_the_one_in_use() {
+        let mouse = SETTINGS_MOUSE_PAGE_INDEX;
+        let clipboard = SETTINGS_CLIPBOARD_PAGE_INDEX;
+        // Opening FOR the mouse page: fill when the controls are new or stale...
+        assert!(mouse_page_needs_fill(Some(mouse), clipboard, false, true));
+        assert!(mouse_page_needs_fill(Some(mouse), clipboard, true, true));
+        // ...and nothing when they already hold current data: that is the saving, and every input that
+        // can change them (config reload, device hot-plug, content rebuild) marks the page dirty.
+        assert!(!mouse_page_needs_fill(Some(mouse), clipboard, true, false));
+        // Opening for another page: never fill, even when the mouse page is what is on screen right now
+        // (it is about to be hidden -- this is the ordering that made reopening from the Mouse page pay).
+        assert!(!mouse_page_needs_fill(Some(clipboard), mouse, false, true));
+        // An in-place refresh: the page on screen decides, and only when its data is stale.
+        assert!(mouse_page_needs_fill(None, mouse, true, true));
+        assert!(!mouse_page_needs_fill(None, mouse, true, false));
+        assert!(!mouse_page_needs_fill(None, clipboard, true, true));
+        // A rebuilt window has fresh controls: not materialized even though the flag may look loaded.
+        assert!(mouse_page_needs_fill(None, mouse, false, false));
+    }
 }
 
 #[cfg(test)]

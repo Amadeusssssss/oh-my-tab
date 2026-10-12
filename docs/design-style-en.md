@@ -672,7 +672,15 @@ changes as keys come and go. The drag handle
 has a transparent 48×20pt hit area (rotated for horizontal streams), larger than its three visible
 dots; it stays localized to the handle rather than making the whole panel draggable. In a column,
 the hit area starts 4pt inside the top edge while the visible dots sit near its outer side, clear
-of the first keycap. In a column, a merge count takes its own small row below its keycap and
+of the first keycap. The clipboard picker carries the same handle vocabulary in the same place — three dots in a
+transparent band, with the panel never dragging by its background — but its band is the **whole top
+bar**: the header strip's top padding, full width by 28pt tall, which is what §6.1 asks of a control's
+hit target and costs the panel no height it did not already reserve. The three dots sit centered in
+that band as the hint, and dragging anywhere along it moves the panel; the controls below it (search
+field, filter pills, settings and close buttons) keep their own clicks. Grabbing the bar shows the
+open hand, holding it the closed hand, and a double-click puts the panel back where the configured
+position wants it.
+In a column, a merge count takes its own small row below its keycap and
 freezes at ×99; in every placement the count renders
 in muted text, adjacent to the name when inline -- it is metadata about the press, not part of the
 key's name. Long legends are shortened at the
@@ -740,6 +748,16 @@ Every custom-drawn control needs all six states, and each uses the token above, 
 
 Hit targets are at least 28×28; a text-only affordance needs padding to reach that. Hover and
 selection never change the layout (no size, no weight change) — only color.
+
+**Corner glyph buttons on a floating panel (exception).** The clipboard picker's two top-right glyph
+buttons — the close × and Clipboard Settings — carry no border and no focus ring, and have only
+normal/hover/pressed: that panel is a nonactivating floating panel whose keyboard focus never leaves
+the search field, so there is no keyboard focus ring and no selected/open state to express, and
+hover and pressed share one faint wash. (The close button still turns destructive red on hover;
+that is its semantic colour, not part of this exception.) The reason is grouping: the two buttons
+share one 28pt corner and are each other's neighbours, so giving one of them a border and fill would
+make it read as a different component family than the one beside it. Every other control keeps all
+six states of this section.
 
 ## 11. Accessibility and localization
 

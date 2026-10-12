@@ -97,6 +97,25 @@ pub(crate) unsafe fn primary_screen_frame() -> Option<NSRect> {
     Some(msg_send![primary, frame])
 }
 
+/// The primary display's visible frame (same display as [`primary_screen_frame`], minus the menu bar and
+/// the dock). Same warning: `NSScreen.mainScreen` follows the key window, and for a caller that means "the
+/// main display" that is a bug waiting for its panel to become key on another display.
+pub(crate) unsafe fn primary_screen_visible_frame() -> Option<NSRect> {
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    if screens.is_null() {
+        return None;
+    }
+    let count: usize = msg_send![screens, count];
+    if count == 0 {
+        return None;
+    }
+    let primary: *mut AnyObject = msg_send![screens, objectAtIndex: 0isize];
+    if primary.is_null() {
+        return None;
+    }
+    Some(msg_send![primary, visibleFrame])
+}
+
 /// Hover poll timer (main-thread runloop). While the overlay is shown, NSEvent.mouseLocation
 /// is read every 16ms to hit-test the cards -- independent of event delivery (moves while a
 /// side button is held are OtherMouseDragged delivered to a non-overlay target; every

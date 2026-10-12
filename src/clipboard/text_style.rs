@@ -481,7 +481,7 @@ pub(super) unsafe fn set_clear_confirmation_button_style(button: *mut AnyObject,
     let palette = clipboard_palette();
     let background = if hovered {
         // Give text buttons only a faint hover wash instead of restoring a solid destructive fill.
-        (palette.hover_bg & 0xFFFF_FF00) | if palette.dark { 0x28 } else { 0x18 }
+        panel_hover_wash()
     } else {
         0x00000000
     };
@@ -520,6 +520,41 @@ pub(super) unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: 
         0x00000000
     };
     crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
+}
+
+/// The panel's faint hover wash over the material: one value for the text actions and the
+/// borderless glyph buttons alike, so a control hovers like its neighbours in the same strip.
+fn panel_hover_wash() -> u32 {
+    let palette = clipboard_palette();
+    (palette.hover_bg & 0xFFFF_FF00) | if palette.dark { 0x28 } else { 0x18 }
+}
+
+/// The header's settings button. It is a glyph-only control in the corner next to the close
+/// button, so it keeps that button's family -- no bezel, no border -- and differs only in tint: a
+/// neutral ink that darkens with the same wash the text actions use, never the close button's
+/// destructive red. See the corner-glyph-button exception in `docs/design-style-en.md` §10.
+pub(super) unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: bool) {
+    if button.is_null() {
+        return;
+    }
+    let palette = clipboard_palette();
+    // Panel ink, not a raw palette colour: on frost the material decides the ink (same reason the
+    // filter pills route through `panel_ink`).
+    let (tint, role) = if hovered {
+        (palette.primary_text, crate::glass::PanelInk::Primary)
+    } else {
+        (palette.secondary_text, crate::glass::PanelInk::Secondary)
+    };
+    let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        let background = if hovered {
+            panel_hover_wash()
+        } else {
+            0x00000000
+        };
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
+    }
 }
 
 /// Replace the detail icon for its normal/hover/active state and reuse the single-button
@@ -621,6 +656,10 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             set_clear_confirmation_button_style(b, true);
             return;
         }
+        if action == sel!(openClipboardSettings:) {
+            set_settings_button_style(b, true);
+            return;
+        }
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(b, true);
             return;
@@ -667,6 +706,10 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
         let action: Sel = msg_send![b, action];
         if is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, false);
+            return;
+        }
+        if action == sel!(openClipboardSettings:) {
+            set_settings_button_style(b, false);
             return;
         }
         if (action == sel!(showItemDetails:)
@@ -743,6 +786,12 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *m
         let action: Sel = msg_send![button, action];
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(button, true);
+        }
+        // Pressed state for the settings button: it shares hover's wash (see
+        // `set_settings_button_style`), and setting it here keeps the state explicit rather than
+        // relying on whatever the borderless button would draw on its own.
+        if action == sel!(openClipboardSettings:) {
+            set_settings_button_style(button, true);
         }
 
         type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
@@ -1624,6 +1673,17 @@ pub(super) unsafe fn footer_legends_layout_is_sane() -> bool {
 pub fn refresh_localized_ui() {
     unsafe {
         rebuild_search_hint();
+        // The two header controls this change added carry translated strings too, and their view survives a
+        // locale switch: without this the tooltip and the accessibility label keep the previous language.
+        super::grip::refresh_grip_strings();
+        if let Some(button) = *PICKER_SETTINGS_BUTTON.lock().unwrap() {
+            let label = make_nsstring(&t("clipboard.open_settings"));
+            let _: () = msg_send![button.0, setAccessibilityLabel: label];
+            CFRelease(label as *const c_void);
+            let tooltip = make_nsstring(&t("clipboard.open_settings"));
+            let _: () = msg_send![button.0, setToolTip: tooltip];
+            CFRelease(tooltip as *const c_void);
+        }
         if let Some(search) = *SEARCH_FIELD.lock().unwrap() {
             let _: () = msg_send![search.0, setNeedsDisplay: true];
         }

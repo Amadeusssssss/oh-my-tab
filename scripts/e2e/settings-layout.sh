@@ -1,4 +1,5 @@
 #!/bin/bash
+# E2E_STEALS_FOCUS=1
 # A2 层 E2E 场景:设置窗口几何护栏(把"只有截图能看见"的事实变成断言)。
 #
 # 覆盖三类曾经只能靠目视发现、因而会静默回归的缺陷:
@@ -18,7 +19,13 @@
 # turn this scenario red; changing the page structure or the layout convention makes it fail loudly,
 # which is intended (such a change needs a human ack).
 #
-# 本场景不注入任何输入,因此不抢焦点;需要 GUI 会话与运行中的 dev app。分层见 AGENTS.md。
+# 本场景不注入输入,但**会抢焦点**:两次启动都用 `--open-settings=` 呈现设置窗口,而呈现会
+# 激活应用并把窗口置前(与 reopen-settings.sh 同类),所以按抢焦点场景声明,默认聚合运行会跳过它,
+# 需要 `--include-focus`。需要 GUI 会话与运行中的 dev app。分层见 AGENTS.md。
+# No input is injected, but the scenario DOES take focus: both launches use `--open-settings=`, and
+# presenting the settings window activates the app and orders the window front (same class as
+# reopen-settings.sh). It is declared focus-stealing, so the default aggregate run skips it unless
+# --include-focus is given. It needs a GUI session and the running dev app.
 #
 # 用法:scripts/e2e/settings-layout.sh
 # Exit code: 0 = 全部断言通过;非 0 = 失败(逐条打印原因)。
@@ -104,6 +111,14 @@ if data is None:
     raise SystemExit(1)
 
 views = data["views"]
+
+# 鼠标页按需填充(要解析设备并渲染映射):停在关于页时它必须是**未填充**的,这正是懒填充的意义。
+# 所以它的几何留到第二阶段 —— 真正显示它的那次启动 —— 再断言。
+# The mouse page is filled on demand (it resolves a device and renders its mappings). Opening on About must
+# leave it unfilled: that is what the lazy fill is for. Its geometry is asserted in the second phase, from
+# the launch that really shows it.
+mouse_filled = bool(data.get("settings_mouse_page_materialized"))
+check(not mouse_filled, "the mouse page is not filled before it is shown")
 
 
 def geom(node: dict) -> dict:
@@ -195,8 +210,20 @@ buttons = [
     and views[n["parent"]]["class"] == "OhMyTabHtmlActionButton"
     and views[n["parent"]]["frame"][2] <= 140.0
 ]
-check(len(buttons) == 3, "found the three in-row action buttons", f"found={len(buttons)}")
-if len(buttons) == 3:
+# 四个:查看指南行(settings.row_view_guide 的「打开」)、无障碍与屏幕录制行的「打开设置」、钥匙串行的
+# 「授予访问」。这一行是在本场景写死之后加的;它的按钮与同一共享口径一致(110×28、贴控制列右缘),
+# 所以这里把结构钉子更新到当下的既定结构(场景头里说明:结构改动必须人工确认)。
+# Four: the View-guide row's "Open", the accessibility and screen-recording rows' "Open Settings", and the
+# keychain row's "Grant Access". The View-guide row landed after this scenario pinned the count; its button
+# follows the same shared convention (110x28, flush to the control column), so the pin is updated to the
+# structure as intended (see the header: a structural change needs an explicit ack).
+check(len(buttons) == 4, "found the four in-row action buttons", f"found={len(buttons)}")
+# 几何检查跑在**实际找到的**按钮上,不受上面的数量钉子影响:数量错了就已经报错,几何不该跟着被跳过
+# (曾经写成 `== 3`,于是数量改成 4 之后共享高度断言被静默跳过)。
+# The geometry checks run over the buttons actually found, not gated on the count pin: a wrong count is
+# already a problem, and the shared geometry must not be skipped along with it (it was `== 3`, so raising the
+# count silently skipped the height assertion).
+if buttons:
     check(
         all(abs(b["h"] - 32.0) <= 0.5 for b in buttons),
         "every in-row action button uses the shared 32pt height",
@@ -235,11 +262,13 @@ if labels:
     # 步长与预期出现次数(次数是页面结构的钉子:结构变了就会红,需要人工确认)。
     # Steps and their expected occurrence counts; the counts pin the page structure, so a structural
     # change fails loudly and needs a human ack.
+    # 次数跟着上面的查看指南行 +1:同行标签+值 3 -> 4,行到行 5 -> 6。
+    # The counts follow the added View-guide row above: label+value on one row 3 -> 4, row to row 5 -> 6.
     allowed = {
-        0.0: ("a label and its value on one row", 3),
+        0.0: ("a label and its value on one row", 4),
         20.0: ("the page header block (app name -> version)", 1),
         43.0: ("a section header to its first row", 3),
-        60.0: ("row to row (52pt row + 8pt gap)", 5),
+        60.0: ("row to row (52pt row + 8pt gap)", 6),
         # 24 (section header gap) + 4 (title -> card) + 20 (header) + 16.2 (row label offset in a
         # 52pt row) + 8 (card bottom inset) = 72.2, all documented tokens.
         72.2: ("a card to the next section header", 2),
@@ -315,6 +344,9 @@ for root in sorted(expected_pages):
     page = next((entry for entry in page_entries if entry.get("root") == root), None)
     if page is None:
         continue
+    if root == "page_2_mouse" and not mouse_filled:
+        print(f"  info {root}: not filled yet; its geometry is asserted in the mouse phase")
+        continue
     doc = page.get("doc")
     if not doc or doc[0] <= 0.0:
         check(False, f"{root}: document geometry is present", f"doc={doc}")
@@ -361,3 +393,144 @@ total = len(checks) + len(problems)
 print(f"e2e settings-layout: {'PASS' if not problems else 'FAIL'} ({len(checks)}/{total} checks)")
 raise SystemExit(1 if problems else 0)
 PY
+about_status=$?
+if [ "$about_status" != "0" ]; then
+    echo "e2e settings-layout: FAIL: the About phase reported problems" >&2
+    exit 1
+fi
+
+# --- 第二阶段:鼠标页真的被填充之后的几何 ---------------------------------
+# 懒填充意味着"窗口一建好就有整棵视图树"不再成立,而第一阶段的关于页快照正好看到未填充的鼠标页。
+# 几何护栏不能因此放过它:这里用停在鼠标页的那次启动,断言填充后的文档高度、页头内边距、底部内边距,
+# 以及侧栏高亮确实落在鼠标行上。
+# Phase 2: the mouse page, filled. The lazy fill means the view tree is no longer complete the moment the
+# window is built, and phase 1 deliberately looks at the unfilled page. The geometry guard must not lose
+# the page to that: this launch shows it, so its document height, top/bottom padding and the sidebar pill
+# are asserted on the real thing.
+mouse_state="/tmp/omt-e2e-settings-mouse.json"
+rm -f "$mouse_state" "${mouse_state%.json}.tmp"
+mouse_out="$("$repo_dir/scripts/dev-restart.sh" --open-settings=2 \
+    --e2e-state="$mouse_state" --no-onboarding 2>&1)"
+echo "$mouse_out" | grep -q "^restart ok" || {
+    echo "$mouse_out" | tail -20 >&2
+    fail "dev-restart.sh did not bring the app up for the mouse phase"
+}
+echo "$mouse_out" | grep -E "^(restart ok|build-version|app args)" || true
+
+python3 - "$mouse_state" <<'PY'
+import json
+import sys
+import time
+
+state_file = sys.argv[1]
+problems: list[str] = []
+checks: list[str] = []
+
+
+def check(ok: bool, label: str, detail: str = "") -> None:
+    (checks if ok else problems).append(f"{label}{(': ' + detail) if detail else ''}")
+
+
+data = None
+last_seq = None
+stable_reads = 0
+deadline = time.time() + 5
+while time.time() < deadline:
+    try:
+        with open(state_file) as handle:
+            candidate = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError):
+        candidate = None
+    if (
+        candidate
+        and candidate.get("views")
+        and candidate.get("selected_sidebar") == 2
+        and candidate.get("settings_mouse_page_materialized")
+    ):
+        if candidate.get("seq") == last_seq:
+            stable_reads += 1
+            if stable_reads >= 5:
+                data = candidate
+                break
+        else:
+            last_seq = candidate.get("seq")
+            stable_reads = 0
+    time.sleep(0.05)
+
+check(data is not None, "the app settled on the filled mouse page", f"seq={last_seq}")
+if data is None:
+    print("\n".join(problems))
+    raise SystemExit(1)
+
+views = data["views"]
+pill = [n for n in views if n["root"] == "sidebar_highlight"]
+mouse_row = [n for n in views if n["root"] == "sidebar_2_mouse"]
+general_row = [n for n in views if n["root"] == "sidebar_0_general"]
+page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_2_mouse"), None)
+
+check(page is not None, "the mouse page's scroll geometry is in the snapshot")
+if page is not None:
+    doc_h, content_top, content_bottom = page["doc"]
+    clip_h = page["clip"][3]
+    extent = content_top - content_bottom
+    # Same conventions as phase 1 (SettingsPageHeader::TOP_PADDING / the bottom padding token).
+    TOP_PADDING = 48.0
+    BOTTOM_PADDING = 72.0
+    DOC_TOL = 1.5
+    # 填充后才成立的钉子:文档高度必须容下真实内容,内容顶点必须落在页头内边距之下,
+    # 内容底边必须正好压在底部内边距上(否则滚到底就是死空白)。
+    # What only becomes assertable once the page is filled: the document must fit the real content, the
+    # content must start under the page-header padding, and it must end exactly on the bottom padding.
+    needed = extent + TOP_PADDING + BOTTOM_PADDING
+    check(
+        doc_h + DOC_TOL >= needed or doc_h + DOC_TOL >= clip_h,
+        "the filled mouse page's document is tall enough for its content",
+        f"doc={doc_h:.0f} needed={needed:.0f} clip={clip_h:.0f}",
+    )
+    header_gap = doc_h - content_top
+    check(
+        TOP_PADDING - DOC_TOL <= header_gap <= TOP_PADDING + 54.0 + DOC_TOL,
+        "the filled mouse page's content sits under the page header padding",
+        f"gap={header_gap:.1f}",
+    )
+    if doc_h > clip_h + DOC_TOL:
+        check(
+            abs(content_bottom - BOTTOM_PADDING) <= DOC_TOL,
+            "the filled mouse page's content ends on the bottom padding",
+            f"bottom={content_bottom:.1f}",
+        )
+    # 填充会插进映射行,文档变高:这时更要把"高亮 pill 跟着选中行"再钉一次。
+    if pill and mouse_row:
+        p, row = pill[0]["frame"], mouse_row[0]["frame"]
+        check(
+            abs((p[1] + p[3] / 2) - (row[1] + row[3] / 2)) <= 0.5
+            and abs(p[0] - row[0]) <= 0.5
+            and abs(p[2] - row[2]) <= 0.5,
+            "the highlight pill sits on the mouse row after the fill",
+            f"pill={p} row={row}",
+        )
+    else:
+        check(False, "the sidebar views are in the mouse-phase snapshot")
+    if general_row:
+        check(
+            abs((pill[0]["frame"][1] + pill[0]["frame"][3] / 2) - (general_row[0]["frame"][1] + general_row[0]["frame"][3] / 2)) > 1.0,
+            "the highlight pill is not left on the first sidebar row",
+        )
+
+for label in checks:
+    print(f"  ok   {label}")
+for label in problems:
+    print(f"  FAIL {label}")
+total = len(checks) + len(problems)
+print(f"e2e settings-layout (mouse phase): {'PASS' if not problems else 'FAIL'} ({len(checks)}/{total} checks)")
+raise SystemExit(1 if problems else 0)
+PY
+mouse_status=$?
+if [ "$mouse_status" != "0" ]; then
+    echo "e2e settings-layout: FAIL: the mouse phase reported problems" >&2
+    exit 1
+fi
+
+echo
+echo "e2e settings-layout: PASS (About phase + filled mouse page)"
+exit 0

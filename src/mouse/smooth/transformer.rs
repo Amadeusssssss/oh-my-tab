@@ -23,6 +23,18 @@ use std::time::Instant;
 
 const TICK_INTERVAL: f64 = 1.0 / 120.0;
 
+/// Whether a smooth-scroll stream is being emitted right now. The startup settings warm-up reads it: building
+/// ~200 views blocks the main thread for ~350ms, and doing that on top of a live scroll stream visibly
+/// truncates the stream (measured: the A2 smooth-scroll scenario lost its momentum_ended phase 3 times out of
+/// 3 with the warm-up firing at +1s, against 2 of 2 passes when it did not).
+static SCROLL_STREAM_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a smooth-scroll stream is currently being emitted (see `SCROLL_STREAM_ACTIVE`).
+pub(crate) fn stream_is_active() -> bool {
+    SCROLL_STREAM_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct SmoothTransformer {
     engine: SmoothEngine,
     settings: Option<SmoothSettings>,
@@ -115,6 +127,7 @@ impl SmoothTransformer {
     }
 
     pub(crate) unsafe fn shutdown(&mut self) {
+        SCROLL_STREAM_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         self.stop_timer();
         self.settings = None;
         self.accumulator = SubpixelAccumulator::default();
@@ -132,8 +145,11 @@ impl SmoothTransformer {
             self.post_emission(emission.phase, emission.delta_x, emission.delta_y);
         }
         if !self.engine.is_running() {
+            SCROLL_STREAM_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             self.stop_timer();
             crate::schedule_smooth_scroll_e2e_record();
+        } else {
+            SCROLL_STREAM_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

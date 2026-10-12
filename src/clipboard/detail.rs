@@ -527,6 +527,13 @@ pub(crate) unsafe fn apply_theme() {
             set_clear_confirmation_button_style(button.0, false);
         }
     }
+    // The two header controls this change added are repainted here too: the picker window is reused
+    // across showings, so an ink captured at build time would keep the previous mode's colour (the
+    // handle's dots and the gear's tint). The rest of the header predates this and is a separate chore.
+    super::grip::refresh_grip_style();
+    if let Some(button) = *PICKER_SETTINGS_BUTTON.lock().unwrap() {
+        set_settings_button_style(button.0, false);
+    }
 }
 
 pub(super) unsafe fn ensure_picker_window() {
@@ -681,6 +688,7 @@ pub(super) unsafe fn ensure_picker_window() {
         release_obj(strip);
         // The search field's own fill is translucent and its text sits on the panel material
         // otherwise; the material is the panel's surface.
+        *PICKER_HEADER_STRIP.lock().unwrap() = Some(ObjPtr::new(strip));
         strip
     };
 
@@ -797,7 +805,7 @@ pub(super) unsafe fn ensure_picker_window() {
     // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
     // with a 1px inner ring; the placeholder is left-aligned. The corner close button shares the
     // row, so the shared geometry gives the field the remaining width.
-    let (search_frame, close_frame) = picker_header_frames();
+    let (search_frame, gear_frame, close_frame) = picker_header_frames();
     let search_w = search_frame.size.width;
     let search: *mut AnyObject = msg_send![search_cls, alloc];
     let search: *mut AnyObject = msg_send![search, initWithFrame: search_frame];
@@ -923,6 +931,59 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![header_strip, addSubview: close_button];
     release_obj(close_button);
     *PICKER_CLOSE_BUTTON.lock().unwrap() = Some(ObjPtr::new(close_button));
+
+    // The drag handle: a transparent band centered on the panel's top edge, holding three dots.
+    // It is the ONLY way the panel moves -- the rows and the corner buttons keep their clicks.
+    super::grip::make_grip_view(header_strip);
+
+    // The settings button, immediately left of the ×: it opens the settings window on the
+    // clipboard page, so the switch a user is looking for is the one they land on. A borderless
+    // glyph button like its neighbour (see the corner-glyph-button exception in the style doc).
+    let gear_button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let gear_button: *mut AnyObject = msg_send![gear_button, initWithFrame: gear_frame];
+    let _: () = msg_send![gear_button, setBordered: false];
+    let _: () = msg_send![gear_button, setWantsLayer: true];
+    let gear_layer: *mut AnyObject = msg_send![gear_button, layer];
+    if !gear_layer.is_null() {
+        let _: () = msg_send![gear_layer, setCornerRadius: PICKER_CLOSE_BTN_R];
+        let _: () = msg_send![gear_layer, setMasksToBounds: true];
+    }
+    // An SF Symbol sized by its own configuration: a symbol image is not sized by the button's
+    // font, so the point size is where the glyph's weight in the corner comes from.
+    let symbol_name = make_nsstring("gearshape");
+    let gear_image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_name,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_name as *const c_void);
+    if !gear_image.is_null() {
+        let gear_config: *mut AnyObject = msg_send![
+            class!(NSImageSymbolConfiguration),
+            configurationWithPointSize: PICKER_GEAR_GLYPH_SIZE,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        let gear_image: *mut AnyObject =
+            msg_send![gear_image, imageWithSymbolConfiguration: gear_config];
+        let _: () = msg_send![gear_image, setTemplate: true];
+        let _: () = msg_send![gear_button, setImage: gear_image];
+    }
+    let gear_title = make_nsstring("");
+    let _: () = msg_send![gear_button, setTitle: gear_title];
+    CFRelease(gear_title as *const c_void);
+    let _: () = msg_send![gear_button, setTarget: observer()];
+    let _: () = msg_send![gear_button, setAction: sel!(openClipboardSettings:)];
+    set_settings_button_style(gear_button, false);
+    add_hover_tracking(gear_button);
+    let gear_label = make_nsstring(&t("clipboard.open_settings"));
+    let _: () = msg_send![gear_button, setAccessibilityLabel: gear_label];
+    CFRelease(gear_label as *const c_void);
+    let gear_tooltip = make_nsstring(&t("clipboard.open_settings"));
+    let _: () = msg_send![gear_button, setToolTip: gear_tooltip];
+    CFRelease(gear_tooltip as *const c_void);
+    let _: () = msg_send![header_strip, addSubview: gear_button];
+    release_obj(gear_button);
+    *PICKER_SETTINGS_BUTTON.lock().unwrap() = Some(ObjPtr::new(gear_button));
     release_obj(search);
     *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr::new(search));
     // Text changes (including the system clear button / NSSearchField's Esc clear) filter live.

@@ -226,6 +226,10 @@ pub(super) fn select_sidebar(idx: usize) {
             page.validate(page_names[idx]);
         });
     }
+    // Landing on the Mouse page has to fill it: the value load skipped it when this open came in on
+    // another page. This runs after the closure above, because the materialization re-borrows the settings
+    // slot and a nested borrow would be swallowed by the reentrancy guard.
+    crate::settings::materialize_mouse_page_if_visible();
     // A2 E2E: the selection and the highlight pill are parked, so write a geometry snapshot for
     // scripts/e2e. It must sit outside the with_settings_ui closure -- a nested borrow there is
     // silently swallowed by the reentrancy guard.
@@ -452,6 +456,38 @@ pub(super) fn show_settings() {
     show_settings_inner(None, 0, None, true);
 }
 
+/// Present the settings window on `page`. The page is selected (and its pill committed) while the window
+/// is still hidden, so the first frame the user sees is already the requested page -- this is the entry
+/// every "open settings on page X" caller uses, including the clipboard picker's settings button.
+pub(super) fn show_settings_on_page(page: usize) {
+    show_settings_inner(None, page, None, true);
+}
+
+/// Build the settings window and fill its controls WITHOUT presenting it, so the first real open only has
+/// to select a page and order the window front.
+///
+/// Idempotent by design: a window that already exists -- open, closed by the user, or built by an earlier
+/// call -- is left completely alone. Re-entering the load path here would collapse confirmation cards and
+/// reset the page the user left the window on.
+pub(super) fn prewarm_settings_window() {
+    crate::debug_assert_main_thread();
+    // `--no-settings-prewarm`: the cold number must stay reproducible by one command, and a scenario that
+    // measures the warm path needs the cold path next to it as its counter-example.
+    if crate::dev_flags::enabled("no-settings-prewarm") {
+        return;
+    }
+    if with_settings_ui(|ui| ui.is_some()) {
+        return;
+    }
+    // `present_window: false` builds and loads without ordering the window front or switching the app's
+    // activation policy; it still runs the layout settle and the content tightening, so the window is
+    // final when it is first shown.
+    show_settings_inner(None, 0, None, false);
+    // A frame carrying `settings_window_built`, so a scenario can wait for the warm-up instead of guessing
+    // that it happened (the A2 latency scenario clicks only after this).
+    crate::e2e_state::record("settings_prewarmed");
+}
+
 /// Reopen Settings from an application-level activation. A visible Settings window keeps its
 /// current page; an active Sparkle wait-for-quit flow also retains the existing About surface.
 pub(crate) fn reopen_for_app_activation(update_waiting_for_quit: bool) {
@@ -486,6 +522,18 @@ pub(crate) fn reopen_for_app_activation(update_waiting_for_quit: bool) {
             page
         };
         show_settings_inner(None, page, None, true);
+    }
+}
+
+/// The sidebar page that was selected when the settings window was last ordered front, for
+/// `--e2e-state`. `None` until the window has been presented once in this process.
+static PRESENTED_PAGE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// A2 E2E: the page the settings window appeared on, or `None` before its first presentation.
+pub(crate) fn e2e_presented_page() -> Option<usize> {
+    match PRESENTED_PAGE.load(Ordering::SeqCst) {
+        usize::MAX => None,
+        page => Some(page),
     }
 }
 
@@ -591,27 +639,68 @@ unsafe fn restore_settings_scroll_offset(scroll: *mut AnyObject, origin: NSPoint
     let _: () = msg_send![scroll, reflectScrolledClipView: clip];
 }
 
+/// Wall time of the last presenting `show_settings_inner`, in milliseconds (see `e2e_last_open_ms`).
+static LAST_OPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The app-side settings-open path, from the click handler's call into the window build/select/compose
+/// until the window is ordered front and its page tightened. Excludes the caller's own steps (hiding the
+/// picker) and everything the window server does afterwards.
+pub(crate) fn e2e_last_open_ms() -> u64 {
+    LAST_OPEN_MS.load(Ordering::SeqCst)
+}
+
+/// Log one `[settings-timing]` phase at debug level and restart the phase clock.
+///
+/// The settings open path is on the user's click path (the clipboard picker's gear, the menu item), and its
+/// cost is dominated by building the window and filling the mouse page. These lines are the instrument that
+/// says whether the window was already warm and which phase still costs; they are cheap and stay in.
+fn mark_settings_phase(name: &str, phase: &mut std::time::Instant, total: std::time::Instant) {
+    log_debug!(
+        "[settings-timing] {name}={}ms total={}ms",
+        phase.elapsed().as_millis(),
+        total.elapsed().as_millis()
+    );
+    *phase = std::time::Instant::now();
+}
+
 fn show_settings_inner(
     preserved_frame: Option<NSRect>,
     page: usize,
     preserved_scroll_offsets: Option<[NSPoint; SETTINGS_PAGE_COUNT]>,
     present_window: bool,
 ) {
+    let total_started = std::time::Instant::now();
+    let mut phase_started = total_started;
+    let window_was_built;
     unsafe {
         {
             let missing = with_settings_ui(|ui| ui.is_none());
+            window_was_built = missing;
             if missing {
                 create_settings_window();
             }
+            log_debug!(
+                "[settings-timing] open present={present_window} built={missing} page={page}"
+            );
+            mark_settings_phase("create", &mut phase_started, total_started);
         }
         // Always reopen in the collapsed state so no unfinished confirmation lingers (both cards).
         collapse_restore_confirmations(false);
         // A window order-out is not guaranteed to deliver mouseExited for its tracking areas;
         // clear the active row fill before reusing the settings window.
         widgets::clear_sidebar_hover();
-        load_settings_values();
-        // Normal opens return to General; seamless refreshes preserve the current page.
+        // The requested page decides whether the mouse page is filled: opening on General or Clipboard
+        // must not pay for the mouse page's device resolution and mapping render.
+        load_settings_values_for(Some(page));
+        mark_settings_phase("load", &mut phase_started, total_started);
+        // Normal opens return to General; seamless refreshes preserve the current page. The selection is
+        // made HERE, before the window is ordered front, so the first frame the user sees is already the
+        // requested page -- presenting first and selecting afterwards showed General and then jumped.
+        // Selected before the window is ordered front, so the first frame the user sees is already the
+        // requested page. One call is enough: `move_highlight` parks the pill without implicit animation, and
+        // this runs before the presentation, so the page is settled by the time the window appears.
         select_sidebar(page);
+        mark_settings_phase("select", &mut phase_started, total_started);
         with_settings_ui(|ui| {
             if let Some(u) = ui.as_ref() {
                 if present_window {
@@ -629,6 +718,11 @@ fn show_settings_inner(
                     }
                     let _: () =
                         msg_send![u.window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
+                    // The page selected when the window actually appeared: a scenario can then assert the
+                    // window never showed the wrong page first. The state frame written by `select_sidebar`
+                    // is overwritten twice inside one run-loop turn, so the final frame alone cannot tell
+                    // the two orders apart.
+                    PRESENTED_PAGE.store(SIDEBAR_SELECTED.load(Ordering::SeqCst), Ordering::SeqCst);
                     // Recompute the conditional rows after the window is on screen: AppKit may
                     // re-place subviews by their autoresizing masks the first time a window is
                     // displayed, undoing the compaction done while it was still hidden. The
@@ -663,15 +757,25 @@ fn show_settings_inner(
                     // scrollbar starts at the top of the track instead of the middle.
                     scroll_page_to_top(u.general_view);
                 }
-                if present_window {
-                    // Clear the default first responder so focus does not land on the Glass color control on open.
-                    let _: bool =
-                        msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
-                    set_text_input_active(false);
-                }
                 refresh_settings_warning_banner(u);
             }
         });
+        mark_settings_phase("compose", &mut phase_started, total_started);
+    }
+    if present_window {
+        // Clear the default first responder so focus does not land on the Glass color control on open.
+        // This runs OUTSIDE the `with_settings_ui` borrow on purpose: ending a field-editing session
+        // synchronously calls the text-field delegate (`dispatch::on_control_text_did_end_editing`), which
+        // takes that same borrow, and a live RefCell guard across it aborts the process with "RefCell
+        // already borrowed". A prewarmed window already holds AppKit's automatic initial first responder
+        // (a text field), so on this path the delegate really does fire.
+        let window =
+            with_settings_ui(|ui| ui.as_ref().map(|u| u.window)).unwrap_or(std::ptr::null_mut());
+        if !window.is_null() {
+            let _: bool =
+                unsafe { msg_send![window, makeFirstResponder: std::ptr::null::<AnyObject>()] };
+        }
+        set_text_input_active(false);
     }
     // Conditional rows / the permission banner change the content height, so tighten once more; if the
     // height changed, the scroll offset set above is stale, so park the current page back at the top.
@@ -696,6 +800,25 @@ fn show_settings_inner(
                 }
             });
         }
+    }
+    mark_settings_phase(
+        if window_was_built {
+            "done-built"
+        } else {
+            "done-warm"
+        },
+        &mut phase_started,
+        total_started,
+    );
+    // A2 E2E: the app's own wall time for this open, published so a scenario can bound the open path
+    // without parsing the debug log. Only a presenting call publishes it -- a prewarm is not an open.
+    if present_window {
+        LAST_OPEN_MS.store(
+            total_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            Ordering::SeqCst,
+        );
+        // Written after the timing is stored: the scenario polls for a frame whose number is this open's.
+        crate::e2e_state::record("settings_opened");
     }
 }
 
@@ -2294,6 +2417,8 @@ fn rebuild_settings_content(window: *mut AnyObject) {
 }
 
 fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
+    // Every control is new: whatever the mouse page held is gone with the old views.
+    crate::settings::note_settings_content_rebuilt();
     unsafe {
         let palette = settings_palette();
         // Keep the original compact settings window dimensions while applying the redesign's

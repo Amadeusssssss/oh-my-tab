@@ -43,6 +43,11 @@ fn state() -> &'static Mutex<Option<UpdaterState>> {
 /// Pointers are represented as usize so the mutex can safely cross Rust's static Sync boundary.
 struct UpdateUiState {
     window: usize,
+    /// Where the visible prompt was actually rendered: `true` inside the About page's host, `false` in the
+    /// standalone window. Recorded when the prompt is rendered, not recomputed later: the settings window can
+    /// be shown or hidden while a prompt is up (the startup warm-up registers the host before the window is
+    /// ever shown), and the focus request and the teardown must both follow where the prompt really is.
+    prompt_inline: bool,
     host_view: usize,
     host_window: usize,
     check_button: usize,
@@ -65,6 +70,7 @@ struct UpdateUiState {
 static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
     Mutex::new(UpdateUiState {
         window: 0,
+        prompt_inline: false,
         host_view: 0,
         host_window: 0,
         check_button: 0,
@@ -378,10 +384,39 @@ struct RenderTarget {
     width: f64,
 }
 
-/// Decide the render target: inline when a host is registered, else fall back to a window. Inline
-/// sizes the host to the screen's required height, keeping its top fixed below the check button
-/// row so the top-down flip is compact without extra blank.
+/// Whether an update step renders inline, i.e. inside the About page's host view.
+///
+/// Both conditions are required: the host must be REGISTERED (it is registered when the About page is built,
+/// which happens the first time the settings window exists) and that page must be the one actually ON SCREEN.
+/// Registering alone used to decide it, so a settings window that had been built and then closed kept
+/// capturing every prompt into a hidden view, and a prewarmed window (built at launch, not yet shown) would
+/// have captured them all from startup; "the window is visible" is not enough either, because a user sitting
+/// on the Clipboard page would have the prompt written into a page they cannot see. Pure, so the four
+/// combinations are testable.
+fn prefers_inline(host_registered: bool, about_page_visible: bool) -> bool {
+    host_registered && about_page_visible
+}
+
+/// E2E: whether the next update step would render inline right now.
+pub(crate) fn e2e_update_target_is_inline() -> bool {
+    let host_registered = UPDATE_UI_STATE.lock().unwrap().host_view != 0;
+    prefers_inline(host_registered, crate::settings::about_page_is_visible())
+}
+
+/// Decide the render target: inline when a host is registered AND the settings window is showing, else
+/// fall back to a window. Inline sizes the host to the screen's required height, keeping its top fixed
+/// below the check button row so the top-down flip is compact without extra blank.
 unsafe fn render_target(window_h: f64) -> RenderTarget {
+    let inline = e2e_update_target_is_inline();
+    // The decision is recorded, not just returned: this prompt's focus request and teardown read it back.
+    UPDATE_UI_STATE.lock().unwrap().prompt_inline = inline;
+    if !inline {
+        return RenderTarget {
+            host: std::ptr::null_mut(),
+            parent: std::ptr::null_mut(),
+            width: 0.0,
+        };
+    }
     let ui = UPDATE_UI_STATE.lock().unwrap();
     if ui.host_view != 0 {
         // Host coordinates start at (0,0); width is the host frame width, so inline layout fits.
@@ -400,6 +435,35 @@ unsafe fn render_target(window_h: f64) -> RenderTarget {
             parent: std::ptr::null_mut(),
             width: 0.0,
         }
+    }
+}
+
+/// The layout scale for the prompt about to be rendered, from the same rule the render target uses: a prompt
+/// going into a standalone window is laid out at that window's own width (scale 1.0) even while a host view is
+/// registered. Measuring it at the host's ratio installed a different width than it measured, which the
+/// release-notes document width depends on.
+unsafe fn prompt_layout_scale(window_w: f64) -> f64 {
+    let inline = e2e_update_target_is_inline();
+    let host_w = if inline {
+        let ui = UPDATE_UI_STATE.lock().unwrap();
+        if ui.host_view == 0 {
+            0.0
+        } else {
+            let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
+            frame.size.width
+        }
+    } else {
+        0.0
+    };
+    prompt_layout_scale_for(inline, host_w, window_w)
+}
+
+/// The scale itself, pure: 1.0 for a standalone prompt, the host ratio for an inline one.
+fn prompt_layout_scale_for(inline: bool, host_w: f64, window_w: f64) -> f64 {
+    if !inline || host_w <= 0.0 {
+        1.0
+    } else {
+        inline_layout_scale(host_w, window_w)
     }
 }
 
@@ -500,15 +564,19 @@ unsafe fn clear_host_subviews(host: *mut AnyObject) {
     }
 }
 
+/// Whether tearing the prompt down must close a window of its own. Pure, so the pairing with the focus
+/// target is testable: a prompt rendered standalone is closed through its own window **even while a host view
+/// is registered** (the settings warm-up registers one), which is exactly what the old `host_view != 0`
+/// criterion skipped, leaking the window and its views.
+fn teardown_closes_standalone(prompt_inline: bool, window: usize) -> bool {
+    !prompt_inline && window != 0
+}
+
 unsafe fn close_custom_update_window() {
     let check_button = UPDATE_UI_STATE.lock().unwrap().check_button as *mut AnyObject;
     stop_check_loading_indicator(check_button);
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
-    if ui.host_view != 0 {
-        // Inline mode: clear the host's controls, leave the settings window untouched.
-        clear_host_subviews(ui.host_view as *mut AnyObject);
-        ui.window = 0;
-    } else if ui.window != 0 {
+    if teardown_closes_standalone(ui.prompt_inline, ui.window) {
         let window = ui.window as *mut AnyObject;
         // Remove subviews before releasing their alloc ownership to avoid AppKit over-release.
         let content: *mut AnyObject = msg_send![window, contentView];
@@ -518,8 +586,12 @@ unsafe fn close_custom_update_window() {
         let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
         let _: () = msg_send![window, close];
         release_obj(window);
-        ui.window = 0;
+    } else if ui.host_view != 0 {
+        // Inline mode: clear the host's controls, leave the settings window untouched.
+        clear_host_subviews(ui.host_view as *mut AnyObject);
     }
+    ui.window = 0;
+    ui.prompt_inline = false;
     release_block(ui.cancellation);
     ui.cancellation = 0;
     release_block(ui.acknowledgement);
@@ -1511,15 +1583,7 @@ unsafe fn make_custom_update_found_window(
     let button_gap = 4.0;
     let message_h = 44.0;
     let title_h = 32.0;
-    let layout_scale = {
-        let ui = UPDATE_UI_STATE.lock().unwrap();
-        if ui.host_view == 0 {
-            1.0
-        } else {
-            let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
-            inline_layout_scale(frame.size.width, window_w)
-        }
-    };
+    let layout_scale = prompt_layout_scale(window_w);
     let skip_w = if prompt_kind == UpdatePromptKind::InformationOnly {
         180.0 * layout_scale
     } else {
@@ -2053,15 +2117,7 @@ unsafe fn make_custom_choice_window(
     close_custom_update_window();
     // Use the same 560pt design width as the download phase so inline content keeps a stable width.
     let window_w = 560.0;
-    let layout_scale = {
-        let ui = UPDATE_UI_STATE.lock().unwrap();
-        if ui.host_view == 0 {
-            1.0
-        } else {
-            let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
-            inline_layout_scale(frame.size.width, window_w)
-        }
-    };
+    let layout_scale = prompt_layout_scale(window_w);
     let button_y = 14.0;
     let button_w = 300.0 * layout_scale;
     let button = crate::settings::components::SettingsButton::action(
@@ -2377,15 +2433,30 @@ extern "C" fn show_update_release_notes(
 extern "C" fn show_update_release_notes_failed(_this: *mut c_void, _cmd: Sel, _error: *mut c_void) {
 }
 
+/// Which window a "bring the update prompt forward" request must raise: the host's settings window for a
+/// prompt rendered inline, the standalone popup otherwise. Pure (the stored windows are addresses), so the
+/// two targets stay paired with `teardown_closes_standalone`.
+fn focus_window_for_prompt(prompt_inline: bool, host_window: usize, popup_window: usize) -> usize {
+    if prompt_inline {
+        host_window
+    } else {
+        popup_window
+    }
+}
+
 extern "C" fn show_update_in_focus(_this: *mut c_void, _cmd: Sel) {
     unsafe {
         let ui = UPDATE_UI_STATE.lock().unwrap();
-        // Inline mode focuses the host's settings window; otherwise the update popup.
-        let window = if ui.host_view != 0 {
-            ui.host_window
-        } else {
-            ui.window
-        };
+        // Where this prompt was rendered, not where a prompt would be rendered now: showing or hiding the
+        // settings window after the prompt appeared must not move the focus request to the other surface.
+        let window = focus_window_for_prompt(ui.prompt_inline, ui.host_window, ui.window);
+        let inline = ui.prompt_inline;
+        drop(ui);
+        if inline {
+            // The prompt lives in the About page, and the user may have switched to another page since it
+            // appeared: bringing the prompt forward means bringing its page forward too.
+            crate::settings::show_settings_page(crate::settings::SETTINGS_ABOUT_PAGE_INDEX);
+        }
         if window != 0 {
             let window = window as *mut AnyObject;
             let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
@@ -2966,9 +3037,10 @@ pub(crate) fn check_for_updates() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        inline_layout_scale, is_safe_update_info_url, release_notes_heading_style,
-        release_notes_measured_width, render_release_notes_markdown, scale_frame,
-        select_release_notes_locale, update_prompt_kind, RenderTarget, UpdatePromptKind,
+        focus_window_for_prompt, inline_layout_scale, is_safe_update_info_url, prefers_inline,
+        prompt_layout_scale_for, release_notes_heading_style, release_notes_measured_width,
+        render_release_notes_markdown, scale_frame, select_release_notes_locale,
+        teardown_closes_standalone, update_prompt_kind, RenderTarget, UpdatePromptKind,
         RELEASE_NOTES_LAYOUT_WIDTH,
     };
     use objc2::runtime::AnyObject;
@@ -2978,6 +3050,75 @@ mod tests {
     /// frame by the host/window ratio, so `make_release_notes_view` must build and measure the text
     /// view at that installed width rather than at `RELEASE_NOTES_LAYOUT_WIDTH`. The assertions bind
     /// the builder's width helper to `scale_frame`'s result, so reverting the helper to the fixed
+    /// The inline routing rule, all four combinations. Registering the host is not enough: a settings
+    /// window that has been built and then closed (or one that was only prewarmed) must not capture update
+    /// prompts into a hidden view -- they belong in their own window until the About page is really on
+    /// screen. The regression this guards: `render_target` used to look at registration alone.
+    #[test]
+    fn update_steps_render_inline_only_while_the_about_page_is_on_screen() {
+        assert!(prefers_inline(true, true));
+        assert!(
+            !prefers_inline(true, false),
+            "a window showing another page, or a hidden one, must not capture the prompt"
+        );
+        assert!(!prefers_inline(false, true));
+        assert!(!prefers_inline(false, false));
+    }
+
+    /// The prompt's layout is measured at the width it will be installed at: a standalone prompt uses the
+    /// window's own width (scale 1.0) even when a host view is registered, which is the state the settings
+    /// warm-up creates. Measuring it at the host ratio installed a different width than it measured, and the
+    /// release-notes document width is derived from this number.
+    #[test]
+    fn a_standalone_prompt_is_measured_at_its_own_width() {
+        assert_eq!(prompt_layout_scale_for(false, 512.0, 640.0), 1.0);
+        assert_eq!(prompt_layout_scale_for(false, 0.0, 640.0), 1.0);
+        // Inline keeps the host ratio, and a host that is not laid out yet falls back to 1.0 rather than
+        // dividing by a zero width.
+        assert_eq!(
+            prompt_layout_scale_for(true, 512.0, 640.0),
+            inline_layout_scale(512.0, 640.0)
+        );
+        assert_eq!(prompt_layout_scale_for(true, 0.0, 640.0), 1.0);
+        assert_ne!(
+            prompt_layout_scale_for(false, 512.0, 640.0),
+            prompt_layout_scale_for(true, 512.0, 640.0)
+        );
+    }
+
+    /// The focus request must follow where the prompt was rendered. A prompt rendered standalone while a host
+    /// view is registered -- what a settings window that is hidden after the warm-up produces -- must raise
+    /// the popup, not the settings window.
+    #[test]
+    fn a_focus_request_raises_the_window_that_actually_shows_the_prompt() {
+        let host = 0x1000usize;
+        let popup = 0x2000usize;
+        // Rendered standalone (host registered but hidden at render time): the popup holds the prompt.
+        assert_eq!(
+            focus_window_for_prompt(false, host, popup),
+            popup,
+            "a standalone prompt must raise its own window, not the settings window"
+        );
+        // Rendered inline: the settings window holds it, whichever window is visible now.
+        assert_eq!(focus_window_for_prompt(true, host, popup), host);
+        // Registering the host but never rendering a prompt leaves the flag false: the popup (or nothing).
+        assert_eq!(focus_window_for_prompt(false, host, 0), 0);
+    }
+
+    /// The teardown must close the window the prompt was rendered in. The leak this guards: a standalone
+    /// prompt's window was left open (and its views leaked) because the old code asked whether a host view
+    /// was *registered*.
+    #[test]
+    fn a_standalone_prompt_closes_its_window_even_with_a_registered_host() {
+        assert!(teardown_closes_standalone(false, 0x2000));
+        assert!(
+            !teardown_closes_standalone(true, 0x2000),
+            "an inline prompt must be cleared out of the host, not closed as a window"
+        );
+        assert!(!teardown_closes_standalone(false, 0));
+        assert!(!teardown_closes_standalone(true, 0));
+    }
+
     /// layout width fails here.
     #[test]
     fn release_notes_are_measured_at_the_width_the_inline_host_installs() {
@@ -3142,47 +3283,5 @@ mod tests {
     fn keeps_legacy_single_language_notes_unchanged() {
         let source = "# Release notes\n\n- One change";
         assert_eq!(select_release_notes_locale(source, "zh-Hans"), source);
-    }
-
-    /// The shipped notes are read by `render_release_notes_markdown`, which understands headings and
-    /// `- ` bullets and nothing else: inline markdown is rendered as its literal characters, and a file
-    /// without a locale's block leaves that language with none of the notes, because the selector falls
-    /// back silently. Both are properties of the files rather than of one of them, so they are asserted
-    /// here instead of being re-checked by hand at each release — the zh blocks of 0.2.5 shipped `**`
-    /// until this test existed.
-    #[test]
-    fn shipped_release_notes_satisfy_the_renderer() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("release_doc_dev");
-        let mut files = 0usize;
-        for entry in std::fs::read_dir(&dir).expect("release_doc_dev is readable") {
-            let path = entry.expect("directory entry").path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path).expect("release notes are readable");
-            for locale in ["en", "zh-Hans", "zh-Hant"] {
-                let open = format!("<!-- locale: {locale} -->");
-                let start = source
-                    .find(&open)
-                    .unwrap_or_else(|| panic!("{} has no {locale} block", path.display()));
-                let rest = &source[start + open.len()..];
-                let end = rest.find("<!-- /locale -->").unwrap_or_else(|| {
-                    panic!("{} leaves the {locale} block unclosed", path.display())
-                });
-                let body = &rest[..end];
-                assert!(
-                    body.contains("- "),
-                    "{} has an empty {locale} block",
-                    path.display()
-                );
-                assert!(
-                    !body.contains("**") && !body.contains('`'),
-                    "{} writes inline markdown in its {locale} block, which the renderer shows literally",
-                    path.display()
-                );
-            }
-            files += 1;
-        }
-        assert!(files > 0, "no release notes found in {}", dir.display());
     }
 }

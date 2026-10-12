@@ -213,6 +213,23 @@ pub(crate) static CONTROLLER: Mutex<Option<CallbackTarget>> = Mutex::new(None);
 static SMOOTH_E2E_RECORD_SCHEDULED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Seconds after launch before the settings window is built ahead of its first open. Late enough that the
+/// menu bar, the global event tap and the update check have settled, and late enough that a user's first
+/// scroll is not stuttered by the build: measured on the A2 smooth-scroll scenario, the stream lost its
+/// momentum_ended phase in 2 of 3 runs with the warm-up at 1.0s, in 1 of 3 with the motion gate alone, and
+/// in 0 of 6 with the motion gate at 3.0s. Still early enough that the window is ready before a user can
+/// reasonably reach the picker's gear or the menu item.
+const SETTINGS_PREWARM_DELAY: f64 = 3.0;
+/// Retry spacing, and the attempt cap, for a firing that must wait: the first-run guide owns the screen, or a
+/// smooth-scroll stream is being emitted. Prewarming under either would be wrong (window the user must not see
+/// yet / a stuttered scroll), so the warm-up retries a bounded number of times: 3.0s + 5 x 4.0s ≈ 23s of
+/// coverage, after which a launch that never went quiet simply opens cold.
+const SETTINGS_PREWARM_RETRY_DELAY: f64 = 4.0;
+static SETTINGS_PREWARM_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+const SETTINGS_PREWARM_MAX_ATTEMPTS: usize = 6;
+static SETTINGS_PREWARM_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Shared ObjC target object for menu items and settings buttons.
 pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
@@ -1020,6 +1037,101 @@ fn on_devices_changed_inner(_self: *mut c_void) {
         }
     }
     crate::settings::refresh_device_popup_if_open();
+    // A plug/unplug can change which device is selected, so the mappings on screen are stale too. The popup
+    // refresh above marks the page dirty; this fills it (no-op unless the mouse page is the one in use and
+    // the page really is stale).
+    crate::settings::materialize_mouse_page_if_visible();
+}
+
+/// Build the settings window during the first idle moment after launch, so the first real open -- the
+/// clipboard picker's settings button, the menu item, or the update banner -- only has to select a page and
+/// order the window front. Measured cold open was ~1s, almost all of it building the window and filling the
+/// newly added mouse page; the prewarm moves that work off the click path.
+///
+/// Deferred on purpose: the build allocates ~200 views, and running it inside `run()` would delay the menu
+/// bar and the update check. Skipped in smoke processes (their runners assert launch-time state and exit)
+/// and while the first-run guide is on screen, where it is retried a bounded number of times.
+fn schedule_settings_prewarm() {
+    if SETTINGS_PREWARM_SCHEDULED.load(Ordering::Acquire) {
+        return;
+    }
+    // The flag is only set for a request that was really handed to the run loop: a missing controller must
+    // leave the warm-up armed for the next attempt, not claim it was scheduled.
+    if schedule_settings_prewarm_after(SETTINGS_PREWARM_DELAY) {
+        SETTINGS_PREWARM_SCHEDULED.store(true, Ordering::Release);
+    }
+}
+
+/// Hands one delayed `prewarmSettings:` to the run loop; false when there is no controller to target.
+fn schedule_settings_prewarm_after(delay: f64) -> bool {
+    let Some(controller) = CONTROLLER.lock().unwrap().map(|target| target.0) else {
+        return false;
+    };
+    unsafe {
+        let _: () = msg_send![
+            controller,
+            performSelector: sel!(prewarmSettings:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: delay
+        ];
+    }
+    true
+}
+
+/// What the deferred warm-up does on one firing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsPrewarmStep {
+    /// Build the window now.
+    Build,
+    /// The first-run guide owns the screen: try again later.
+    Retry,
+    /// The guide is still up after the bounded number of retries: leave the first open cold.
+    GiveUp,
+}
+
+/// One firing's decision. Pure, so the interactions are a tested contract: warming under the guide would put a
+/// window on the user's screen that the guide owns; warming on top of a live smooth-scroll stream blocks the
+/// main thread for the build and truncates the stream (measured: the A2 smooth-scroll scenario lost its
+/// momentum_ended phase 3 times out of 3 with the warm-up firing at +1s, against 2 of 2 passes without it);
+/// and retrying without a cap would keep a timer alive for the whole session.
+fn settings_prewarm_step(
+    guide_visible: bool,
+    motion_active: bool,
+    retries: usize,
+) -> SettingsPrewarmStep {
+    if !guide_visible && !motion_active {
+        return SettingsPrewarmStep::Build;
+    }
+    if retries + 1 < SETTINGS_PREWARM_MAX_ATTEMPTS {
+        SettingsPrewarmStep::Retry
+    } else {
+        SettingsPrewarmStep::GiveUp
+    }
+}
+
+extern "C" fn on_prewarm_settings(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    callback_guard::void("on_prewarm_settings", || {
+        let retries = SETTINGS_PREWARM_ATTEMPTS.load(Ordering::SeqCst);
+        let guide_visible = crate::onboarding::is_visible();
+        // Motion is read at firing time: a stream that starts after this check cannot be dodged, but one that
+        // is already running must not be stuttered by a 200-view build.
+        let motion_active = crate::mouse::smooth::stream_is_active();
+        match settings_prewarm_step(guide_visible, motion_active, retries) {
+            SettingsPrewarmStep::Build => crate::settings::prewarm_settings_window(),
+            SettingsPrewarmStep::Retry => {
+                SETTINGS_PREWARM_ATTEMPTS.store(retries + 1, Ordering::SeqCst);
+                log_debug!(
+                    "[settings-timing] prewarm deferred (guide={guide_visible} motion={motion_active})"
+                );
+                let _ = schedule_settings_prewarm_after(SETTINGS_PREWARM_RETRY_DELAY);
+            }
+            SettingsPrewarmStep::GiveUp => {
+                log_debug!(
+                    "[settings-timing] prewarm given up (guide={guide_visible} motion={motion_active})"
+                );
+            }
+        }
+    });
 }
 
 /// Thumbnail capture finished (hopped from the worker thread via
@@ -1602,6 +1714,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleDevicesChanged:),
             on_devices_changed as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(prewarmSettings:),
+            on_prewarm_settings as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2350,9 +2468,88 @@ fn application_reopen_smoke() -> bool {
             applicationShouldHandleReopen: app,
             hasVisibleWindows: appkit_bool(true)
         ];
-        !appkit_bool_value(handled)
-            && settings::settings_window_is_visible()
-            && settings::e2e_selected_sidebar() == settings::SETTINGS_ABOUT_PAGE_INDEX
+        if appkit_bool_value(handled) {
+            return false;
+        }
+        // The reopen's own result is asserted first and kept: the window must still be up and still on
+        // the page the reopen left it on. Adding the clipboard navigation below must not replace this --
+        // it did once, and then a reopen that wrongly reset the page could still pass.
+        if !settings::settings_window_is_visible()
+            || settings::e2e_selected_sidebar() != settings::SETTINGS_ABOUT_PAGE_INDEX
+        {
+            return false;
+        }
+        // The clipboard picker's header button calls exactly this: from a DIFFERENT page, because a
+        // sidebar already sitting on the target page cannot tell navigation from a button whose action
+        // did nothing. The settings window is live here (this process ran the lifecycle), so both the
+        // page and the window are real facts.
+        settings::show_settings_page(0);
+        if settings::e2e_selected_sidebar() != 0 {
+            return false;
+        }
+        // The mouse page's controls are filled only when that page is the one in use: opening on General
+        // and then on Clipboard must leave them unfilled, and asking for the Mouse page must fill them
+        // (before this change every open resolved a device and rendered its mappings).
+        if settings::e2e_mouse_page_materialized() {
+            return false;
+        }
+        settings::show_settings_page(settings::SETTINGS_MOUSE_PAGE_INDEX);
+        if !settings::e2e_mouse_page_materialized()
+            || settings::e2e_mouse_line_count_text().is_empty()
+        {
+            return false;
+        }
+        // The startup prewarm must be a no-op on a window that already exists: a prewarmed window is left
+        // on the page the user chose, with the page's controls still filled. Re-entering the build/load
+        // path here would park the window back on General and hand the user a different page.
+        let mouse_line_count = settings::e2e_mouse_line_count_text();
+        settings::prewarm_settings_window();
+        if !settings::settings_window_is_visible()
+            || settings::e2e_selected_sidebar() != settings::SETTINGS_MOUSE_PAGE_INDEX
+            || !settings::e2e_mouse_page_materialized()
+            || settings::e2e_mouse_line_count_text() != mouse_line_count
+        {
+            return false;
+        }
+        // A config reload must make the filled, clean mouse page stale even while ANOTHER page is on screen.
+        // The page is expensive to fill, so it is filled on demand; the failure this guards is the one where
+        // the reload only refilled a mouse page that was already showing and marked the page clean anyway,
+        // leaving the user looking at the values the reload replaced.
+        settings::show_settings_page(settings::SETTINGS_CLIPBOARD_PAGE_INDEX);
+        // The master switch, not the resolved line count: it is read straight from the config section, so
+        // the assertion cannot be confounded by which profile the resolver picks for this machine.
+        let previous_enabled = CONFIG.read().unwrap().mouse.enabled;
+        let reloaded_enabled = !previous_enabled;
+        CONFIG.write().unwrap().mouse.enabled = reloaded_enabled;
+        settings::refresh_switcher_keystroke_and_mouse_controls_from_config();
+        settings::show_settings_page(settings::SETTINGS_MOUSE_PAGE_INDEX);
+        let after_reload = settings::e2e_mouse_enabled_state();
+        if after_reload != isize::from(reloaded_enabled) {
+            eprintln!(
+                "[smoke-app-reopen] the mouse page was not refilled after a config reload: switch={after_reload}, expected {reloaded_enabled}"
+            );
+            return false;
+        }
+        // The plug/unplug entry (what `on_devices_changed_inner` calls) must stale the page the same way.
+        CONFIG.write().unwrap().mouse.enabled = previous_enabled;
+        settings::show_settings_page(settings::SETTINGS_CLIPBOARD_PAGE_INDEX);
+        settings::refresh_device_popup_if_open();
+        settings::show_settings_page(settings::SETTINGS_MOUSE_PAGE_INDEX);
+        let after_device_change = settings::e2e_mouse_enabled_state();
+        if after_device_change != isize::from(previous_enabled) {
+            eprintln!(
+                "[smoke-app-reopen] a device change did not stale the mouse page: switch={after_device_change}, expected {previous_enabled}"
+            );
+            return false;
+        }
+        // Back to Clipboard for the navigation assertions below.
+        settings::show_clipboard_page();
+        settings::settings_window_is_visible()
+            // ...and it must have APPEARED on the clipboard page: the step above left the window presented
+            // on General, and a present-then-select path would store General here while the final selection
+            // still read 3.
+            && settings::e2e_presented_page() == Some(settings::SETTINGS_CLIPBOARD_PAGE_INDEX)
+            && settings::e2e_selected_sidebar() == settings::SETTINGS_CLIPBOARD_PAGE_INDEX
     }
 }
 
@@ -3097,6 +3294,11 @@ pub fn run() {
                 schedule_dev_blank_text(std::time::Duration::from_secs_f64(seconds));
             }
         }
+        // Warm the settings window before the run loop takes over (see `schedule_settings_prewarm`).
+        // Smoke processes assert launch-time state and exit through their runner, so they skip it.
+        if !is_smoke_process {
+            schedule_settings_prewarm();
+        }
         e2e_state::record("launch");
         let _: () = msg_send![nsapp, run];
     }
@@ -3141,4 +3343,44 @@ unsafe fn show_dev_backdrop(shade: &str) {
 
 pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
     restart::run_relaunch_helper_if_requested(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{settings_prewarm_step, SettingsPrewarmStep, SETTINGS_PREWARM_MAX_ATTEMPTS};
+
+    #[test]
+    fn the_settings_warm_up_builds_only_at_a_quiet_moment_and_gives_up_after_the_cap() {
+        assert_eq!(
+            settings_prewarm_step(false, false, 0),
+            SettingsPrewarmStep::Build,
+            "an idle launch must warm the settings window"
+        );
+        assert_eq!(
+            settings_prewarm_step(false, false, SETTINGS_PREWARM_MAX_ATTEMPTS),
+            SettingsPrewarmStep::Build,
+            "the retry cap must not stop a warm-up nothing blocks any more"
+        );
+        for retries in 0..SETTINGS_PREWARM_MAX_ATTEMPTS - 1 {
+            for (guide, motion) in [(true, false), (false, true), (true, true)] {
+                assert_eq!(
+                    settings_prewarm_step(guide, motion, retries),
+                    SettingsPrewarmStep::Retry,
+                    "retry {retries} must reschedule (guide={guide} motion={motion})"
+                );
+            }
+        }
+        for (guide, motion) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                settings_prewarm_step(guide, motion, SETTINGS_PREWARM_MAX_ATTEMPTS - 1),
+                SettingsPrewarmStep::GiveUp,
+                "the last retry must give up instead of keeping a timer alive (guide={guide} motion={motion})"
+            );
+        }
+        assert_eq!(
+            settings_prewarm_step(false, true, SETTINGS_PREWARM_MAX_ATTEMPTS + 5),
+            SettingsPrewarmStep::GiveUp,
+            "a retry count past the cap must still give up"
+        );
+    }
 }

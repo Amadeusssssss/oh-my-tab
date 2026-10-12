@@ -186,10 +186,10 @@ pub(super) fn header_strip_h() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y + FILTERS_H
 }
 
-/// The search field and the corner close button side by side in the header strip (flipped
-/// coordinates, measured from the strip's top-left). One source of truth so the two can never
-/// overlap: the field gives up the button's size plus the gap on the right.
-pub(super) fn picker_header_frames() -> (NSRect, NSRect) {
+/// The search field, the settings button and the corner close button side by side in the header
+/// strip (flipped coordinates, measured from the strip's top-left). One source of truth so no two
+/// can ever overlap: the field gives up both buttons' size plus both gaps on the right.
+pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect) {
     let close = NSRect::new(
         NSPoint::new(
             PICKER_W - SEARCH_PAD_X - PICKER_CLOSE_BTN_SIZE,
@@ -197,14 +197,50 @@ pub(super) fn picker_header_frames() -> (NSRect, NSRect) {
         ),
         NSSize::new(PICKER_CLOSE_BTN_SIZE, PICKER_CLOSE_BTN_SIZE),
     );
+    let gear = NSRect::new(
+        NSPoint::new(
+            close.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_CLOSE_BTN_SIZE,
+            close.origin.y,
+        ),
+        close.size,
+    );
     let search = NSRect::new(
         NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
         NSSize::new(
-            PICKER_W - SEARCH_PAD_X * 2.0 - PICKER_CLOSE_BTN_SIZE - PICKER_CLOSE_BTN_GAP,
+            PICKER_W - SEARCH_PAD_X * 2.0 - (PICKER_CLOSE_BTN_SIZE + PICKER_CLOSE_BTN_GAP) * 2.0,
             SEARCH_H,
         ),
     );
-    (search, close)
+    (search, gear, close)
+}
+
+/// The drag handle's transparent hit band: the WHOLE top bar, i.e. the header strip's top padding across
+/// the panel's full width (flipped coordinates, measured from the strip's top-left). The user drags the
+/// panel by the top bar, not by the three dots alone; the dots stay centered in it as the visual hint.
+/// The band is the header's own top padding, so it covers no control: the search row starts below it.
+pub(super) fn picker_grip_frame() -> NSRect {
+    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PICKER_W, TOP_PAD_Y))
+}
+
+/// The handle's three visible dots, centered in the hit band (flipped coordinates, measured from
+/// the band's top-left). Pure so a test can prove the dots stay inside the band they are drawn in --
+/// and that they are centered in the band they are given, whatever its width (the band grew from a
+/// fixed 48pt to the panel's full width, and dot positions computed from the old constant would have
+/// stayed at the left end).
+pub(super) fn picker_grip_dot_frames() -> [NSRect; 3] {
+    let band = picker_grip_frame().size;
+    let total = PICKER_GRIP_MARK * 3.0 + PICKER_GRIP_MARK_GAP * 2.0;
+    let start_x = (band.width - total) / 2.0;
+    let y = (band.height - PICKER_GRIP_MARK) / 2.0;
+    std::array::from_fn(|index| {
+        NSRect::new(
+            NSPoint::new(
+                start_x + index as f64 * (PICKER_GRIP_MARK + PICKER_GRIP_MARK_GAP),
+                y,
+            ),
+            NSSize::new(PICKER_GRIP_MARK, PICKER_GRIP_MARK),
+        )
+    })
 }
 
 /// Calculate the picker minimum from three same-group records and use it for every state, so it

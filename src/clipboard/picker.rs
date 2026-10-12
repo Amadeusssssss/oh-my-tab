@@ -87,22 +87,27 @@ pub(super) fn detail_frame_for(
 }
 
 /// Pure: lay out the picker and detail as one group, with the picker always left of detail.
+///
+/// `anchor_x` is where the picker already is when the caller has a position of its own — the anchor a
+/// drag ended on this showing — and `None` means "derive it": centered on the main screen, or centered
+/// on the cursor. Ignoring the anchor here was a real defect: dragging the panel and then opening the
+/// detail snapped it back to the derived x, and so did every selection change while the detail was open.
 pub(super) fn detail_group_frames(
     picker: NSRect,
     align_top_y: f64,
     screen: NSRect,
-    detail_w: f64,
-    detail_h: f64,
+    detail_size: NSSize,
+    anchor_x: Option<f64>,
     center_on_main: bool,
     cursor_x: f64,
 ) -> (NSRect, NSRect) {
-    let group_w = picker.size.width + DETAIL_GAP + detail_w;
+    let group_w = picker.size.width + DETAIL_GAP + detail_size.width;
     let min_x = screen.origin.x + PICKER_EDGE_MARGIN;
     let max_x = screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN;
-    let mut picker_x = if center_on_main {
-        screen.origin.x + (screen.size.width - group_w) / 2.0
-    } else {
-        cursor_x - group_w / 2.0
+    let mut picker_x = match anchor_x {
+        Some(x) => x,
+        None if center_on_main => screen.origin.x + (screen.size.width - group_w) / 2.0,
+        None => cursor_x - group_w / 2.0,
     };
 
     // Clamp the whole group when it fits; if it does not, keep the picker whole and leave
@@ -114,19 +119,139 @@ pub(super) fn detail_group_frames(
     }
 
     let picker_frame = NSRect::new(NSPoint::new(picker_x, picker.origin.y), picker.size);
-    let detail_frame = detail_frame_for(picker_frame, align_top_y, screen, detail_w, detail_h);
+    let detail_frame = detail_frame_for(
+        picker_frame,
+        align_top_y,
+        screen,
+        detail_size.width,
+        detail_size.height,
+    );
     (picker_frame, detail_frame)
 }
 
 /// The frame of the picker's screen (follows it across screens; falls back to the main
 /// screen when unavailable).
-unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
+pub(super) unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
     let sc: *mut AnyObject = msg_send![picker_win, screen];
     if sc.is_null() {
         let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         msg_send![main, visibleFrame]
     } else {
         msg_send![sc, visibleFrame]
+    }
+}
+
+/// Where `clipboard.picker_position` puts the picker: `(centered on the main screen, the cursor,
+/// the target screen's visible frame)`. One derivation shared by the summon and by the drag
+/// handle's reset, so the two can never disagree about what "the configured position" is.
+pub(super) fn configured_picker_area() -> (bool, NSPoint, NSRect) {
+    unsafe {
+        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let center_on_main = CONFIG.read().unwrap().clipboard.picker_position == "main";
+        // The PRIMARY display, not `NSScreen.mainScreen`: that follows the key window, and the picker is a
+        // panel that becomes key -- so after a drag to a secondary display, `mainScreen` would be that
+        // display and "centred on the main screen" would centre the reset where the panel already is (the
+        // trap `overlay::hover::primary_screen_frame` documents). The fallback keeps the old behaviour if
+        // AppKit reports no screens at all.
+        let main_frame: NSRect = match crate::overlay::hover::primary_screen_visible_frame() {
+            Some(frame) => frame,
+            None => {
+                let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+                msg_send![main_screen, visibleFrame]
+            }
+        };
+        let screen_frame = if center_on_main {
+            main_frame
+        } else {
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            let count: usize = msg_send![screens, count];
+            let mut frames: Vec<NSRect> = Vec::with_capacity(count);
+            for i in 0..count {
+                // objectAtIndex: expects 'q' (signed long); pass isize.
+                let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
+                frames.push(msg_send![s, visibleFrame]);
+            }
+            screen_containing(cursor, &frames).unwrap_or(main_frame)
+        };
+        (center_on_main, cursor, screen_frame)
+    }
+}
+
+/// The frame the configured mode wants for a picker of `size`: centered on its screen, or offset
+/// from the cursor with the edge flip/clamp.
+pub(super) fn configured_picker_frame(
+    center_on_main: bool,
+    cursor: NSPoint,
+    screen_frame: NSRect,
+    size: NSSize,
+) -> NSRect {
+    if center_on_main {
+        // Always centered on the main screen; no flip/clamp.
+        NSRect::new(
+            NSPoint::new(
+                screen_frame.origin.x + (screen_frame.size.width - size.width) / 2.0,
+                screen_frame.origin.y + (screen_frame.size.height - size.height) / 2.0,
+            ),
+            size,
+        )
+    } else {
+        picker_frame_for(cursor, screen_frame, size.width, size.height)
+    }
+}
+
+/// Put the picker back where the configuration asks for it, at its current size: the drag handle's
+/// double-click, i.e. the undo for "the panel is somewhere awkward now".
+///
+/// With the detail panel open the pair is laid out again from the configured origin instead of
+/// moving the picker alone, so the group stays intact and the origin restored when the detail
+/// closes is the configured one.
+pub(super) fn reset_picker_to_configured_position() {
+    // The reset means "this showing is back at the configured position", so the anchor a drag left has to
+    // go with it: keeping it would make the next grab start from a position the panel is no longer at
+    // (and the detail group lay out from that stale x). The double-click path relied on clearing it
+    // itself before this call, which left any other caller -- the smoke runner drives this directly --
+    // with a stale anchor. One owner: this function.
+    super::grip::forget_session_position();
+    unsafe {
+        let Some(picker_win) = PICKER_WINDOW.lock().unwrap().map(|w| w.0) else {
+            return;
+        };
+        let size = crate::glass::panel_frame_of(picker_win).size;
+        let (center_on_main, cursor, screen_frame) = configured_picker_area();
+        let target = configured_picker_frame(center_on_main, cursor, screen_frame, size);
+        let detail_win = if detail_visible() {
+            DETAIL_WINDOW.lock().unwrap().map(|w| w.0)
+        } else {
+            None
+        };
+        if let Some(detail_win) = detail_win {
+            if let Some(align_top_y) = selected_row_screen_y(target) {
+                let detail_size = crate::glass::panel_frame_of(detail_win).size;
+                let (picker_frame, detail_frame) = detail_group_frames(
+                    target,
+                    align_top_y,
+                    screen_frame,
+                    detail_size,
+                    None,
+                    center_on_main,
+                    cursor.x,
+                );
+                crate::glass::set_panel_frame(picker_win, picker_frame, true);
+                crate::glass::set_panel_frame(detail_win, detail_frame, true);
+                // The origin the detail's close restores is the anchor, not the shifted frame the
+                // group layout produced for the picker.
+                *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(target.origin);
+                // The reset moved the panel too, so the state document has to say where it is (same
+                // reason as the end of a drag; see `grip::finish_drag`).
+                crate::e2e_state::record("clipboard_picker_reset");
+                return;
+            }
+        }
+        crate::glass::set_panel_frame(picker_win, target, true);
+        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = None;
+        // The reset moved the panel too, so the state document has to say where it is (same reason as
+        // the end of a drag; see `grip::finish_drag`).
+        crate::e2e_state::record("clipboard_picker_reset");
     }
 }
 
@@ -517,24 +642,7 @@ pub(super) fn show_picker() {
         // Resolve the position mode first: "mouse" follows the cursor on its screen;
         // "main" centers the picker on the main screen (the height cap uses that screen
         // too).
-        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-        let picker_pos = CONFIG.read().unwrap().clipboard.picker_position.clone();
-        let center_on_main = picker_pos == "main";
-        let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-        let main_frame: NSRect = msg_send![main_screen, visibleFrame];
-        let screen_frame = if center_on_main {
-            main_frame
-        } else {
-            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-            let count: usize = msg_send![screens, count];
-            let mut frames: Vec<NSRect> = Vec::with_capacity(count);
-            for i in 0..count {
-                // objectAtIndex: expects 'q' (signed long); pass isize.
-                let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
-                frames.push(msg_send![s, visibleFrame]);
-            }
-            screen_containing(cursor, &frames).unwrap_or(main_frame)
-        };
+        let (center_on_main, cursor, screen_frame) = configured_picker_area();
 
         // Max height: the 640pt hard cap, shrunk on small screens (120pt kept for the menu
         // bar / cursor offset / edge margins).
@@ -565,18 +673,12 @@ pub(super) fn show_picker() {
         // Use the same three-record visual minimum for every state, including one or zero rows.
         let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(picker_min_height());
 
-        let frame = if center_on_main {
-            // Always centered on the main screen; no flip/clamp.
-            NSRect::new(
-                NSPoint::new(
-                    main_frame.origin.x + (main_frame.size.width - PICKER_W) / 2.0,
-                    main_frame.origin.y + (main_frame.size.height - h) / 2.0,
-                ),
-                NSSize::new(PICKER_W, h),
-            )
-        } else {
-            picker_frame_for(cursor, screen_frame, PICKER_W, h)
-        };
+        let frame = configured_picker_frame(
+            center_on_main,
+            cursor,
+            screen_frame,
+            NSSize::new(PICKER_W, h),
+        );
         log_debug!(
             "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0}) mode={}",
             frame.origin.x,
@@ -713,6 +815,12 @@ pub(super) fn hide_picker() {
     if let Some(button) = *PICKER_CLOSE_BUTTON.lock().unwrap() {
         unsafe { reset_close_button_hover(button.0) };
     }
+    if let Some(button) = *PICKER_SETTINGS_BUTTON.lock().unwrap() {
+        unsafe { set_settings_button_style(button.0, false) };
+    }
+    // Same reason for the drag handle: an in-flight grab loses its mouseUp, the pushed hand cursor
+    // has to be popped by hand, and this showing's dragged position dies with the showing.
+    super::grip::on_picker_hidden();
     hide_detail();
 
     // Take the pointer under the lock but orderOut outside it: orderOut synchronously fires
@@ -766,8 +874,22 @@ pub(super) fn hide_detail() {
             // goes back through `set_panel_frame`, so mixing a window rect in here would add the padding
             // twice and change the picker's size on close.
             let current_picker = crate::glass::panel_frame_of(picker.0);
-            let restored_picker =
-                original_origin.map(|origin| NSRect::new(origin, current_picker.size));
+            // The saved origin was taken while the picker stood alone, but the panel it belongs to is now
+            // opening back up as a standalone picker on whatever display the drag left it on. Clamping it
+            // there (rather than trusting the saved x) is what keeps a cross-display drag from restoring the
+            // panel past the new screen's edge; the session anchor follows, so the next grab starts from
+            // where the panel really is.
+            let restored_picker = original_origin.map(|origin| {
+                let clamped = super::grip::clamp_picker_origin(
+                    origin,
+                    current_picker.size,
+                    picker_screen_frame(picker.0),
+                );
+                if super::grip::session_origin().is_some() {
+                    super::grip::set_session_origin(clamped);
+                }
+                NSRect::new(clamped, current_picker.size)
+            });
             cancel_detail_close(w.0);
             animate_detail_close(picker.0, w.0, content.0, restored_picker);
         } else if let Some(w) = win {
@@ -1509,22 +1631,33 @@ pub(super) unsafe fn show_detail_for_sel() {
     // Row alignment instead of the window top: the top strip holds the search/clear bar
     // and with few entries the window is floored at the min height, so a window-top
     // alignment floats the panel above the row (user-reported misalignment).
-    let Some(align_top_y) = selected_row_screen_y(picker_frame) else {
+    //
+    // The x comes from the ANCHOR (the dragged position this showing, else the live rect), never
+    // from the live rect alone: a drag followed by opening the detail must not snap the panel back
+    // to where the configured mode would have put it.
+    let anchor = super::grip::anchor_origin(picker_frame.origin);
+    let anchor_frame = NSRect::new(
+        // The anchor supplies x; y stays the LIVE one, which is where the panel actually is (and
+        // where the row alignment below measures from).
+        NSPoint::new(anchor.x, picker_frame.origin.y),
+        picker_frame.size,
+    );
+    let Some(align_top_y) = selected_row_screen_y(anchor_frame) else {
         return;
     };
     if !detail_was_visible {
-        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(picker_frame.origin);
+        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(anchor_frame.origin);
     }
     // Lay out the picker + detail as one group, keeping detail on the right and aligned to
     // the selected row.
     let center_on_main = CONFIG.read().unwrap().clipboard.picker_position == "main";
     let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
     let (target_picker_frame, target_detail_frame) = detail_group_frames(
-        picker_frame,
+        anchor_frame,
         align_top_y,
         screen_frame,
-        w,
-        h,
+        NSSize::new(w, h),
+        super::grip::session_origin().map(|origin| origin.x),
         center_on_main,
         cursor.x,
     );

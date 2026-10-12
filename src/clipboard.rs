@@ -62,6 +62,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 mod crypto;
 mod detail;
+mod grip;
 mod image_cache;
 mod keyring;
 mod keyring_acl;
@@ -92,6 +93,7 @@ use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use detail::{apply_backdrop_material, apply_theme};
 pub(crate) use monitor::{start, stop};
+pub(crate) use notifications::{e2e_settings_click_delivery_ms, e2e_settings_click_ms};
 pub(crate) use persist::{clear_on_quit_enabled, discard_history_on_disk};
 pub(crate) use picker::{on_clipboard_toggle, show_picker_for_development};
 pub(crate) use smoke::{set_smoke_mode, smoke_runner};
@@ -330,8 +332,19 @@ const ACTIONS_W: f64 = ACTION_BTN * 3.0 + ACTION_GAP * 2.0;
 const GROUP_H: f64 = 28.0;
 /// The group label's top offset (vertically centered).
 const GROUP_LABEL_PAD: f64 = 8.0;
-/// The header strip: the search zone's top padding (the new mockup's 12px).
-const TOP_PAD_Y: f64 = 12.0;
+/// The header strip's top padding. It is also the drag handle's band: the picker is moved by
+/// dragging the three dots centered in this band (see `grip.rs`), and the band is what makes the
+/// handle reach the 28pt hit target §6.1 requires of a control, not the 12pt padding it replaced.
+const TOP_PAD_Y: f64 = 28.0;
+/// The drag handle's three visible dots. The band they sit in is the header's whole top padding (see
+/// `model::picker_grip_frame`): the user drags the panel by the top bar, and the dots mark where.
+/// The handle's visible dots, and the distance between two of them. Same footprint as the
+/// keystroke display's handle so one gesture looks like one component wherever it appears.
+const PICKER_GRIP_MARK: f64 = 3.0;
+const PICKER_GRIP_MARK_GAP: f64 = 3.0;
+/// Pointer travel that separates a click on the handle from a drag: below it the grab is a no-op
+/// (the handle has no click action), above it the panel follows the pointer.
+const PICKER_DRAG_THRESHOLD: f64 = 4.0;
 /// the search bar's height (the new mockup's 40px).
 const SEARCH_H: f64 = 40.0;
 /// The search bar's side padding.
@@ -344,6 +357,10 @@ const PICKER_CLOSE_BTN_R: f64 = crate::theme::RADIUS_CONTROL;
 const PICKER_CLOSE_BTN_FONT: f64 = 12.0;
 /// Gap between the search field's right edge and the corner close button.
 const PICKER_CLOSE_BTN_GAP: f64 = 8.0;
+/// The settings button's SF Symbol point size. A symbol image carries its own size (it does not
+/// follow the button's font), so the corner's second glyph is sized here, a step above the close
+/// button's 12pt text × so the two read as the same weight.
+const PICKER_GEAR_GLYPH_SIZE: f64 = 13.0;
 /// The gap under the search bar.
 const SEARCH_GAP_Y: f64 = 8.0;
 /// the filters row's height (the new mockup's 36px).
@@ -788,6 +805,11 @@ static SEARCH_CLEAR_HOVERED: AtomicBool = AtomicBool::new(false);
 static SEARCH_CLEAR_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The header's corner close button (persistent: the picker window is reused across summons).
 static PICKER_CLOSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The fixed header strip (search field, drag handle, settings and close buttons). Kept so the
+/// smoke runner can assert its controls against the live view tree, not just against geometry.
+static PICKER_HEADER_STRIP: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The header's settings button, next to the close button (same persistence).
+static PICKER_SETTINGS_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
 /// carries NO placeholder property, so the field editor never draws the placeholder
 /// left-aligned on a focused-but-empty field).
@@ -1003,6 +1025,55 @@ pub(crate) fn picker_footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
     text_style::footer_hint_frames()
 }
 
+/// The drag handle's hit band in the picker's own points, top-left origin. The A2 drag scenario has
+/// to start its gesture on the real band: a rect derived from the panel frame would put this
+/// module's geometry into the test, where a later change to it could not be noticed.
+pub(crate) fn picker_grip_rect_top_left() -> Option<(f64, f64, f64, f64)> {
+    let frame = picker_grip_frame();
+    Some((
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height,
+    ))
+}
+
+/// The visible frame the configured position mode resolves to, top-left based, for `--e2e-state`.
+///
+/// With more than one display this is what tells "centred on the PRIMARY display" from "centred on the
+/// display the picker is on": the two are the same API apart (`NSScreen.screens[0]` vs `NSScreen.mainScreen`,
+/// which follows the key window) and identical on a single-display machine, so a scenario on such a machine
+/// cannot distinguish them -- the field is what makes the difference assertable where a second display exists.
+/// Each component is `None` until a picker window exists, since the mode is read with the window.
+pub(crate) fn picker_configured_screen_top_left() -> Option<(f64, f64, f64, f64)> {
+    if PICKER_WINDOW.lock().unwrap().is_none() {
+        return None;
+    }
+    let (_, _, screen_frame) = picker::configured_picker_area();
+    let primary = unsafe { crate::overlay::hover::primary_screen_frame()? };
+    Some((
+        screen_frame.origin.x,
+        primary.size.height - (screen_frame.origin.y + screen_frame.size.height),
+        screen_frame.size.width,
+        screen_frame.size.height,
+    ))
+}
+
+/// The settings button's frame in the picker's own points, top-left origin (None until the header
+/// has been built). Read from the live view so the reported rect is the one the user can click.
+pub(crate) fn picker_settings_rect_top_left() -> Option<(f64, f64, f64, f64)> {
+    let button = (*PICKER_SETTINGS_BUTTON.lock().unwrap())?;
+    unsafe {
+        let frame: NSRect = msg_send![button.0, frame];
+        Some((
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        ))
+    }
+}
+
 /// Whether the picker window is on screen right now.
 ///
 /// Asks AppKit rather than reading `PICKER_VISIBLE`: that atomic is this app's *intent*, which can lag (or be
@@ -1102,27 +1173,39 @@ mod tests {
 
     use super::{
         cache_generation, clip_image_detail_path, clip_image_path, effective_hover_row,
-        estimated_entry_bytes, fnv1a64, header_strip_h, picker_header_frames, rect_contains_point,
-        run_image_cache_job, scroll_indicator_geometry, wipe_cache_for_discard, ClipEntry,
-        ImageCacheJob, ImageEntry, CLIP_HISTORY, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, PICKER_W,
-        SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
+        estimated_entry_bytes, fnv1a64, header_strip_h, picker_grip_frame, picker_header_frames,
+        rect_contains_point, run_image_cache_job, scroll_indicator_geometry,
+        wipe_cache_for_discard, ClipEntry, ImageCacheJob, ImageEntry, CLIP_HISTORY, NO_SELECTION,
+        NSPASTEBOARD_TYPE_PNG, PICKER_W, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
+        SEARCH_PAD_X, TOP_PAD_Y,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::sync::Arc;
     #[test]
-    fn picker_header_separates_the_search_field_and_the_close_button() {
-        let (search, close) = picker_header_frames();
-        // The pair is inset symmetrically from the strip's edges and the button is square.
+    fn picker_header_separates_the_search_field_the_settings_button_and_the_close_button() {
+        let (search, gear, close) = picker_header_frames();
+        // The row is inset symmetrically from the strip's edges and both buttons are square.
         assert_eq!(search.origin.x, SEARCH_PAD_X);
         assert_eq!(search.origin.y, TOP_PAD_Y);
         assert_eq!(close.origin.x + close.size.width, PICKER_W - SEARCH_PAD_X);
         assert_eq!(close.size.width, close.size.height);
-        // The field must end before the button: the × is never drawn over the query/⌘F keycap.
-        assert!(search.origin.x + search.size.width < close.origin.x);
-        // Both stay inside the fixed strip (never over the filters row or the list).
+        assert_eq!(gear.size, close.size);
+        // Every control is clear of the one before it: the × is never drawn over the gear, the gear
+        // never over the query/⌘F keycap, and the three never overlap whichever label is longest.
+        assert!(search.origin.x + search.size.width < gear.origin.x);
+        assert!(gear.origin.x + gear.size.width < close.origin.x);
+        // All three stay inside the fixed strip (never over the filters row or the list).
         let strip_bottom = header_strip_h();
-        assert!(search.origin.y + search.size.height <= strip_bottom);
-        assert!(close.origin.y + close.size.height <= strip_bottom);
+        for frame in [search, gear, close] {
+            assert!(frame.origin.y + frame.size.height <= strip_bottom);
+        }
+        // The drag handle is the WHOLE top bar: it sits in the top padding the strip already reserves
+        // (so it adds no height), spans the panel's full width, and ends exactly where the search row
+        // begins -- which is also why it cannot reach any of the three controls.
+        let grip = picker_grip_frame();
+        assert_eq!(grip.origin.x, 0.0);
+        assert_eq!(grip.size.width, PICKER_W);
+        assert_eq!(grip.origin.y + grip.size.height, search.origin.y);
     }
     #[test]
     fn incremental_row_delete_declines_an_empty_result() {
@@ -3857,8 +3940,15 @@ mod tests {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
         let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0));
         let picker = NSRect::new(NSPoint::new(680.0, 300.0), NSSize::new(PICKER_W, 600.0));
-        let (picker_frame, detail_frame) =
-            detail_group_frames(picker, 820.0, screen, 720.0, 400.0, true, 960.0);
+        let (picker_frame, detail_frame) = detail_group_frames(
+            picker,
+            820.0,
+            screen,
+            NSSize::new(720.0, 400.0),
+            None,
+            true,
+            960.0,
+        );
         let group_w = PICKER_W + DETAIL_GAP + 720.0;
         assert_eq!(picker_frame.origin.x, (1920.0 - group_w) / 2.0);
         assert_eq!(
@@ -3874,8 +3964,15 @@ mod tests {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
         let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1000.0, 800.0));
         let picker = NSRect::new(NSPoint::new(0.0, 200.0), NSSize::new(PICKER_W, 400.0));
-        let (picker_frame, detail_frame) =
-            detail_group_frames(picker, 600.0, screen, 720.0, 300.0, true, 500.0);
+        let (picker_frame, detail_frame) = detail_group_frames(
+            picker,
+            600.0,
+            screen,
+            NSSize::new(720.0, 300.0),
+            None,
+            true,
+            500.0,
+        );
         assert_eq!(picker_frame.origin.x, PICKER_EDGE_MARGIN);
         assert!(detail_frame.origin.x >= screen.origin.x + PICKER_EDGE_MARGIN);
         assert!(
@@ -3883,6 +3980,54 @@ mod tests {
                 <= screen.origin.x + screen.size.width - PICKER_EDGE_MARGIN
         );
     }
+    /// A dragged panel keeps its x when the detail opens: the group layout must start from the anchor it
+    /// is given, not from the mode-derived x. This is the regression the review found -- the code took the
+    /// anchor but only used its y, so opening the detail snapped a dragged panel back to the middle.
+    #[test]
+    fn detail_group_starts_from_the_dragged_anchor_when_there_is_one() {
+        use super::{detail_group_frames, DETAIL_GAP, PICKER_EDGE_MARGIN, PICKER_W};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0));
+        let anchored_x = 120.0;
+        let picker = NSRect::new(
+            NSPoint::new(anchored_x, 300.0),
+            NSSize::new(PICKER_W, 600.0),
+        );
+        let (picker_frame, detail_frame) = detail_group_frames(
+            picker,
+            820.0,
+            screen,
+            NSSize::new(720.0, 400.0),
+            Some(anchored_x),
+            true,
+            960.0,
+        );
+        // The anchor fits on this screen, so nothing corrects it and the group hangs off it.
+        assert_eq!(picker_frame.origin.x, anchored_x);
+        assert_eq!(
+            detail_frame.origin.x,
+            anchored_x + PICKER_W + DETAIL_GAP,
+            "the detail stays to the right of the anchor"
+        );
+        // An anchor that would push the group off the right edge is still corrected as a group.
+        let far_picker = NSRect::new(NSPoint::new(1700.0, 300.0), NSSize::new(PICKER_W, 600.0));
+        let (corrected, corrected_detail) = detail_group_frames(
+            far_picker,
+            820.0,
+            screen,
+            NSSize::new(720.0, 400.0),
+            Some(1700.0),
+            true,
+            960.0,
+        );
+        assert!(corrected.origin.x < 1700.0);
+        assert_eq!(
+            corrected_detail.origin.x + corrected_detail.size.width,
+            1920.0 - PICKER_EDGE_MARGIN
+        );
+        assert!(corrected.origin.x >= PICKER_EDGE_MARGIN);
+    }
+
     #[test]
     fn detail_text_units_scales_with_width() {
         use super::detail_text_units;

@@ -20,6 +20,7 @@ use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 /// Device hardware identity (config matches on VID+PID; name/transport for display only).
 #[derive(Debug, Clone)]
@@ -204,6 +205,14 @@ struct DeviceRegistry {
     /// Holds the services CFArray (keeping its IOHIDServiceClients alive).
     services: *mut c_void,
     devices: Vec<Device>,
+    /// When the last full *query recovery batch* ran (see `recovery_is_due`). Deliberately NOT touched by
+    /// `ensure_enumerated`'s single low-level enumeration: the recovery batch is what recovers from a stale
+    /// client, and recording a plain enumeration as an attempt would let the startup case skip it.
+    recovery_at: Option<Instant>,
+    /// Counts device-change invalidations. A recovery batch captures this before it retries and only records
+    /// its attempt if nothing invalidated it meanwhile, so a plug/unplug that lands during the batch is not
+    /// swallowed by the batch's own timestamp.
+    invalidations: u64,
 }
 
 unsafe impl Send for DeviceRegistry {}
@@ -239,6 +248,8 @@ fn registry() -> &'static Mutex<DeviceRegistry> {
             client: std::ptr::null_mut(),
             services: std::ptr::null_mut(),
             devices: Vec::new(),
+            recovery_at: None,
+            invalidations: 0,
         })
     })
 }
@@ -482,6 +493,47 @@ unsafe fn enumerate_locked(reg: &mut DeviceRegistry, rebuild_client: bool) {
 }
 
 /// Enumerate once at startup (also lazily triggered on first attribution failure).
+/// How long a failed query recovery stays authoritative. Repeated queries inside this window reuse the
+/// (empty) device list instead of rebuilding the client and re-enumerating with the two retries below.
+const RECOVERY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a query must run the recovery batch: rebuild the client and retry enumeration.
+///
+/// Pure, so the policy is testable without IOKit. The batch exists for the startup / stale-client /
+/// async-matching race (`enumerate_locked`'s 30ms settle can miss a device that is still registering), and
+/// running it again for every caller made "which mice are connected" cost ~170ms of sleeps per call on a
+/// machine where nothing enumerates -- the settings window called it three times per open. A non-empty
+/// list never needs recovery.
+fn recovery_is_due(last: Option<Instant>, now: Instant, devices_empty: bool) -> bool {
+    devices_empty && last.is_none_or(|last| now.duration_since(last) >= RECOVERY_COOLDOWN)
+}
+
+/// A device actually changed, so the next query must be allowed to recover again.
+fn invalidate_recovery(reg: &mut DeviceRegistry) {
+    reg.recovery_at = None;
+    reg.invalidations = reg.invalidations.wrapping_add(1);
+}
+
+/// Whether a finished recovery batch may record its attempt time: only when no device change invalidated
+/// the registry while the batch was running. Pure, so the interleaving is testable.
+fn may_record_recovery(batch_generation: u64, current_generation: u64) -> bool {
+    batch_generation == current_generation
+}
+
+/// Whether a caller may reuse the registry's empty answer instead of running the enumeration again.
+///
+/// True only for a registry that has already enumerated once and holds nothing, with a recovery batch still
+/// inside its cooldown. Anything else -- no enumeration yet, devices present, or a batch past its cooldown --
+/// has to go through `ensure_enumerated`, so a device can never be hidden by this shortcut.
+fn may_reuse_empty_answer(
+    enumeration_ran: bool,
+    devices_empty: bool,
+    recovery_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    enumeration_ran && devices_empty && !recovery_is_due(recovery_at, now, true)
+}
+
 pub(crate) fn ensure_enumerated() {
     let _ = injector_notice_sender();
     let mut reg = registry().lock().unwrap();
@@ -496,37 +548,65 @@ pub(crate) fn connected_devices() -> Vec<DeviceIdentity> {
     if skip_device_enumeration_in_smoke() {
         return Vec::new();
     }
+    // A recovery batch that came back empty is an answer, not a starting point: inside its cooldown another
+    // caller must reuse it instead of re-running the low-level enumeration (the IOHID services + the
+    // Bluetooth property reads) -- that repeated enumeration is what made "which mice are connected" cost
+    // ~170ms per call on a machine where nothing enumerates. A device change clears `recovery_at`, so the
+    // cooldown never hides a device that appeared.
     {
         let reg = registry().lock().unwrap();
+        if may_reuse_empty_answer(
+            !reg.client.is_null(),
+            reg.devices.is_empty(),
+            reg.recovery_at,
+            Instant::now(),
+        ) {
+            return with_virtual_pointer(Vec::new());
+        }
         if reg.client.is_null() || reg.devices.is_empty() {
             drop(reg);
             ensure_enumerated();
         }
     }
-    {
+    let (needs_recovery, batch_generation) = {
         let reg = registry().lock().unwrap();
-        if reg.devices.is_empty() {
-            // Enumeration came back empty while devices may be present (stale client or the
-            // async-matching race): retry with a rebuilt client (which carries the 30ms settle
-            // in enumerate_locked). Only give up after the retries still return empty.
-            drop(reg);
-            for _ in 0..2 {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                let mut reg = registry().lock().unwrap();
-                unsafe { enumerate_locked(&mut reg, true) };
-                if !reg.devices.is_empty() {
-                    break;
-                }
+        (
+            recovery_is_due(reg.recovery_at, Instant::now(), reg.devices.is_empty()),
+            reg.invalidations,
+        )
+    };
+    if needs_recovery {
+        // Enumeration came back empty while devices may be present (stale client or the async-matching
+        // race): retry with a rebuilt client (which carries the 30ms settle in enumerate_locked). Only
+        // after the retries still return empty does the cooldown take over, so the sequence is paid once
+        // per startup / device change rather than once per caller (see `recovery_is_due`).
+        for _ in 0..2 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut reg = registry().lock().unwrap();
+            unsafe { enumerate_locked(&mut reg, true) };
+            if !reg.devices.is_empty() {
+                break;
             }
         }
+        // Record the attempt whether or not it found anything: an empty result must still suppress the
+        // next batch inside the cooldown. Not when a device change invalidated the registry during the
+        // batch: that change must keep the next query free to recover.
+        let mut reg = registry().lock().unwrap();
+        if may_record_recovery(batch_generation, reg.invalidations) {
+            reg.recovery_at = Some(Instant::now());
+        }
     }
-    let mut out: Vec<DeviceIdentity> = {
+    let out: Vec<DeviceIdentity> = {
         let reg = registry().lock().unwrap();
         reg.devices.iter().map(|d| d.identity.clone()).collect()
     };
-    // The virtual pointer (the injecting process) comes last: it is not a HID device and only
-    // appears after an injected event has been seen while that process is still alive, so the
-    // picker's entry count follows whether a software KVM is running (see virtual_device_identity).
+    with_virtual_pointer(out)
+}
+
+/// Append the virtual pointer (the injecting process) last: it is not a HID device and only appears after an
+/// injected event has been seen while that process is still alive, so the picker's entry count follows
+/// whether a software KVM is running (see `virtual_device_identity`).
+fn with_virtual_pointer(mut out: Vec<DeviceIdentity>) -> Vec<DeviceIdentity> {
     if let Some(virtual_pointer) = virtual_device_identity() {
         out.push(virtual_pointer);
     }
@@ -711,6 +791,9 @@ fn run_recheck(force_rebuild: bool) {
     {
         let mut reg = registry().lock().unwrap();
         unsafe { enumerate_locked(&mut reg, true) };
+        // The delayed recheck exists because a just-reconnected device can miss the 30ms settle, so its
+        // result is a device change like any other: allow the next query to recover.
+        invalidate_recovery(&mut reg);
         log_debug!(
             "[device] delayed recheck: re-enumerated {} device(s).",
             reg.devices.len()
@@ -771,6 +854,8 @@ unsafe fn device_change_callback_inner(
     {
         let mut reg = registry().lock().unwrap();
         enumerate_locked(&mut reg, true);
+        // A real device change clears the recovery cooldown: the next query may recover again.
+        invalidate_recovery(&mut reg);
         log_debug!(
             "[device] plug/unplug event: re-enumerated {} device(s).",
             reg.devices.len()
@@ -1082,5 +1167,84 @@ mod tests {
         let mut map = HashMap::new();
         parse_bluetooth_info(&bytes, &mut map);
         assert_eq!(map.get("AA-BB-CC-DD-EE-FF"), Some(&0x03C2));
+    }
+    /// The recovery policy, as a pure decision: the retry batch is paid once per startup / device change,
+    /// not once per caller. Every case here is a state the old code got wrong -- it rebuilt the client and
+    /// slept 2x50ms for EVERY query while the device list was empty.
+    #[test]
+    fn recovery_runs_once_per_startup_or_device_change() {
+        let now = Instant::now();
+        // Startup: nothing has been tried yet, and nothing is enumerated -> the batch is due.
+        assert!(recovery_is_due(None, now, true));
+        // A caller right after that batch: inside the cooldown -> not due (this is the saving).
+        let recent = now - std::time::Duration::from_millis(200);
+        assert!(!recovery_is_due(Some(recent), now, true));
+        // Still inside the cooldown, just short of it.
+        let almost = now - (RECOVERY_COOLDOWN - std::time::Duration::from_millis(1));
+        assert!(!recovery_is_due(Some(almost), now, true));
+        // The cooldown expired -> due again, so a device that appeared late is still picked up.
+        let expired = now - RECOVERY_COOLDOWN;
+        assert!(recovery_is_due(Some(expired), now, true));
+        // A non-empty list never needs recovery, however long ago the last batch ran.
+        assert!(!recovery_is_due(None, now, false));
+        assert!(!recovery_is_due(Some(expired), now, false));
+    }
+
+    /// The invalidation wiring: a device change clears the cooldown, so the next query recovers again even
+    /// though the previous batch just ran (an empty list that later gains a device must not stay cached).
+    #[test]
+    fn a_device_change_makes_the_next_query_recover_again() {
+        let now = Instant::now();
+        let mut reg = DeviceRegistry {
+            client: std::ptr::null_mut(),
+            services: std::ptr::null_mut(),
+            devices: Vec::new(),
+            recovery_at: Some(now),
+            invalidations: 0,
+        };
+        assert!(!recovery_is_due(
+            reg.recovery_at,
+            now,
+            reg.devices.is_empty()
+        ));
+        invalidate_recovery(&mut reg);
+        assert!(reg.recovery_at.is_none());
+        assert!(recovery_is_due(
+            reg.recovery_at,
+            now,
+            reg.devices.is_empty()
+        ));
+    }
+
+    /// A cached empty answer is reused only inside the cooldown, and only for a registry that really holds
+    /// nothing: the shortcut must never answer "no devices" for a registry that has some.
+    #[test]
+    fn only_a_cooled_down_empty_registry_reuses_its_answer() {
+        let now = Instant::now();
+        let recent = Some(now - std::time::Duration::from_millis(50));
+        // The saving: enumerated, empty, batch still in its cooldown.
+        assert!(may_reuse_empty_answer(true, true, recent, now));
+        // Nothing enumerated yet: the caller has to enumerate.
+        assert!(!may_reuse_empty_answer(false, true, recent, now));
+        // Devices are present: the empty answer would hide them.
+        assert!(!may_reuse_empty_answer(true, false, recent, now));
+        // The cooldown expired: a device that appeared late must still be picked up.
+        assert!(!may_reuse_empty_answer(
+            true,
+            true,
+            Some(now - RECOVERY_COOLDOWN),
+            now
+        ));
+        // A device change cleared the cooldown.
+        assert!(!may_reuse_empty_answer(true, true, None, now));
+    }
+
+    /// A recovery batch that lost its race against a device change must not record its attempt: the change
+    /// has to keep the next query free to recover.
+    #[test]
+    fn a_batch_that_lost_its_race_does_not_record_its_attempt() {
+        assert!(may_record_recovery(4, 4));
+        assert!(!may_record_recovery(4, 5));
+        assert!(!may_record_recovery(5, 4));
     }
 }

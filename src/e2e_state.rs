@@ -903,16 +903,50 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             format!("[{}]", items.join(", "))
         }
     };
+    // `grip` and `settings` are the header's drag handle and settings button in the panel's own
+    // points, top-left based: an A2 scenario that drags the panel has to start the gesture on the
+    // real band, and one that opens the settings page has to click the real button -- deriving
+    // either from the panel rect would bake this module's geometry into the test.
+    let grip = crate::clipboard::picker_grip_rect_top_left();
+    let grip_json = match grip {
+        Some((x, y, w, h)) => {
+            format!("{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}")
+        }
+        None => "null".to_string(),
+    };
+    let settings = crate::clipboard::picker_settings_rect_top_left();
+    let settings_json = match settings {
+        Some((x, y, w, h)) => {
+            format!("{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}")
+        }
+        None => "null".to_string(),
+    };
+    // The display the configured position mode resolves to. On a machine with one display this cannot
+    // differ from the picker's own; on a machine with two it is what proves "main" still means the primary
+    // display after the panel has been dragged to the other one.
+    let configured_screen = crate::clipboard::picker_configured_screen_top_left();
+    let configured_screen_json = match configured_screen {
+        Some((x, y, w, h)) => {
+            format!("{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}")
+        }
+        None => "null".to_string(),
+    };
+    json.push_str(&format!(
+        "  \"clipboard_picker_configured_screen\": {},\n",
+        configured_screen_json
+    ));
     json.push_str(&format!(
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {
             Some((x, y, w, h)) => format!(
-                "{{\"visible\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"footer_hints\": {}}}",
+                "{{\"visible\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}}}",
                 crate::clipboard::picker_is_visible(),
                 x,
                 y,
                 w,
                 h,
+                grip_json,
+                settings_json,
                 hints
             ),
             None => "null".to_string(),
@@ -1229,6 +1263,41 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     json.push_str(&format!(
         "  \"selected_sidebar\": {},\n",
         crate::settings::e2e_selected_sidebar()
+    ));
+    // The page the settings window was on when it was last ordered front: `selected_sidebar` alone cannot
+    // tell "opened on the clipboard page" from "opened on General and then switched", because the two
+    // selections happen inside one run-loop turn.
+    // The mouse page's controls are filled on demand (they resolve a device and render mappings, which
+    // used to cost ~170ms of device-enumeration sleeps per settings open). A scenario can assert that
+    // opening on another page left them unfilled, and that landing on that page filled them.
+    json.push_str(&format!(
+        "  \"settings_mouse_page_materialized\": {},\n",
+        crate::settings::e2e_mouse_page_materialized()
+    ));
+    // The app's own wall time for the last settings open, in milliseconds: the click path's latency, as one
+    // number a scenario can bound (`settings_open_ms`).
+    json.push_str(&format!(
+        "  \"settings_window_built\": {},\n",
+        crate::settings::settings_window_is_built()
+    ));
+    json.push_str(&format!(
+        "  \"settings_open_ms\": {},\n",
+        crate::settings::e2e_last_open_ms()
+    ));
+    // The picker's gear click end to end (event delivery + window + panel), which is wider than the window
+    // phase above, plus the delivery part on its own so a bound can be read apart from the main-thread wait.
+    json.push_str(&format!(
+        "  \"settings_click_ms\": {},\n",
+        crate::clipboard::e2e_settings_click_ms()
+    ));
+    json.push_str(&format!(
+        "  \"settings_click_delivery_ms\": {},\n",
+        crate::clipboard::e2e_settings_click_delivery_ms()
+    ));
+    let presented_page = crate::settings::e2e_presented_page();
+    json.push_str(&format!(
+        "  \"settings_presented_page\": {},\n",
+        presented_page.map_or("null".to_string(), |page| page.to_string())
     ));
     json.push_str("  \"pages\": [");
     for (index, page) in collect_pages().iter().enumerate() {
