@@ -1,6 +1,9 @@
 //! Settings window classes and lifecycle (show/hide/sidebar switching) plus content construction.
 
 use super::*;
+use crate::clipboard::{
+    record_applied_about_status, record_applied_action, AppliedAction, NoticeSurface,
+};
 
 /// The page scroll views, indexed by sidebar order.
 fn page_scroll_views(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
@@ -90,11 +93,24 @@ pub(super) unsafe fn refresh_settings_warning_banner(ui: &SettingsUi) {
                 sel!(handleOpenPrivacy:),
                 true,
             ),
-            PageWarning::Storage => (
-                t("clipboard.grant_keychain_access"),
-                sel!(retryKeychainAccess:),
-                true,
-            ),
+            PageWarning::Storage => match crate::clipboard::storage_action() {
+                crate::clipboard::StorageAction::GrantKeychain => (
+                    t("clipboard.grant_keychain_access"),
+                    sel!(retryKeychainAccess:),
+                    true,
+                ),
+                // The blocked states cannot be cleared through the keychain: re-reading the key
+                // re-derives the same state. Their way out is the purge transaction, which is what
+                // this action runs (see `clipboard::clear_storage_and_restart`).
+                crate::clipboard::StorageAction::ClearAndRestart => (
+                    t("clipboard.clear_and_restart"),
+                    sel!(clearClipboardStorage:),
+                    true,
+                ),
+                crate::clipboard::StorageAction::None => {
+                    (String::new(), sel!(handleOpenPrivacy:), false)
+                }
+            },
             PageWarning::None => (String::new(), sel!(handleOpenPrivacy:), false),
         };
         if visible {
@@ -104,6 +120,28 @@ pub(super) unsafe fn refresh_settings_warning_banner(ui: &SettingsUi) {
             CFRelease(ns as *const c_void);
         }
         let _: () = msg_send![ui.permission_warning_button, setHidden: !visible];
+        // The palette follows the warning: a destructive storage action must read as destructive
+        // (red text — the red fill is reserved for a confirming step), and switching back to the
+        // permission warning must restore the neutral role. The same button carries both, so the role
+        // is re-applied on every refresh instead of only at construction.
+        if warning == PageWarning::Storage && action == sel!(clearClipboardStorage:) {
+            SettingsButton::apply_destructive_text(ui.permission_warning_button);
+        } else {
+            SettingsButton::apply_role(ui.permission_warning_button, SettingsButtonRole::Action);
+        }
+        // Record what this surface actually applied (for `--e2e-state`): the button exists, so the
+        // question is which action it carries. A permission banner (or none) carries no storage
+        // action at all — that is "hidden", never "clear".
+        let applied = match warning {
+            PageWarning::Storage if visible && action == sel!(retryKeychainAccess:) => {
+                AppliedAction::Grant
+            }
+            PageWarning::Storage if visible => AppliedAction::Clear,
+            _ => AppliedAction::Hidden,
+        };
+        record_applied_action(NoticeSurface::SettingsBanner, applied);
+    } else {
+        record_applied_action(NoticeSurface::SettingsBanner, AppliedAction::Absent);
     }
     // The banner is a sibling of the page scroll views, so the page it covers has to give up that
     // height. Reserving against the selected page and restoring every other page (rather than
@@ -252,29 +290,41 @@ unsafe fn refresh_permission_statuses(ui: &SettingsUi) {
     }
 }
 
-/// Refresh the About page's keychain-access row: the clipboard key is either usable now, or the user
-/// has to authorize the keychain once (the row's button does exactly that).
+/// Refresh the About page's keychain-access row.
+///
+/// The row reports the STORAGE state, not merely "is a key held": a blocked history is not a
+/// keychain problem (offering the keychain action there is a dead end), and a session that has not
+/// loaded yet has not asked for the key at all — right after a purge, "needs authorization" would
+/// accuse the keychain of a state the app itself just created. The action button is offered exactly
+/// where the keychain action is the right one (see `StorageAction`).
 unsafe fn refresh_keychain_access_row(ui: &SettingsUi) {
     if ui.keychain_access_status.is_null() {
+        record_applied_action(NoticeSurface::AboutRow, AppliedAction::Absent);
         return;
     }
     KEYCHAIN_ROW_REFRESHES.fetch_add(1, Ordering::SeqCst);
-    let granted = crate::clipboard::storage_key_available();
-    let (key, color): (&str, *mut AnyObject) = if granted {
-        (
-            "settings.keychain_status_granted",
-            msg_send![class!(NSColor), systemGreenColor],
-        )
+    let (key, show_action) = crate::clipboard::keychain_row_status();
+    let granted = key == "settings.keychain_status_granted";
+    let color: *mut AnyObject = if granted {
+        msg_send![class!(NSColor), systemGreenColor]
     } else {
-        (
-            "settings.keychain_status_missing",
-            msg_send![class!(NSColor), systemOrangeColor],
-        )
+        msg_send![class!(NSColor), systemOrangeColor]
     };
     let _: () = msg_send![ui.keychain_access_status, setTextColor: color];
     set_field(ui.keychain_access_status, t(key));
+    record_applied_about_status(key.strip_prefix("settings.keychain_status_").unwrap_or(key));
     if !ui.keychain_access_button.is_null() {
-        let _: () = msg_send![ui.keychain_access_button, setHidden: granted];
+        let _: () = msg_send![ui.keychain_access_button, setHidden: !show_action];
+        record_applied_action(
+            NoticeSurface::AboutRow,
+            if show_action {
+                AppliedAction::Grant
+            } else {
+                AppliedAction::Hidden
+            },
+        );
+    } else {
+        record_applied_action(NoticeSurface::AboutRow, AppliedAction::Absent);
     }
 }
 

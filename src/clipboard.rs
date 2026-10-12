@@ -93,7 +93,11 @@ use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use detail::{apply_backdrop_material, apply_theme};
 pub(crate) use monitor::{start, stop};
-pub(crate) use notifications::{e2e_settings_click_delivery_ms, e2e_settings_click_ms};
+pub(crate) use notifications::{
+    applied_notice_labels, e2e_settings_click_delivery_ms, e2e_settings_click_ms,
+    keychain_row_status, record_applied_about_status, record_applied_action, storage_action,
+    AppliedAction, NoticeSurface, StorageAction,
+};
 pub(crate) use persist::{clear_on_quit_enabled, discard_history_on_disk};
 pub(crate) use picker::{on_clipboard_toggle, show_picker_for_development};
 pub(crate) use smoke::{set_smoke_mode, smoke_runner};
@@ -165,6 +169,31 @@ pub(crate) fn retry_keychain_access() {
     persist::retry_load_history();
 }
 
+/// The storage notice's "clear and restart" action (settings banner and picker empty state): delete
+/// the storage set through the purge transaction and start a fresh history.
+///
+/// Eligibility is decided HERE, before the intent is recorded. Afterwards the deletion is a
+/// user-authorized purge and completes whatever the switch or the state does next — the same
+/// transaction the switch-off path runs, and the durable intent is what makes it resumable. A
+/// request that is no longer eligible is refused rather than carried out: the state can recover
+/// between the click and this call, and clearing a storage set that just became readable would
+/// delete records the user never agreed to lose.
+pub(crate) fn clear_storage_and_restart() {
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        log_info!("[clip] clear-and-restart ignored: the clipboard feature is off");
+        return;
+    }
+    if storage_action() != StorageAction::ClearAndRestart {
+        log_info!(
+            "[clip] clear-and-restart ignored: the storage state no longer admits it ({}/{})",
+            storage_state_label(),
+            storage_reason_label()
+        );
+        return;
+    }
+    persist::clear_storage_and_restart();
+}
+
 /// Finish a purge an earlier session could not complete. Called at launch and on every config
 /// change, BEFORE anything loads or writes, and whether the clipboard switch is on or off
 /// (`clear_on_quit` failures happen with the switch on).
@@ -195,6 +224,10 @@ pub(crate) fn clear_history_and_disk() {
     clear_search();
     hide_detail();
     unsafe { rebuild_rows() };
+    // The purge committed a new storage state (uninitialized, or blocked on a purge that could not
+    // finish). No load follows a switch-off, so this is the only place that can tell the three
+    // surfaces — without it a stale notice keeps accusing the keychain while the feature is off.
+    persist::refresh_storage_ui();
 }
 
 /// Drop what THIS session recorded, without touching anything on disk: the in-memory entries, the

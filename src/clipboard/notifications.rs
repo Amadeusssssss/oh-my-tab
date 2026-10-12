@@ -116,6 +116,12 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(clearClipboardStorage:),
+                crate::handle_clear_clipboard_storage as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clearClipboardHistory:),
                 clear_clipboard_history as *mut c_void,
                 types.as_ptr(),
@@ -327,9 +333,168 @@ pub(super) fn unavailable_copy_key(state: &StorageState) -> Option<&'static str>
     match state {
         StorageState::Unavailable(_) => Some("clipboard.unavailable_key"),
         StorageState::Blocked(BlockedReason::PurgePending) => Some("clipboard.unavailable_purge"),
+        // A migration or damage can clear by itself (a permission or IO obstruction that goes away),
+        // so this copy says a restart retries. A foreign key needs the matching key back and a newer
+        // format needs a newer build, so those keep the plain sentence: suggesting a restart there
+        // would promise something the same version cannot deliver.
+        StorageState::Blocked(BlockedReason::MigrationIncomplete | BlockedReason::Damaged) => {
+            Some("clipboard.unavailable_history_retry")
+        }
         StorageState::Blocked(_) => Some("clipboard.unavailable_history"),
         StorageState::Uninitialized | StorageState::Ready => None,
     }
+}
+
+/// What a storage notice may offer the user. Pure: which action a state admits is a rule about the
+/// state machine, not about any one view (plan §4.5/§4.6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StorageAction {
+    /// Re-read the keychain key and re-run the load. The only action that can clear `Unavailable`.
+    GrantKeychain,
+    /// Delete the storage set through the purge transaction and start a fresh history. The only way
+    /// out of a `Blocked` state: re-reading the key cannot change what is on disk.
+    ClearAndRestart,
+    /// Nothing to offer. A pending purge already retries on every launch and config change, and the
+    /// healthy states need no action at all.
+    None,
+}
+
+/// The action a state admits (see `StorageAction`).
+pub(super) fn storage_action_key(state: &StorageState) -> StorageAction {
+    match state {
+        StorageState::Unavailable(_) => StorageAction::GrantKeychain,
+        StorageState::Blocked(
+            BlockedReason::MigrationIncomplete
+            | BlockedReason::Damaged
+            | BlockedReason::ForeignKey
+            | BlockedReason::UnsupportedVersion,
+        ) => StorageAction::ClearAndRestart,
+        StorageState::Blocked(BlockedReason::PurgePending)
+        | StorageState::Uninitialized
+        | StorageState::Ready => StorageAction::None,
+    }
+}
+
+/// The action for the current state.
+pub(crate) fn storage_action() -> StorageAction {
+    storage_action_key(&storage::state())
+}
+
+/// What the About page's keychain row reports, and whether it offers the keychain action.
+///
+/// `Uninitialized` must not read as "needs authorization": right after a purge (or before the first
+/// load lands) the session has simply not asked for the key yet, and `Blocked` is not a keychain
+/// problem at all — the keychain action there would be a dead end (see `StorageAction`).
+///
+/// A held key answers the keychain question whatever the storage state is: the row reports
+/// AUTHORIZATION, not writability. `acquire_key_only` (this row's own action while the feature is
+/// off) holds a key without loading anything, so reporting "not read yet" after a successful grant
+/// would be wrong in exactly the way this row exists to avoid.
+pub(super) fn keychain_row_status_key(
+    state: &StorageState,
+    key_held: bool,
+) -> (&'static str, bool) {
+    match state {
+        _ if key_held => ("settings.keychain_status_granted", false),
+        StorageState::Unavailable(_) => ("settings.keychain_status_missing", true),
+        StorageState::Blocked(BlockedReason::PurgePending) => {
+            ("settings.keychain_status_cleanup", false)
+        }
+        StorageState::Blocked(_) => ("settings.keychain_status_unreadable", false),
+        StorageState::Uninitialized | StorageState::Ready => {
+            ("settings.keychain_status_not_read", false)
+        }
+    }
+}
+
+/// The About page's keychain row for the current state.
+pub(crate) fn keychain_row_status() -> (&'static str, bool) {
+    keychain_row_status_key(&storage::state(), storage::key().is_some())
+}
+
+/// A surface that reports the storage state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NoticeSurface {
+    SettingsBanner,
+    PickerEmptyState,
+    AboutRow,
+}
+
+/// What a notice surface actually put on screen. `Absent` (no such view in this process) and
+/// `Hidden` (the view exists with its action hidden) are different facts — a state field that
+/// conflated them could not tell a missing surface from a hidden button.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AppliedAction {
+    /// The view does not exist in this process (never created, or no window open).
+    Absent,
+    /// The view exists and carries no action (hidden, or a state that offers none).
+    Hidden,
+    /// The view carries the keychain action.
+    Grant,
+    /// The view carries the clear-and-restart action.
+    Clear,
+}
+
+impl AppliedAction {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Hidden => "hidden",
+            Self::Grant => "grant",
+            Self::Clear => "clear",
+        }
+    }
+}
+
+/// The last APPLIED notice state per surface, for `--e2e-state`: what the UI actually put on screen,
+/// not what the classifier would allow. `Unset` means nothing has been applied yet, which is also
+/// not the same fact as `Absent`.
+#[derive(Clone, Copy)]
+struct AppliedNotice {
+    banner: Option<AppliedAction>,
+    panel: Option<AppliedAction>,
+    about: Option<AppliedAction>,
+    about_status: Option<&'static str>,
+}
+
+impl AppliedNotice {
+    const fn new() -> Self {
+        Self {
+            banner: None,
+            panel: None,
+            about: None,
+            about_status: None,
+        }
+    }
+}
+
+static APPLIED_NOTICE: Mutex<AppliedNotice> = Mutex::new(AppliedNotice::new());
+
+/// Record what a surface applied (called from the UI paths themselves, on the main thread).
+pub(crate) fn record_applied_action(surface: NoticeSurface, action: AppliedAction) {
+    let mut applied = APPLIED_NOTICE.lock().unwrap();
+    match surface {
+        NoticeSurface::SettingsBanner => applied.banner = Some(action),
+        NoticeSurface::PickerEmptyState => applied.panel = Some(action),
+        NoticeSurface::AboutRow => applied.about = Some(action),
+    }
+}
+
+/// Record the About row's applied status (the short suffix of its `settings.keychain_status_*` key).
+pub(crate) fn record_applied_about_status(status: &'static str) {
+    APPLIED_NOTICE.lock().unwrap().about_status = Some(status);
+}
+
+/// The applied labels for `--e2e-state`: (banner, panel, about row, about row status).
+pub(crate) fn applied_notice_labels() -> (&'static str, &'static str, &'static str, &'static str) {
+    let applied = *APPLIED_NOTICE.lock().unwrap();
+    let label = |action: Option<AppliedAction>| action.map_or("unset", AppliedAction::label);
+    (
+        label(applied.banner),
+        label(applied.panel),
+        label(applied.about),
+        applied.about_status.unwrap_or("unset"),
+    )
 }
 
 /// The unavailable copy for the current state, resolved in the active locale.

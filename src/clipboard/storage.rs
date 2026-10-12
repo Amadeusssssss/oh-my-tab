@@ -339,31 +339,48 @@ fn clear_purge_intent() -> bool {
 /// Run the purge transaction (invariant R6):
 /// 1. persist the intent FIRST (so a crash mid-delete is recoverable),
 /// 2. stop in-flight work (generation bump) so nothing writes after this point,
-/// 3. delete, 4. verify, 5. revoke the intent.
+/// 3. delete, 4. verify, 5. revoke the intent,
+/// 6. commit the completion boundary: advance the generation once more and commit the final state
+///    under ONE `SESSION` lock.
 ///
 /// Only a verified deletion plus a verified revocation returns `Done`.
+///
+/// Step 6 is what makes the transaction safe against a load that captured the generation after
+/// step 2 but read the index BEFORE step 3: `decide_load` checks for a pending purge and only then
+/// captures the generation, and the read takes no I/O lock, so such a result would otherwise pass
+/// `apply_load_outcome`'s generation check and put records back that the user asked to delete.
 pub(super) fn run_full_purge() -> PurgeOutcome {
     // Any attempt invalidates loads that started before it, whatever its outcome: a request to stop
     // keeping records must not be bypassed by a result computed under the old generation.
     bump_generation();
-    match purge_intent_state() {
-        IntentState::Present => {}
+    let outcome = match purge_intent_state() {
+        IntentState::Present => run_full_purge_body(),
         IntentState::Absent => {
             if !write_purge_intent() {
                 log_info!(
                     "Clipboard purge not accepted: neither intent location is writable; nothing was deleted."
                 );
                 PURGE_NOT_ACCEPTED.store(true, Ordering::SeqCst);
-                return PurgeOutcome::NotAccepted;
+                PurgeOutcome::NotAccepted
+            } else {
+                run_full_purge_body()
             }
         }
         IntentState::Unknown => {
             // A marker that cannot be checked might be there: deleting now could remove history
             // whose purge nobody authorized. Nothing is deleted, and the session stays blocked.
             log_info!("Clipboard purge deferred: the intent state cannot be verified.");
-            return PurgeOutcome::Deferred;
+            PurgeOutcome::Deferred
         }
-    }
+    };
+    commit_purge_completion(outcome == PurgeOutcome::Done);
+    outcome
+}
+
+/// The delete/verify/revoke half of the transaction (see `run_full_purge`). Split out so EVERY
+/// outcome — including a request that could not even be recorded, and one that could not be
+/// checked — still passes through the completion boundary exactly once.
+fn run_full_purge_body() -> PurgeOutcome {
     bump_generation();
     let remaining = discard_history_verified();
     if !remaining.is_empty() {
@@ -384,19 +401,37 @@ pub(super) fn run_full_purge() -> PurgeOutcome {
         return PurgeOutcome::Deferred;
     }
     PURGE_NOT_ACCEPTED.store(false, Ordering::SeqCst);
-    log_info!("Clipboard purge complete (history file, image cache and intent removed).");
+    log_info!("Clipboard purge complete (history file, image cache, kept-aside copies and intent removed).");
     PurgeOutcome::Done
 }
 
-/// A user-authorized purge (turning the switch off, or `clear_on_quit`). The key is kept
-/// (decision 3): it reveals nothing on its own, and deleting it would add an irreversible
-/// failure path without a real gain.
+/// A user-authorized purge (turning the switch off, `clear_on_quit`, or the storage notice's
+/// "clear and restart"). The keychain item is kept (decision 3): it reveals nothing on its own, and
+/// deleting it would add an irreversible failure path without a real gain.
+///
+/// The final state is committed by the completion boundary inside `run_full_purge`; nothing here
+/// writes the state afterwards, so a newer state can never be overwritten by an older attempt.
 pub(super) fn request_full_purge() -> PurgeOutcome {
-    let outcome = run_full_purge();
-    if outcome != PurgeOutcome::Done {
-        set_blocked(BlockedReason::PurgePending);
-    }
-    outcome
+    run_full_purge()
+}
+
+/// The purge's completion boundary (step 6 of `run_full_purge`): advance the generation and commit
+/// the final state — `Uninitialized` after a verified purge (the storage set is gone, so a fresh
+/// load is allowed to decide), `PurgePending` otherwise — together with dropping the session's key,
+/// in ONE `SESSION` critical section.
+///
+/// One section, not three calls: a load result captured during the transaction must see a generation
+/// that is already past it AND a state that is already not writable, or it could decide the storage
+/// on its own (the interleaving is written out in the plan's §4.5).
+fn commit_purge_completion(done: bool) {
+    let mut session = SESSION.lock().unwrap();
+    session.generation += 1;
+    session.key = None;
+    session.state = if done {
+        StorageState::Uninitialized
+    } else {
+        StorageState::Blocked(BlockedReason::PurgePending)
+    };
 }
 
 /// What a pending-purge attempt did.
@@ -418,7 +453,9 @@ pub(super) fn process_pending_purge() -> PurgeProgress {
         // Nothing pending. A session that was blocked on the purge can now be rebuilt: the records
         // it was protecting are gone, so a fresh key is allowed (invariant R1).
         if matches!(state(), StorageState::Blocked(BlockedReason::PurgePending)) {
-            rebuild_after_purge();
+            // Through the same boundary a purge uses: the generation moves with the state, so a
+            // result captured while the session was blocked cannot decide the storage afterwards.
+            commit_purge_completion(true);
             return PurgeProgress::Completed;
         }
         return PurgeProgress::NothingPending;
@@ -426,28 +463,15 @@ pub(super) fn process_pending_purge() -> PurgeProgress {
     // Either a marker is there, or an earlier attempt could not even record one. Retry the
     // transaction: an unrecorded request must keep the session blocked until a VERIFIED purge
     // completes, and a later apply must not read "no marker" as "the records are gone".
+    // `run_full_purge` commits the final state at its completion boundary; this must not write the
+    // state again afterwards (a second, unconditional write could hide a newer state).
     match run_full_purge() {
-        PurgeOutcome::Done => {
-            rebuild_after_purge();
-            PurgeProgress::Completed
-        }
+        PurgeOutcome::Done => PurgeProgress::Completed,
         PurgeOutcome::Deferred | PurgeOutcome::NotAccepted => {
             log_info!("Clipboard history stays blocked: a purge is still pending.");
-            set_blocked(BlockedReason::PurgePending);
             PurgeProgress::StillPending
         }
     }
-}
-
-/// After a completed purge the storage set is empty; the session must not become writable until a
-/// fresh load decides (see the body).
-fn rebuild_after_purge() {
-    // Deliberately NOT acquiring the key here: this runs on the caller's thread (a config apply on
-    // the main thread), and a keychain read may block on a system prompt. The session stays
-    // uninitialized and not writable until the next load decides — off the main thread.
-    let mut session = SESSION.lock().unwrap();
-    session.state = StorageState::Uninitialized;
-    session.key = None;
 }
 
 /// Test-only: the single lock every test that touches the storage state OR the shared image

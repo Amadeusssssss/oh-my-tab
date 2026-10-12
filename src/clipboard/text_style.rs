@@ -486,8 +486,10 @@ pub(super) unsafe fn set_clear_confirmation_button_style(button: *mut AnyObject,
         0x00000000
     };
     // The destructive label stays a palette colour (it is a semantic accent, not panel ink); the plain
-    // label is panel text and follows the material like every other label on this panel.
-    let text = if action == sel!(clearClipboardAll:) {
+    // label is panel text and follows the material like every other label on this panel. Both the
+    // panel's own clear-all button and the storage notice's clear-and-restart are irreversible full
+    // deletions, so both carry the destructive token.
+    let text = if action == sel!(clearClipboardAll:) || action == sel!(clearClipboardStorage:) {
         crate::ffi::hex_to_ns_color(palette.destructive)
     } else {
         crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary)

@@ -107,6 +107,26 @@ pub(super) fn image_logical_name(hash: u64) -> String {
     format!("{hash:016x}")
 }
 
+/// A fixed label for an object kind, for diagnostic lines. Never a file name: a cache file's name
+/// IS its content hash, and logs travel (plan §4.9).
+fn kind_label(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::History => "index",
+        ObjectKind::ImageData => "image",
+        ObjectKind::Thumbnail => "preview",
+        ObjectKind::Detail => "detail",
+    }
+}
+
+/// A fixed class for an IO failure: the error kind plus the raw OS code when there is one. The
+/// error's own message and the file name are deliberately left out (see `kind_label`).
+fn io_class(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("io({:?}, os={code})", error.kind()),
+        None => format!("io({:?})", error.kind()),
+    }
+}
+
 /// Seal `plaintext` and write it atomically to `dir/file_name` (temp file, read back and
 /// authenticate, then rename). The verification step is what makes a later "it was written" a
 /// fact rather than an assumption.
@@ -120,33 +140,71 @@ fn write_sealed_file(
 ) -> bool {
     let object_id = object_id_for(logical_name);
     let Some(sealed) = seal(key, kind, &object_id, plaintext) else {
-        log_info!("Clipboard write failed: sealing failed.");
+        log_info!(
+            "Clipboard write failed (kind={}, stage=seal, class=seal).",
+            kind_label(kind)
+        );
         return false;
     };
-    if std::fs::create_dir_all(dir).is_err() {
-        log_info!("Clipboard write failed: cannot create dir.");
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        log_info!(
+            "Clipboard write failed (kind={}, stage=mkdir, class={}).",
+            kind_label(kind),
+            io_class(&error)
+        );
         return false;
     }
     let path = dir.join(file_name);
     let tmp = dir.join(format!("{file_name}.tmp{}-0", std::process::id()));
-    let ok = std::fs::write(&tmp, &sealed).is_ok();
-    if ok {
-        // Mode 600: owner-only access.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    if let Err(error) = std::fs::write(&tmp, &sealed) {
+        log_info!(
+            "Clipboard write failed (kind={}, stage=write, class={}).",
+            kind_label(kind),
+            io_class(&error)
+        );
+        return false;
     }
+    // Mode 600: owner-only access.
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
     // Read back and authenticate before publishing: a torn or truncated write must never
-    // replace the previous file.
-    let verified = ok
-        && std::fs::read(&tmp)
-            .ok()
-            .is_some_and(|back| open(key, kind, &object_id, &back).is_ok());
-    let ok = verified && std::fs::rename(&tmp, &path).is_ok();
-    if !ok {
+    // replace the previous file. The two failures are logged apart: a read-back that fails is an
+    // IO problem, not a cryptographic one.
+    let verified = match std::fs::read(&tmp) {
+        Ok(back) => {
+            if open(key, kind, &object_id, &back).is_ok() {
+                true
+            } else {
+                log_info!(
+                    "Clipboard write failed (kind={}, stage=authenticate, class=authenticate).",
+                    kind_label(kind)
+                );
+                false
+            }
+        }
+        Err(error) => {
+            log_info!(
+                "Clipboard write failed (kind={}, stage=read-back, class={}).",
+                kind_label(kind),
+                io_class(&error)
+            );
+            false
+        }
+    };
+    if !verified {
         let _ = std::fs::remove_file(&tmp);
-        log_info!("Clipboard write failed: write/verify error.");
+        return false;
     }
-    ok
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        log_info!(
+            "Clipboard write failed (kind={}, stage=rename, class={}).",
+            kind_label(kind),
+            io_class(&error)
+        );
+        return false;
+    }
+    true
 }
 
 struct PersistJob {
@@ -683,11 +741,44 @@ fn apply_load_outcome(outcome: LoadOutcome) {
         // Once per session for the system notification; the settings banner and the panel's own
         // notice are re-derived from the state instead of being announced once.
         notify_storage_failure_once();
-        unsafe { crate::settings::refresh_clipboard_unavailable_notice() };
-        // The About page's keychain row reads the same state and must follow it too, without waiting
-        // for a page switch or an app activation.
-        refresh_settings_permission_ui();
-        schedule_picker_refresh();
+        refresh_storage_ui();
+    }
+}
+
+/// Push a storage-state change to the three surfaces that report it: the settings warning banner,
+/// the About page's keychain row and the picker's empty state. A load result refreshes them from
+/// `apply_load_outcome`; a purge changes the state WITHOUT producing a load result, so it has to
+/// refresh them itself — otherwise a purge that could not finish leaves the old notice and a dead
+/// action on screen.
+///
+/// Main thread only (it touches AppKit); every caller is on it, and `apply_load_outcome` guards its
+/// own call with `is_main_thread`.
+pub(super) fn refresh_storage_ui() {
+    unsafe { crate::settings::refresh_clipboard_unavailable_notice() };
+    refresh_settings_permission_ui();
+    schedule_picker_refresh();
+}
+
+/// The user-authorized "clear and restart" (see `clipboard::clear_storage_and_restart`): run the
+/// purge transaction — the same one the switch-off path runs — and then ask for the fresh load the
+/// completion boundary makes necessary. The boundary advances the generation, so a load that was
+/// already queued re-runs by itself, but one is not CREATED by that: with no request in flight the
+/// session would stay `Uninitialized` (not writable) until the next launch.
+pub(super) fn clear_storage_and_restart() {
+    let outcome = storage::request_full_purge();
+    log_info!(
+        "[clip] clear-and-restart: purge {}",
+        match outcome {
+            storage::PurgeOutcome::Done => "complete",
+            storage::PurgeOutcome::Deferred => "deferred (some files could not be removed)",
+            storage::PurgeOutcome::NotAccepted => "not accepted (no intent could be recorded)",
+        }
+    );
+    // Refresh either way: a failed purge must show the cleanup state immediately instead of leaving
+    // the notice that offered this action.
+    refresh_storage_ui();
+    if outcome == storage::PurgeOutcome::Done && CONFIG.read().unwrap().clipboard.enabled {
+        load_history();
     }
 }
 
@@ -867,19 +958,37 @@ fn referenced_cache_files_ok(entries: &[ClipEntry]) -> bool {
         if img.hash == 0 {
             continue;
         }
-        if img.source_path.is_none() && cache_image_state(img.hash) == CacheFileState::Failed {
-            log_info!(
-                "Clipboard image cache file is present but unreadable ({})",
-                image_logical_name(img.hash)
-            );
-            ok = false;
+        if img.source_path.is_none() {
+            match cache_image_state(img.hash) {
+                CacheFileState::Unreadable(kind) => {
+                    log_info!(
+                        "Clipboard image cache file is present but unreadable (kind=image, stage=read, class=io({kind:?}))."
+                    );
+                    ok = false;
+                }
+                CacheFileState::Failed => {
+                    log_info!(
+                        "Clipboard image cache file is present but does not authenticate (kind=image, stage=authenticate, class=authenticate)."
+                    );
+                    ok = false;
+                }
+                CacheFileState::Readable | CacheFileState::Missing => {}
+            }
         }
-        if cache_preview_state(img.hash) == CacheFileState::Failed {
-            log_info!(
-                "Clipboard image preview is present but unreadable ({}.preview)",
-                image_logical_name(img.hash)
-            );
-            ok = false;
+        match cache_preview_state(img.hash) {
+            CacheFileState::Unreadable(kind) => {
+                log_info!(
+                    "Clipboard image preview is present but unreadable (kind=preview, stage=read, class=io({kind:?}))."
+                );
+                ok = false;
+            }
+            CacheFileState::Failed => {
+                log_info!(
+                    "Clipboard image preview is present but does not authenticate (kind=preview, stage=authenticate, class=authenticate)."
+                );
+                ok = false;
+            }
+            CacheFileState::Readable | CacheFileState::Missing => {}
         }
     }
     ok
@@ -957,25 +1066,39 @@ fn resume_isolation(generation: u64) -> bool {
 }
 
 /// The move itself (see `isolate_storage_set`).
+///
+/// "Cannot establish whether it is there" blocks instead of skipping: skipping the cache while
+/// moving the index would leave a fresh session next to a cache its own sweep may then delete, and
+/// skipping an index would let the fresh session's write replace it (a rename onto the same path).
+/// A failure anywhere keeps the marker, so the next launch resumes from the top.
 fn finish_isolation() -> bool {
     let cache = clip_image_cache_dir();
     let mut moved_cache: Option<std::path::PathBuf> = None;
-    if matches!(storage::path_present(&cache), Some(true)) {
-        match rename_aside(&cache) {
+    match storage::path_present(&cache) {
+        Some(true) => match rename_aside(&cache) {
             Some(path) => moved_cache = Some(path),
             None => return false, // nothing else has been touched
+        },
+        Some(false) => {}
+        None => {
+            log_info!("Clipboard isolation deferred: the cache directory cannot be inspected.");
+            return false;
         }
     }
     for path in [history_file_path(), legacy_history_file_path()] {
-        if !matches!(storage::path_present(&path), Some(true)) {
-            continue;
+        match storage::path_present(&path) {
+            Some(true) => {}
+            Some(false) => continue,
+            None => {
+                log_info!("Clipboard isolation deferred: an index file cannot be inspected.");
+                roll_back_cache(moved_cache.as_deref(), &cache);
+                return false;
+            }
         }
         if rename_aside(&path).is_none() {
             // Roll the cache back, so the next launch sees the state this one saw instead of
             // "no index" next to a cache it would sweep.
-            if let Some(moved) = &moved_cache {
-                let _ = std::fs::rename(moved, &cache);
-            }
+            roll_back_cache(moved_cache.as_deref(), &cache);
             return false;
         }
     }
@@ -988,6 +1111,18 @@ fn finish_isolation() -> bool {
             log_info!("Clipboard isolation marker could not be removed; staying blocked.");
             false
         }
+    }
+}
+
+/// Undo the cache half of an isolation that could not finish, so the next launch sees the state this
+/// one saw. A rollback that itself fails is logged: the marker stays, so the next launch resumes the
+/// isolation from the top rather than starting empty next to an unreferenced cache.
+fn roll_back_cache(moved: Option<&std::path::Path>, cache: &std::path::Path) {
+    let Some(moved) = moved else {
+        return;
+    };
+    if std::fs::rename(moved, cache).is_err() {
+        log_info!("Clipboard isolation rollback failed; it stays resumable.");
     }
 }
 
@@ -1012,6 +1147,139 @@ fn rename_aside(path: &std::path::Path) -> Option<std::path::PathBuf> {
         return None;
     }
     None
+}
+
+/// Whether `name` is a kept-aside copy of `active_name` that THIS app created: `rename_aside`
+/// writes `<name>.failed-<unix seconds>`, with a numeric suffix when that name was taken. Pure, so
+/// the rule can be asserted without a file system: the purge deletes by this rule, and it must
+/// never match a file the app did not create (a hand-made `clipboard-history.enc.failed-backup`).
+fn is_kept_aside_name(active_name: &str, name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(active_name) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(".failed-") else {
+        return false;
+    };
+    let (stamp, suffix) = match rest.split_once('-') {
+        Some((stamp, suffix)) => (stamp, Some(suffix)),
+        None => (rest, None),
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    digits(stamp) && suffix.is_none_or(digits)
+}
+
+/// Remove the app's own kept-aside copies of `active` (see `rename_aside`), VERIFYING each: a copy
+/// that is still there, or whose state cannot be established, comes back in `remaining` so the
+/// purge reports an incomplete transaction instead of claiming success. Symlinks are never followed
+/// and never deleted — a link is not a copy this app created, and deleting through it could reach
+/// content outside the storage set.
+fn discard_kept_aside_copies(active: &std::path::Path, remaining: &mut Vec<std::path::PathBuf>) {
+    let (Some(parent), Some(active_name)) = (
+        active.parent(),
+        active.file_name().and_then(|name| name.to_str()),
+    ) else {
+        return;
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        // No directory means no copy can be in it: not a failure (a purge on a machine that never
+        // wrote a history must not report an incomplete cleanup).
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        // Cannot enumerate for any other reason: whether a copy exists cannot be established, so
+        // nothing may be reported as cleaned.
+        Err(_) => {
+            remaining.push(parent.to_path_buf());
+            return;
+        }
+    };
+    let mut unreadable_entry = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // An entry that cannot even be read might be a copy: not a clean transaction.
+            unreadable_entry = true;
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_kept_aside_name(active_name, name) {
+            continue;
+        }
+        let path = entry.path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                log_info!("Clipboard kept-aside path is a symlink; left untouched.");
+                remaining.push(path);
+            }
+            Ok(meta) if meta.is_dir() => discard_kept_aside_dir(&path, remaining),
+            Ok(_) => discard_kept_aside_file(&path, remaining),
+            Err(_) => remaining.push(path),
+        }
+    }
+    if unreadable_entry {
+        remaining.push(parent.to_path_buf());
+    }
+}
+
+/// Remove one kept-aside file, VERIFYING it. Only an explicit "not found" may be read as gone: a
+/// failed delete whose metadata check ALSO fails (permissions, IO) must never be reported as
+/// cleaned — that is exactly how a purge could revoke its intent while copies survive.
+fn discard_kept_aside_file(path: &std::path::Path, remaining: &mut Vec<std::path::PathBuf>) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => remaining.push(path.to_path_buf()),
+    }
+}
+
+/// Remove one kept-aside DIRECTORY (the image cache's copy) and verify it. Only regular files are
+/// removed; any other object inside (a subdirectory, a symlink) keeps the purge incomplete rather
+/// than being skipped and reported as cleaned.
+fn discard_kept_aside_dir(dir: &std::path::Path, remaining: &mut Vec<std::path::PathBuf>) {
+    let mut verified = true;
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    verified = false;
+                    continue;
+                };
+                let path = entry.path();
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_file() => match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => verified = false,
+                    },
+                    _ => verified = false,
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => verified = false,
+    }
+    if verified {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => verified = false,
+        }
+    }
+    if !verified {
+        remaining.push(dir.to_path_buf());
+    }
+}
+
+/// Remove the isolation marker, VERIFYING it: while it stays (or cannot be checked), the next load
+/// would try to resume an isolation whose storage set the user just deleted.
+fn discard_isolation_marker(remaining: &mut Vec<std::path::PathBuf>) {
+    let marker = isolation_marker_path();
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => remaining.push(marker),
+    }
 }
 
 /// Merge loaded entries into the in-memory history (dedup by kind, pinned first, trim to
@@ -1137,8 +1405,12 @@ fn migrate_legacy_history(legacy: &std::path::Path, generation: u64) -> LoadOutc
         }
     };
     // Encrypted cache files may exist from an interrupted earlier migration: creating a new key
-    // would orphan them, so creation is only allowed when nothing is sealed yet.
-    let allow_create = !any_sealed_cache_file();
+    // would orphan them, so creation is only allowed when the cache was inspected and holds nothing
+    // sealed. The three-valued answer is kept all the way to the error handling below: "cannot tell"
+    // must neither create a key (R1) nor be read as "the key is permanently lost" (which would move
+    // a recoverable history aside).
+    let sealed = any_sealed_cache_file();
+    let allow_create = sealed == Some(false);
     match keyring::acquire(allow_create) {
         Ok(key) => {
             // The conversion and the commit share the purge's I/O lock (and the cache lock, taken in
@@ -1240,37 +1512,72 @@ fn migrate_legacy_history(legacy: &std::path::Path, generation: u64) -> LoadOutc
             log_info!("Clipboard history migrated to the encrypted format.");
             outcome(generation, LoadDecision::Entries { key, entries })
         }
-        Err(KeyUnavailable::Missing) => {
-            // Partially migrated data without a key: unrecoverable by design. Isolate the whole
-            // set (file + cache) and start fresh, never deleting anything.
+        Err(KeyUnavailable::Missing) if sealed == Some(true) => {
+            // CONFIRMED sealed data without a key: unrecoverable by design (the plan's §4.5 row).
+            // Isolate the whole set (file + cache) and start fresh, never deleting anything.
             log_info!("Clipboard migration found no key with sealed data present; isolating and starting fresh.");
             if !isolate_storage_set(generation) {
                 return outcome(generation, LoadDecision::Blocked(BlockedReason::Damaged));
             }
             empty_outcome(generation)
         }
+        Err(KeyUnavailable::Missing) => {
+            // No key, but nothing was CONFIRMED sealed (or the cache could not be inspected): this
+            // is not the permanently-lost-key case. The plaintext index is still the authority, so it
+            // stays exactly where it is and the migration is retried later — moving a recoverable
+            // history aside would turn a transient read failure into a reset nobody asked for.
+            log_info!(
+                "Clipboard migration found no key and no confirmed sealed data; the plaintext history stays in place."
+            );
+            outcome(generation, LoadDecision::Blocked(BlockedReason::Damaged))
+        }
         Err(reason) => outcome(generation, LoadDecision::Unavailable(reason)),
     }
 }
 
 /// Whether any cache file is already sealed (used to forbid key creation mid-migration).
-fn any_sealed_cache_file() -> bool {
+///
+/// Three-valued, and "cannot tell" is NOT "none". The probe must agree with how the cache is
+/// actually READ (`std::fs::read`, which follows symlinks), so:
+/// - a confirmed regular file is read;
+/// - a symlink is UNKNOWN, never "nothing": its target may be sealed, and skipping it would let a
+///   key be created next to sealed data (invariant R1);
+/// - a directory (or any other non-file object `read` cannot return data for) holds no cache bytes;
+/// - an entry that cannot be inspected, or whose metadata cannot be read, is UNKNOWN.
+///
+/// The caller keeps the answer to the final decision: `Some(false)` is the only value that allows
+/// creating a key, and an unknown answer with no key must stay blocked rather than be read as "the
+/// key is permanently lost".
+fn any_sealed_cache_file() -> Option<bool> {
     let dir = clip_image_cache_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return false;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return None;
+        };
         let path = entry.path();
-        if !path.is_file() {
-            continue;
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(meta) if meta.file_type().is_symlink() => return None,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         }
-        if let Ok(bytes) = std::fs::read(&path) {
-            if looks_like_envelope(&bytes) {
-                return true;
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                if looks_like_envelope(&bytes) {
+                    return Some(true);
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
     }
-    false
+    Some(false)
 }
 
 enum Convert {
@@ -1288,25 +1595,44 @@ fn convert_cache_file(
     logical_name: &str,
     key: &MasterKey,
 ) -> Convert {
-    let Ok(bytes) = std::fs::read(path) else {
-        return if path.exists() {
-            Convert::Failed
-        } else {
-            Convert::Absent
-        };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Convert::Absent,
+        // Unreadable for any other reason (permissions, IO, a non-file object): the migration must
+        // not commit. The line names the class, never the file.
+        Err(error) => {
+            log_info!(
+                "Clipboard migration: cache file could not be read (kind={}, stage=read, class={}).",
+                kind_label(kind),
+                io_class(&error)
+            );
+            return Convert::Failed;
+        }
     };
     let object_id = object_id_for(logical_name);
     if looks_like_envelope(&bytes) {
         return if open(key, kind, &object_id, &bytes).is_ok() {
             Convert::Converted
         } else {
+            log_info!(
+                "Clipboard migration: sealed cache file did not authenticate (kind={}, stage=authenticate, class=authenticate).",
+                kind_label(kind)
+            );
             Convert::Failed
         };
     }
     let Some(dir) = path.parent() else {
+        log_info!(
+            "Clipboard migration: cache file has no parent directory (kind={}, stage=read, class=path).",
+            kind_label(kind)
+        );
         return Convert::Failed;
     };
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        log_info!(
+            "Clipboard migration: cache file name is not UTF-8 (kind={}, stage=read, class=path).",
+            kind_label(kind)
+        );
         return Convert::Failed;
     };
     if write_sealed_file(dir, file_name, logical_name, kind, key, &bytes) {
@@ -1352,7 +1678,14 @@ fn sweep_history_temp_files(history_path: &std::path::Path) -> Vec<std::path::Pa
         return remaining;
     };
     let mut removed = 0usize;
-    for entry in entries.flatten() {
+    let mut unreadable_entry = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // An entry that cannot be read might be a temp file holding the whole history: the
+            // directory stays unverified rather than being reported as clean.
+            unreadable_entry = true;
+            continue;
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -1366,6 +1699,9 @@ fn sweep_history_temp_files(history_path: &std::path::Path) -> Vec<std::path::Pa
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => remaining.push(path),
         }
+    }
+    if unreadable_entry {
+        remaining.push(dir.to_path_buf());
     }
     if removed > 0 {
         log_info!("Removed {removed} leftover clipboard history temp file(s).");
@@ -1386,6 +1722,17 @@ pub(super) fn discard_history_verified() -> Vec<std::path::PathBuf> {
         &legacy_history_file_path(),
         &clip_image_cache_dir(),
     ));
+    // A user-authorized purge covers the kept-aside copies and the isolation marker too: the
+    // switch-off copy promises that turning the feature off clears the saved records, and a
+    // half-finished isolation would otherwise block the fresh start this purge exists to enable.
+    for active in [
+        history_file_path(),
+        legacy_history_file_path(),
+        clip_image_cache_dir(),
+    ] {
+        discard_kept_aside_copies(&active, &mut remaining);
+    }
+    discard_isolation_marker(&mut remaining);
     remaining.sort();
     remaining.dedup();
     // A discard invalidates the queued snapshots instead of running them, so the worker's
@@ -1414,9 +1761,23 @@ pub(super) fn discard_history_in(
     wipe_cache_for_discard(cache_dir);
     match std::fs::read_dir(cache_dir) {
         Ok(entries) => {
-            for entry in entries.flatten() {
-                if entry.path().is_file() {
-                    remaining.push(entry.path());
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    // An entry that cannot be read might be one of ours: not a clean wipe.
+                    remaining.push(cache_dir.to_path_buf());
+                    continue;
+                };
+                let path = entry.path();
+                // The wipe removes FILES, so a file that is still there was not deleted. A confirmed
+                // non-file object (the history directory of a test/smoke run lives inside the cache
+                // directory; a stray directory in production) is not one of the app's cache files and
+                // is skipped. Only an explicit "not found" counts as gone: a metadata check that
+                // fails cannot prove absence, so it stays incomplete.
+                match std::fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_file() => remaining.push(path),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => remaining.push(path),
                 }
             }
         }

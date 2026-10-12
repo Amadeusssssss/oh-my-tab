@@ -1956,6 +1956,14 @@ fn setup_status_bar() {
                 handle_retry_keychain_access as *mut c_void,
                 types.as_ptr(),
             );
+            // Same two-class arrangement for the storage notice's other action: the settings banner
+            // and the picker's empty state both target it.
+            class_addMethod(
+                cls,
+                sel!(clearClipboardStorage:),
+                handle_clear_clipboard_storage as *mut c_void,
+                types.as_ptr(),
+            );
             // The settings window's buttons target THIS action class (MENU_TARGET in
             // settings/window.rs), so "View guide" must be registered here; registering it on the
             // main controller class leaves an unimplemented selector and the click does nothing
@@ -2281,6 +2289,18 @@ pub(crate) extern "C" fn handle_retry_keychain_access(
     _sender: *mut c_void,
 ) {
     crate::clipboard::retry_keychain_access();
+}
+
+/// The storage notice's "clear and restart" action (settings banner and picker empty state): delete
+/// the storage set through the purge transaction and start a fresh history. Offered only while the
+/// state admits it (see `StorageAction`); the handler re-checks, because the state can recover
+/// between the click and the call.
+pub(crate) extern "C" fn handle_clear_clipboard_storage(
+    _this: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    crate::clipboard::clear_storage_and_restart();
 }
 
 /// Open System Settings -> Privacy & Security -> Accessibility (deep link).

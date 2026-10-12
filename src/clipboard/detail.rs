@@ -1505,11 +1505,12 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     };
     let doc_h = empty_state_doc_height(visible_h);
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
-    // While the storage is unavailable the panel carries the path out of it: the same "grant
-    // keychain access" action the settings banner offers, centred under the sentence that says why
+    // While the storage is unavailable the panel carries the path out of it: the action the state
+    // admits (the same one the settings banner offers), centred under the sentence that says why
     // nothing can be recorded. The sentence and the button are centred as one block, so the panel
     // does not look top-heavy.
-    let show_action = unavailable_copy().is_some();
+    let action = storage_action();
+    let show_action = action != StorageAction::None;
     let button_h = 26.0;
     let block_gap = 10.0;
     // The hint: vertically centered within the visible list area (with the button, when present).
@@ -1531,7 +1532,7 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
             } else {
                 0.0
             },
-        show_action,
+        action,
     );
     let frame = NSRect::new(
         NSPoint::new(PAD_X, label_y),
@@ -1576,32 +1577,62 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     true
 }
 
-/// Place (or hide) the empty state's "grant keychain access" button at `y`, centred.
+/// Place (or hide) the empty state's storage action at `y`, centred.
 ///
 /// Created once and reused, like the hint label: the panel is a long-lived view tree and the button
-/// has to survive re-layouts. `show` false only hides it -- an unavailable session is the only state
-/// that offers it, and the label above keeps the space otherwise.
-unsafe fn layout_empty_state_action(container: *mut AnyObject, y: f64, show: bool) {
+/// has to survive re-layouts. `StorageAction::None` only hides it — the healthy and purge-pending
+/// states offer nothing, and the label above keeps the space otherwise. The title and the selector
+/// are re-applied on every layout, because the SAME button serves both actions and the state can
+/// change between two layouts (a repaired history and a blocked one must not keep each other's
+/// action).
+unsafe fn layout_empty_state_action(container: *mut AnyObject, y: f64, action: StorageAction) {
+    let (title, selector) = match action {
+        StorageAction::GrantKeychain => (
+            t("clipboard.grant_keychain_access"),
+            sel!(retryKeychainAccess:),
+        ),
+        StorageAction::ClearAndRestart => (
+            t("clipboard.clear_and_restart"),
+            sel!(clearClipboardStorage:),
+        ),
+        StorageAction::None => (String::new(), sel!(retryKeychainAccess:)),
+    };
+    let show = action != StorageAction::None;
+    let applied = match action {
+        StorageAction::GrantKeychain => AppliedAction::Grant,
+        StorageAction::ClearAndRestart => AppliedAction::Clear,
+        StorageAction::None => AppliedAction::Hidden,
+    };
     let existing = *EMPTY_STATE_ACTION.lock().unwrap();
     if let Some(button) = existing {
         if !button.0.is_null() {
             let _: () = msg_send![button.0, setHidden: !show];
             if show {
-                let title = t("clipboard.grant_keychain_access");
+                let ns = make_nsstring(&title);
+                let _: () = msg_send![button.0, setTitle: ns];
+                CFRelease(ns as *const c_void);
+                let _: () = msg_send![button.0, setAction: selector];
                 let width = localized_string_width(&title, crate::theme::FONT_CAPTION) + 28.0;
                 let frame = NSRect::new(
                     NSPoint::new((PICKER_W - width) / 2.0, y),
                     NSSize::new(width, 26.0),
                 );
                 let _: () = msg_send![button.0, setFrame: frame];
+                // Re-apply the palette too: the same button serves the keychain action and the
+                // destructive clear-and-restart, and the destructive label must not survive the
+                // change (nor the plain one cover a destructive action).
+                set_clear_confirmation_button_style(button.0, false);
             }
+            record_applied_action(NoticeSurface::PickerEmptyState, applied);
             return;
         }
     }
     if !show {
+        // No button object exists in this process: "absent", which is a different fact from a
+        // button that exists with its action hidden.
+        record_applied_action(NoticeSurface::PickerEmptyState, AppliedAction::Absent);
         return;
     }
-    let title = t("clipboard.grant_keychain_access");
     let width = localized_string_width(&title, crate::theme::FONT_CAPTION) + 28.0;
     let frame = NSRect::new(
         NSPoint::new((PICKER_W - width) / 2.0, y),
@@ -1622,13 +1653,14 @@ unsafe fn layout_empty_state_action(container: *mut AnyObject, y: f64, show: boo
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![button, setFont: font];
     let _: () = msg_send![button, setTarget: observer()];
-    let _: () = msg_send![button, setAction: sel!(retryKeychainAccess:)];
+    let _: () = msg_send![button, setAction: selector];
     // The clear actions' palette is the panel's bordered-control look (fill + label ink), so the
     // button reads as a control on the material rather than as chrome.
     set_clear_confirmation_button_style(button, false);
     let _: () = msg_send![container, addSubview: button];
     release_obj(button);
     *EMPTY_STATE_ACTION.lock().unwrap() = Some(ObjPtr::new(button));
+    record_applied_action(NoticeSurface::PickerEmptyState, applied);
 }
 
 /// Summon-time entry point: re-derive the empty-state layout for the viewport the summon just
@@ -1805,7 +1837,7 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     // are present (a retry that succeeds, or a history that turns out to be readable): the empty-state
     // layout below is skipped for a non-empty list, so the button is hidden here as well -- otherwise
     // it would keep its old frame over the rows.
-    layout_empty_state_action(container, 0.0, false);
+    layout_empty_state_action(container, 0.0, StorageAction::None);
 
     // Document height covers ALL displayed entries (the scrollable area). Floored at the
     // visible height (the window minus the header strip): a document shorter than the

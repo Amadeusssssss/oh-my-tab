@@ -976,6 +976,20 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         crate::clipboard::legacy_index_leftover(),
         json_string(crate::clipboard::keychain_acl_label())
     ));
+    // What each storage-notice surface ACTUALLY applied (the action on its button, or that it has no
+    // such view): `state`/`reason` say what the state machine decided and cannot distinguish "the
+    // button is hidden" from "the surface does not exist", nor a state whose action is offered from
+    // one whose action is a dead end. `unset` means nothing has been applied yet.
+    {
+        let (banner, panel, about, about_status) = crate::clipboard::applied_notice_labels();
+        json.push_str(&format!(
+            "  \"clipboard_notice\": {{\"settings_banner\": {}, \"picker_empty_state\": {}, \"about_row\": {}, \"about_status\": {}}},\n",
+            json_string(banner),
+            json_string(panel),
+            json_string(about),
+            json_string(about_status)
+        ));
+    }
     // The decorations actually in effect, so a scenario can tell "the switch did not take" from "the
     // measurement is wrong" without inferring either from pixels.
     json.push_str(&format!(

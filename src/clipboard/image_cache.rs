@@ -97,11 +97,17 @@ pub(super) fn cache_write_image(hash: u64, bytes: &[u8]) -> bool {
 
 /// Whether a cache file can be read by this session. The load path needs the difference: a file
 /// that is PRESENT but does not authenticate must block the load, because treating it as "missing"
-/// would drop the entry and let the sweep delete a file that may still be recoverable.
+/// would drop the entry and let the sweep delete a file that may still be recoverable. `Unreadable`
+/// is kept apart from `Failed` so a diagnostic line does not blame authentication for what is a
+/// permissions or IO failure.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum CacheFileState {
     Readable,
     Missing,
+    /// Present, but the bytes could not be read (permissions, IO): an IO failure, not a
+    /// cryptographic one.
+    Unreadable(std::io::ErrorKind),
+    /// Present and readable, but it does not authenticate under this key (damaged, a moved slot).
     Failed,
 }
 
@@ -113,7 +119,7 @@ pub(super) fn cache_image_state(hash: u64) -> CacheFileState {
             None => CacheFileState::Failed,
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheFileState::Missing,
-        Err(_) => CacheFileState::Failed,
+        Err(error) => CacheFileState::Unreadable(error.kind()),
     }
 }
 
@@ -174,7 +180,7 @@ pub(super) fn cache_preview_state(hash: u64) -> CacheFileState {
             None => CacheFileState::Failed,
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheFileState::Missing,
-        Err(_) => CacheFileState::Failed,
+        Err(error) => CacheFileState::Unreadable(error.kind()),
     }
 }
 

@@ -800,6 +800,34 @@ impl SettingsButton {
             frame, title, target, action, background, text, hover_tag,
         )
     }
+
+    /// Re-apply a role's palette to an existing button. The warning banner's button carries different
+    /// warnings in turn (permission guidance, a keychain problem, a destructive storage action), so
+    /// its role has to follow the warning it currently carries. The hover palette stays the role's
+    /// own tag — never an action id (AGENTS.md).
+    pub(super) unsafe fn apply_role(button: *mut AnyObject, role: SettingsButtonRole) {
+        if button.is_null() {
+            return;
+        }
+        let (background, text, hover_tag) = role.style(crate::theme::ui_palette());
+        widgets::style_html_button(button, background, text);
+        let _: () = objc2::msg_send![button, setTag: hover_tag];
+    }
+
+    /// The destructive-TEXT treatment for a direct destructive action: the style document's
+    /// destructive role is red text/border, and the red FILL is reserved for a confirming step. The
+    /// picker's clear actions read the same way, so one destructive action never looks like two
+    /// different things. The hover palette is the Action role's tag (a neutral wash), because a red
+    /// fill on hover would turn a direct action into a confirming one.
+    pub(super) unsafe fn apply_destructive_text(button: *mut AnyObject) {
+        if button.is_null() {
+            return;
+        }
+        let palette = crate::theme::ui_palette();
+        let (_, _, hover_tag) = SettingsButtonRole::Action.style(palette);
+        widgets::style_html_button(button, palette.button_bg, palette.destructive);
+        let _: () = objc2::msg_send![button, setTag: hover_tag];
+    }
 }
 
 /// Restore-defaults footer control: one compact trigger that morphs into confirm/cancel rows.
