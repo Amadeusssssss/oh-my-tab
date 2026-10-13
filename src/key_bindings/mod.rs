@@ -20,7 +20,10 @@ mod trigger;
 mod validate;
 
 pub(crate) use action::{Action, Group, ALL};
-pub(crate) use engine::{enabled_in, live_binding_count, publish, reset_input_state, start, stop};
+pub(crate) use engine::{
+    debug_self_frontmost, enabled_in, live_binding_count, publish, publish_self_frontmost,
+    reset_input_state, start, stop,
+};
 pub(crate) use execute::{action_label, execute_authorized, reserved_trigger_message};
 pub(crate) use table::BindingTable;
 pub(crate) use trigger::{modifier_flag, Trigger};

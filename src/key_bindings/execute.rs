@@ -51,6 +51,11 @@ pub(crate) fn execute(action: Action) {
     // Whatever the user asked for takes over from an unfinished switcher session -- including a
     // first show that has not been displayed yet, whose late result would otherwise reopen it.
     crate::overlay::reset_switcher();
+    // A window action does not act on this app's own windows (they are fixed-layout panels whose
+    // constraints would fight the write). The *decision* is taken in the tap, before the press is
+    // swallowed, so that a chord like Option+arrow still reaches a focused text field -- arriving
+    // here at all means the action was meant to run. Kept as a backstop for an action enqueued
+    // before this app became frontmost.
     if action.is_window_scoped() && crate::ffi::frontmost_app_info().1 == std::process::id() as i32
     {
         log_debug!(

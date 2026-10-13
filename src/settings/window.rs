@@ -1408,6 +1408,19 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         log_info!("[smoke-settings-layout] opening settings");
         show_settings();
         log_info!("[smoke-settings-layout] settings opened");
+        // The engine's "is this app frontmost" flag drives a pass-through rule for window actions
+        // (see `key_bindings::engine`). Two halves are assertable here; the third is not, and is
+        // recorded in `docs/review-backlog.md` rather than faked:
+        //   * the controller class really answers both activation selectors (a missing or renamed
+        //     registration would leave the flag permanently false);
+        //   * publishing and reading the flag round-trips.
+        // What a smoke run cannot produce is the notification itself: this process is not the active
+        // application during a smoke run, so AppKit never delivers it. Asserting a value here would
+        // be asserting `false == false` and would pass with the publication deleted.
+        if !bindings::debug_validate_self_frontmost_wiring() {
+            hide_settings();
+            return false;
+        }
         // The select's open surface and focus hand-back are only observable with a real window.
         if !super::select::settings_select_focus_ring_smoke() {
             log_info!("[smoke-settings-layout] select open/close focus smoke failed");

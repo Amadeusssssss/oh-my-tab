@@ -62,6 +62,47 @@ static MODIFIER_DOWN: LazyLock<Mutex<HashMap<u32, bool>>> =
 static GESTURE_LAST: LazyLock<Mutex<HashMap<u32, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Whether this app is the frontmost one, published from the main thread.
+///
+/// The tap runs on its own thread and must not call `NSWorkspace` (main-thread AppKit), so the fact
+/// is published here and read as a plain atomic. It exists because a window-scoped action must not be
+/// swallowed while the user is typing in our own window: the event has to reach the focused text
+/// field. Deciding that on the main thread is too late -- by then the press is already swallowed and
+/// the field never sees it.
+static SELF_FRONTMOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Publish whether this app is frontmost. Called from the main thread's activation notifications.
+pub(crate) fn publish_self_frontmost(frontmost: bool) {
+    SELF_FRONTMOST.store(frontmost, Ordering::Relaxed);
+}
+
+/// Whether this app is frontmost, as last published. Off-main safe.
+fn self_is_frontmost() -> bool {
+    SELF_FRONTMOST.load(Ordering::Relaxed)
+}
+
+/// The published flag, for the A1 smoke runner: the AppKit activation notifications set it and the
+/// tap reads it. The unit tests cover the *rule* the flag feeds; this is what lets a runner assert
+/// the wiring they cannot reach.
+pub(crate) fn debug_self_frontmost() -> bool {
+    self_is_frontmost()
+}
+
+/// Drop every pending gesture candidate from `last`.
+///
+/// A gesture is "this modifier was tapped twice on its own". Any real key press in between breaks
+/// that reading: Command tapped, then `C` (`Command+C`), then Command again inside the window is a
+/// copy followed by a fresh modifier press, not a double-tap of Command. Without this the first tap
+/// stayed on record and the next press fired the gesture action -- a window move, a lock screen or a
+/// pointer jump the user never asked for.
+///
+/// Pure over the caller's map so the rule is testable, and so the key path applies it atomically
+/// with everything else it decides. Synthesized events never reach it: the tap filters those before
+/// the decision, because our own key injection must not change gesture state.
+fn clear_pending_gestures(last: &mut HashMap<u32, Instant>) {
+    last.clear();
+}
+
 static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::new();
 static ENGINE_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
 
@@ -280,12 +321,24 @@ enum KeyDecision {
 /// or a release of a key that was never taken is passed through rather than turned into an action —
 /// an unknown repeat (a tap that restarted mid-hold) must not fire anything, and a release we never
 /// swallowed belongs to the app.
-fn decide_key(event: KeyEvent, table: &BindingTable, swallowed: &mut Vec<u16>) -> KeyDecision {
+fn decide_key(
+    event: KeyEvent,
+    table: &BindingTable,
+    swallowed: &mut Vec<u16>,
+    self_frontmost: bool,
+    gestures: &mut HashMap<u32, Instant>,
+) -> KeyDecision {
     // Checked before the record is touched: a synthesized keyUp must not clear the record of a real
-    // key still being held (and a synthesized press must never dispatch).
+    // key still being held (and a synthesized press must never dispatch). Our own injected keys also
+    // must not disturb gesture state.
     if event.synthetic {
         return KeyDecision::PassThrough;
     }
+    // A real key press ends any pending double-tap reading, whoever the key belongs to: Command tap,
+    // `Command+C`, Command again is a copy and then a fresh press, not a double-tap. Done here rather
+    // than beside the call so the rule travels with the decision it belongs to -- the defect was this
+    // call being absent, and only a function that owns both effects can be tested for it.
+    clear_pending_gestures(gestures);
     match event.kind {
         KeyKind::Up => {
             if let Some(index) = swallowed.iter().position(|held| *held == event.keycode) {
@@ -308,6 +361,17 @@ fn decide_key(event: KeyEvent, table: &BindingTable, swallowed: &mut Vec<u16>) -
                     // A second press without a release: treat it as a repeat, but one key never
                     // fires two actions.
                     KeyDecision::Swallow(None)
+                } else if action.is_window_scoped() && self_frontmost {
+                    // A window action cannot act on this app's own window, so while our settings
+                    // window is frontmost the chord belongs to the focused control: Option+arrow
+                    // moves the caret in a text field. Deciding this here rather than on the main
+                    // thread is what keeps those editing keys working -- the main thread's skip
+                    // happens after the press was already swallowed, and no later handler can give
+                    // back an event the app never received.
+                    //
+                    // Nothing is recorded in `swallowed`, so the matching release passes through
+                    // too and the field sees a complete press/release pair.
+                    KeyDecision::PassThrough
                 } else {
                     swallowed.push(event.keycode);
                     KeyDecision::Swallow(Some(action))
@@ -340,9 +404,15 @@ unsafe fn handle_key_event(event_type: CGEventType, event: CGEventRef) -> CGEven
         Ok(table) => Arc::clone(&table),
         Err(_) => return event,
     };
-    let decision = match SWALLOWED_KEYS.lock() {
-        Ok(mut swallowed) => decide_key(key_event, &table, &mut swallowed),
-        Err(_) => return event,
+    let frontmost = self_is_frontmost();
+    // Both tap state maps are taken together, after the table read has been released: the tap must
+    // never hold its read side and either map at once, and the two maps are ordered consistently here
+    // (gestures before swallowed) wherever both are touched.
+    let decision = match (SWALLOWED_KEYS.lock(), GESTURE_LAST.lock()) {
+        (Ok(mut swallowed), Ok(mut gestures)) => {
+            decide_key(key_event, &table, &mut swallowed, frontmost, &mut gestures)
+        }
+        _ => return event,
     };
     match decision {
         KeyDecision::PassThrough => event,
@@ -389,13 +459,17 @@ fn decide_gesture(
             continue;
         }
         // Another modifier being held disqualifies the tap: Command held while Control is tapped
-        // twice must not read as a double-Control.
+        // twice must not read as a double-Control. Every pending candidate goes, not just this
+        // flag's: no gesture can be in flight while a combination is being held, and leaving another
+        // modifier's older entry behind would let a stale tap fire later.
         if flags & (MODIFIER_MASK & !flag) != 0 {
-            last.remove(&flag);
+            last.clear();
             continue;
         }
         let Some(action) = table.lookup_gesture(flag) else {
-            last.remove(&flag);
+            // A lone press of a modifier with no gesture bound likewise ends any reading in progress:
+            // the user's taps are not a sequence we are part-way through.
+            last.clear();
             continue;
         };
         let is_double = match last.get(&flag).copied() {
@@ -404,6 +478,9 @@ fn decide_gesture(
                 true
             }
             _ => {
+                // At most one candidate is ever pending: a tap of another modifier is over as soon as
+                // this one starts, or a stale entry could pair with a much later press.
+                last.clear();
                 last.insert(flag, now);
                 false
             }
@@ -484,9 +561,16 @@ mod tests {
     fn a_matching_press_dispatches_once_and_its_repeats_and_release_are_swallowed() {
         let table = default_table();
         let mut swallowed = Vec::new();
+        let mut gestures = HashMap::new();
         let option = crate::mouse::shortcut::FLAG_ALT;
         assert_eq!(
-            decide_key(down(0x0E, option), &table, &mut swallowed),
+            decide_key(
+                down(0x0E, option),
+                &table,
+                &mut swallowed,
+                false,
+                &mut gestures
+            ),
             KeyDecision::Swallow(Some(Action::OpenFinder))
         );
         assert_eq!(swallowed, vec![0x0E]);
@@ -496,11 +580,17 @@ mod tests {
             ..down(0x0E, option)
         };
         assert_eq!(
-            decide_key(repeat, &table, &mut swallowed),
+            decide_key(repeat, &table, &mut swallowed, false, &mut gestures),
             KeyDecision::Swallow(None)
         );
         assert_eq!(
-            decide_key(up(0x0E, option), &table, &mut swallowed),
+            decide_key(
+                up(0x0E, option),
+                &table,
+                &mut swallowed,
+                false,
+                &mut gestures
+            ),
             KeyDecision::Swallow(None)
         );
         assert!(swallowed.is_empty(), "the release clears the record");
@@ -512,11 +602,18 @@ mod tests {
     fn the_release_is_matched_after_the_modifiers_are_let_go() {
         let table = default_table();
         let mut swallowed = Vec::new();
+        let mut gestures = HashMap::new();
         let option = crate::mouse::shortcut::FLAG_ALT;
-        decide_key(down(0x0E, option), &table, &mut swallowed);
+        decide_key(
+            down(0x0E, option),
+            &table,
+            &mut swallowed,
+            false,
+            &mut gestures,
+        );
         // Option released first: the keyUp arrives with no chord modifiers at all.
         assert_eq!(
-            decide_key(up(0x0E, 0), &table, &mut swallowed),
+            decide_key(up(0x0E, 0), &table, &mut swallowed, false, &mut gestures),
             KeyDecision::Swallow(None)
         );
         assert!(swallowed.is_empty());
@@ -526,10 +623,17 @@ mod tests {
     fn unrelated_keys_and_unknown_repeats_pass_through() {
         let table = default_table();
         let mut swallowed = Vec::new();
+        let mut gestures = HashMap::new();
         let option = crate::mouse::shortcut::FLAG_ALT;
         // Not bound.
         assert_eq!(
-            decide_key(down(0x00, option), &table, &mut swallowed),
+            decide_key(
+                down(0x00, option),
+                &table,
+                &mut swallowed,
+                false,
+                &mut gestures
+            ),
             KeyDecision::PassThrough
         );
         // A repeat with no record (a tap that restarted mid-hold) must not fire anything.
@@ -538,12 +642,18 @@ mod tests {
             ..down(0x0E, option)
         };
         assert_eq!(
-            decide_key(stale_repeat, &table, &mut swallowed),
+            decide_key(stale_repeat, &table, &mut swallowed, false, &mut gestures),
             KeyDecision::PassThrough
         );
         // A release we never swallowed belongs to the app.
         assert_eq!(
-            decide_key(up(0x0E, option), &table, &mut swallowed),
+            decide_key(
+                up(0x0E, option),
+                &table,
+                &mut swallowed,
+                false,
+                &mut gestures
+            ),
             KeyDecision::PassThrough
         );
     }
@@ -552,13 +662,26 @@ mod tests {
     fn a_second_press_without_a_release_never_fires_twice() {
         let table = default_table();
         let mut swallowed = Vec::new();
+        let mut gestures = HashMap::new();
         let option = crate::mouse::shortcut::FLAG_ALT;
         assert!(matches!(
-            decide_key(down(0x0E, option), &table, &mut swallowed),
+            decide_key(
+                down(0x0E, option),
+                &table,
+                &mut swallowed,
+                false,
+                &mut gestures
+            ),
             KeyDecision::Swallow(Some(_))
         ));
         assert_eq!(
-            decide_key(down(0x0E, option), &table, &mut swallowed),
+            decide_key(
+                down(0x0E, option),
+                &table,
+                &mut swallowed,
+                false,
+                &mut gestures
+            ),
             KeyDecision::Swallow(None)
         );
     }
@@ -570,14 +693,21 @@ mod tests {
     fn synthesized_events_neither_dispatch_nor_clear_a_real_press() {
         let table = default_table();
         let mut swallowed = Vec::new();
+        let mut gestures = HashMap::new();
         let option = crate::mouse::shortcut::FLAG_ALT;
-        decide_key(down(0x0E, option), &table, &mut swallowed);
+        decide_key(
+            down(0x0E, option),
+            &table,
+            &mut swallowed,
+            false,
+            &mut gestures,
+        );
         let synthetic_up = KeyEvent {
             synthetic: true,
             ..up(0x0E, option)
         };
         assert_eq!(
-            decide_key(synthetic_up, &table, &mut swallowed),
+            decide_key(synthetic_up, &table, &mut swallowed, false, &mut gestures),
             KeyDecision::PassThrough
         );
         assert_eq!(swallowed, vec![0x0E], "the real press is still recorded");
@@ -589,7 +719,7 @@ mod tests {
             ..down(0x0E, option)
         };
         assert_eq!(
-            decide_key(synthetic_down, &table, &mut empty),
+            decide_key(synthetic_down, &table, &mut empty, false, &mut gestures),
             KeyDecision::PassThrough
         );
         assert!(empty.is_empty());
@@ -633,6 +763,206 @@ mod tests {
         assert!(table_maps(&live, trigger, Action::LocatePointer));
         let gone = BindingTable::build(&[], false);
         assert!(!table_maps(&gone, trigger, Action::LocatePointer));
+    }
+
+    /// A window action's chord passes through while our own window is frontmost.
+    ///
+    /// The defect: the engine swallowed every matching press and only then skipped the window action
+    /// on the main thread, so with the settings window up, Option+arrow neither moved the window nor
+    /// reached the focused text field -- caret movement and Shift+Option selection stopped working.
+    /// The old tap checked the frontmost app before swallowing; this restores that order.
+    ///
+    /// The release must pass through too: the field needs a complete press/release pair, and recording
+    /// the press in `swallowed` is what would swallow its release.
+    #[test]
+    fn a_window_action_passes_through_while_own_window_is_frontmost() {
+        let table = BindingTable::build(&[item("window.snap_left", "option+left")], true);
+        let option = crate::mouse::shortcut::FLAG_ALT;
+        let mut gestures = HashMap::new();
+
+        // Our own window is frontmost: the chord belongs to the focused control, so the press passes.
+        let mut swallowed = Vec::new();
+        assert_eq!(
+            decide_key(
+                down(0x7B, option),
+                &table,
+                &mut swallowed,
+                true,
+                &mut gestures
+            ),
+            KeyDecision::PassThrough,
+            "a window chord must reach the focused control"
+        );
+        assert!(
+            swallowed.is_empty(),
+            "nothing is swallowed, so the release passes through too"
+        );
+        assert_eq!(
+            decide_key(
+                up(0x7B, option),
+                &table,
+                &mut swallowed,
+                true,
+                &mut gestures
+            ),
+            KeyDecision::PassThrough,
+            "the release must not be swallowed either"
+        );
+
+        // Another app is frontmost: the same chord is ours and the action fires.
+        let mut swallowed = Vec::new();
+        assert_eq!(
+            decide_key(
+                down(0x7B, option),
+                &table,
+                &mut swallowed,
+                false,
+                &mut gestures
+            ),
+            KeyDecision::Swallow(Some(Action::SnapLeft))
+        );
+        assert_eq!(swallowed, vec![0x7B]);
+    }
+
+    /// The frontmost exception covers WINDOW actions only: a quick action is not about the frontmost
+    /// window, so it still fires while our own window is up (Option+L must still lock the screen).
+    #[test]
+    fn only_window_actions_are_exempted_by_our_own_window_being_frontmost() {
+        let table = BindingTable::build(&[item("quick.lock_screen", "option+l")], true);
+        let option = crate::mouse::shortcut::FLAG_ALT;
+        let mut swallowed = Vec::new();
+        let mut gestures = HashMap::new();
+        assert_eq!(
+            decide_key(
+                down(0x25, option),
+                &table,
+                &mut swallowed,
+                true,
+                &mut gestures
+            ),
+            KeyDecision::Swallow(Some(Action::LockScreen)),
+            "a quick action is not a window action and must still fire"
+        );
+    }
+
+    /// A real key press between the two taps of a modifier ends the reading.
+    ///
+    /// The defect: the first tap stayed on record through other keys, so `Command` (tap), `Command+C`
+    /// (copy), `Command` again inside the window fired the gesture action -- a window move, a lock
+    /// screen or a pointer jump the user never asked for. The gesture is "this modifier was tapped
+    /// twice on its own"; a key press in between is what makes that false.
+    #[test]
+    fn a_real_key_press_clears_a_pending_gesture_candidate() {
+        let table = BindingTable::build(
+            &[
+                item("quick.locate_pointer", "double-control"),
+                item("window.snap_left", "option+left"),
+            ],
+            true,
+        );
+        let control = FLAG_CONTROL as u32;
+        let start = Instant::now();
+        let mut modifiers = HashMap::new();
+        let mut last = HashMap::new();
+        // First tap of Control: a candidate, nothing fires.
+        assert_eq!(
+            decide_gesture(start, control, &table, &mut modifiers, &mut last),
+            None
+        );
+        assert!(last.contains_key(&control), "the first tap is on record");
+        // Release, then a real key press happens (the `C` of a copy). It goes through the production
+        // key decision, so a missing invalidation is what this catches -- asserting the rule by hand
+        // would pass even with the call removed from the tap path.
+        decide_gesture(
+            start + Duration::from_millis(10),
+            0,
+            &table,
+            &mut modifiers,
+            &mut last,
+        );
+        let mut swallowed = Vec::new();
+        let key_table = BindingTable::build(&[item("window.snap_left", "option+left")], true);
+        let plain_key = down(0x08, 0); // `C`, no modifiers
+        assert_eq!(
+            decide_key(plain_key, &key_table, &mut swallowed, false, &mut last),
+            KeyDecision::PassThrough,
+            "an unbound key is not swallowed"
+        );
+        assert!(
+            last.is_empty(),
+            "the production key path must clear the pending gesture"
+        );
+        // The next Control press is a FIRST tap again, not a double-tap.
+        assert_eq!(
+            decide_gesture(
+                start + Duration::from_millis(20),
+                control,
+                &table,
+                &mut modifiers,
+                &mut last
+            ),
+            None,
+            "a key press between the taps must stop them reading as a double-tap"
+        );
+    }
+
+    /// Only one gesture candidate can be pending: tapping another modifier ends the previous one.
+    ///
+    /// The defect: a candidate for one modifier survived while another was tapped, so an unrelated
+    /// later press could pair with the stale entry. This pins the invariant on the state map, which
+    /// is what the caller holds.
+    #[test]
+    fn only_one_gesture_candidate_is_ever_pending() {
+        let table = BindingTable::build(
+            &[
+                item("quick.locate_pointer", "double-control"),
+                item("quick.lock_screen", "double-command"),
+            ],
+            true,
+        );
+        let control = FLAG_CONTROL as u32;
+        let command = FLAG_COMMAND as u32;
+        let start = Instant::now();
+        let mut modifiers = HashMap::new();
+        let mut last = HashMap::new();
+        decide_gesture(start, control, &table, &mut modifiers, &mut last);
+        assert_eq!(last.len(), 1);
+        // Release Control, then tap Command: its own candidate replaces the Control one.
+        decide_gesture(
+            start + Duration::from_millis(5),
+            0,
+            &table,
+            &mut modifiers,
+            &mut last,
+        );
+        decide_gesture(
+            start + Duration::from_millis(10),
+            command,
+            &table,
+            &mut modifiers,
+            &mut last,
+        );
+        assert_eq!(
+            last.len(),
+            1,
+            "a stale candidate must not survive another modifier's tap"
+        );
+        assert!(
+            last.contains_key(&command),
+            "the pending candidate is the most recent tap"
+        );
+        // A combination being held ends the reading entirely: no gesture can be mid-flight.
+        decide_gesture(
+            start + Duration::from_millis(15),
+            command | (FLAG_SHIFT as u32),
+            &table,
+            &mut modifiers,
+            &mut last,
+        );
+        assert!(
+            last.is_empty(),
+            "holding a combination must leave no pending gesture"
+        );
     }
 
     #[test]

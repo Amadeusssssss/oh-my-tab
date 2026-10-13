@@ -266,6 +266,52 @@ pub(crate) unsafe fn debug_validate_row_overlay_is_below_controls() -> bool {
     true
 }
 
+/// Smoke check for the engine's "this app is frontmost" flag wiring.
+///
+/// The flag lets a window action's chord pass through while our own window is up, so a settings text
+/// field keeps its Option+arrow editing keys. The tap reads it on its own thread; two things are
+/// decidable from the main thread:
+///
+/// * the controller class answers both activation selectors, so the publication has somewhere to
+///   arrive (a missing or renamed registration leaves the flag permanently false);
+/// * publishing then reading round-trips, so the tap cannot read a stale or unwired slot.
+///
+/// The notification delivery itself is NOT asserted: a smoke run never makes this process the active
+/// application, so AppKit does not deliver it. Claiming to check it here would be asserting
+/// `false == false`. Recorded in `docs/review-backlog.md`.
+pub(crate) unsafe fn debug_validate_self_frontmost_wiring() -> bool {
+    // The notifications are registered on the controller the app installs as their observer, which is
+    // `OhMyTabController` (see `create_controller`), not the menu target class.
+    let cls = objc2::class!(OhMyTabController);
+    for selector in [
+        sel!(handleSelfBecameActive:),
+        sel!(handleSelfResignedActive:),
+    ] {
+        let responds: bool = msg_send![cls, instancesRespondToSelector: selector];
+        if !responds {
+            log_info!("[smoke-settings-layout] the controller does not answer {selector:?}");
+            return false;
+        }
+    }
+    // Publish both ways and confirm the tap's reader sees each value.
+    let before = crate::key_bindings::debug_self_frontmost();
+    crate::key_bindings::publish_self_frontmost(true);
+    let saw_true = crate::key_bindings::debug_self_frontmost();
+    crate::key_bindings::publish_self_frontmost(false);
+    let saw_false = crate::key_bindings::debug_self_frontmost();
+    // Leave the flag as the app's own state says it is, not as this probe left it.
+    let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+    let active: bool = msg_send![nsapp, isActive];
+    crate::key_bindings::publish_self_frontmost(active);
+    if saw_true && !saw_false {
+        return true;
+    }
+    log_info!(
+        "[smoke-settings-layout] the self-frontmost flag does not round-trip (before={before}, saw_true={saw_true}, saw_false={saw_false})"
+    );
+    false
+}
+
 /// Smoke check for the footer's segment gating.
 ///
 /// The two halves of the joined control have different availability: `＋` is available whenever the

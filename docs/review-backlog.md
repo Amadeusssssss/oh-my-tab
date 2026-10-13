@@ -160,3 +160,21 @@ so a later reader does not re-derive them. The fixes are in the tree, with their
   orders produce identical per-segment flags, so the original ordering was never a bug. The comments
   now record the measurement instead of the theory. No further work; recorded so the wrong theory is
   not "fixed" again from the AppKit header alone.
+
+- **The self-frontmost flag's notification delivery is unrun** (2026-10-13). A window action's chord
+  now passes through while this app is frontmost, so a settings text field keeps Option+arrow editing
+  keys. The rule is asserted (unit test, falsified by removing the pass-through branch) and the flag's
+  *wiring* is asserted in `--smoke-settings-layout`
+  (`debug_validate_self_frontmost_wiring`: the controller answers both activation selectors and the
+  flag round-trips). What no tier currently covers is the notification itself: a smoke run never makes
+  this process the active application, so `NSApplicationDidBecomeActiveNotification` /
+  `DidResignActiveNotification` are never delivered and the flag is legitimately `false` throughout
+  (measured: `nsapp_active=false` after `show_settings()` plus a pumped run loop). Asserting a value
+  there would pass with the publication deleted. Trigger: the next change to that flag, or an A2
+  scenario that activates the settings window and presses Option+arrow in a text field.
+
+- **A pending gesture is cleared by any real key press** (2026-10-13). `decide_key` now owns the
+  clearing, so the wiring is inside the tested function (the first attempt asserted the rule by hand
+  and passed with the call removed from the tap path -- falsified after moving it). Only the pure rule
+  and its placement are covered; a real keyboard sequence (Command tap, Command+C, Command again
+  inside 350ms) is not, because it needs a live tap. Trigger: the next change to gesture handling.

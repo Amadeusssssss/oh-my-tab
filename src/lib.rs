@@ -518,6 +518,22 @@ extern "C" fn on_active_space_changed(_self: *mut c_void, _cmd: Sel, _notificati
     });
 }
 
+/// This app became active. Published for the binding engine's tap thread, which has to decide whether
+/// a window action's chord belongs to a focused control here rather than to a window (see
+/// `key_bindings::publish_self_frontmost`).
+extern "C" fn on_self_became_active(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
+    callback_guard::void("on_self_became_active", || {
+        key_bindings::publish_self_frontmost(true);
+    });
+}
+
+/// This app resigned active: the frontmost app is someone else again.
+extern "C" fn on_self_resigned_active(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
+    callback_guard::void("on_self_resigned_active", || {
+        key_bindings::publish_self_frontmost(false);
+    });
+}
+
 fn on_app_activated_inner(notification: *mut c_void) {
     settings::refresh_permission_ui_if_visible();
     unsafe {
@@ -1532,6 +1548,18 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleAppActivation:),
             on_app_activated as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleSelfBecameActive:),
+            on_self_became_active as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleSelfResignedActive:),
+            on_self_resigned_active as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2933,6 +2961,28 @@ pub fn run() {
             let _: () = msg_send![default_nc,
                 addObserver: controller,
                 selector: sel!(handleScrollerStyleChanged:),
+                name: name_ns,
+                object: std::ptr::null::<AnyObject>(),
+            ];
+            CFRelease(name_ns as *const c_void);
+        }
+        // The binding engine's tap thread has to know whether this app is frontmost BEFORE it swallows
+        // a press, so that a window action's chord reaches the focused control while our own window is
+        // up. Published from these notifications, which are the authoritative transition.
+        for (probe_name, selector) in [
+            (
+                "NSApplicationDidBecomeActiveNotification",
+                sel!(handleSelfBecameActive:),
+            ),
+            (
+                "NSApplicationDidResignActiveNotification",
+                sel!(handleSelfResignedActive:),
+            ),
+        ] {
+            let name_ns = make_nsstring(probe_name);
+            let _: () = msg_send![default_nc,
+                addObserver: controller,
+                selector: selector,
                 name: name_ns,
                 object: std::ptr::null::<AnyObject>(),
             ];
