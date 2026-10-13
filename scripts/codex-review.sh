@@ -46,6 +46,7 @@
 #   .agent-review/last-stderr.txt    the CLI's stderr for the newest run
 #   .agent-review/last-status.txt    what the classification pass made of the newest run
 #   .agent-review/round-counter      the round number the archive names carry
+#   .agent-review/session-log.tsv    every session's beginning, resumption, loss and deliberate end
 #   .agent-review/rounds/            every attempt's events, message, stderr and outcome
 #
 # Those are the paths of the keyless task. A named task holds the same set under
@@ -93,6 +94,81 @@ set_concluded() {
     mv "$tmp" "$STATUS_FILE"
 }
 
+# The session log is append-only, and it answers the one question an outcome file cannot: whether the
+# session changed because the task ended on purpose (--finish) or because the old one was lost. Both
+# leave `reason=none` in the outcome, so without this record a silent loss and a clean hand-off are
+# indistinguishable after the fact. Timestamps are UTC so they sort with the archive's round stamps.
+#   timestamp  event  session  round  kind
+# `event` is one of new, resumed, restarted, lost, finished, discarded.
+log_session_event() {
+    local dir="$1" event="$2" session="$3" round="$4" kind="$5"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "${session:--}" \
+        "${round:--}" "${kind:--}" >> "$dir/session-log.tsv"
+}
+
+# How many rounds of one kind the *current* session has already run. The log is the only place that
+# knows: codex-session-id says which session, not how much of its context is already spent. Legacy
+# state directories predate the log and answer 0, which is the honest answer for "not recorded".
+#
+# Only events that stand for a round attempt advance the count. `lost` is skipped because it is the
+# second half of a `resumed` that already counted -- the attempt is one round, not two -- and a
+# `finished`/`discarded` resets to zero because the session it counted is over.
+session_rounds_so_far() {
+    local dir="$1" kind="$2" n=0 event k
+    [[ -f "$dir/session-log.tsv" ]] || { echo 0; return; }
+    while IFS=$'\t' read -r _ event _ _ k; do
+        case "$event" in
+            finished|discarded) n=0; continue ;;
+            new|restarted)      n=0 ;;
+            lost)               continue ;;
+        esac
+        [[ "$k" == "$kind" ]] && n=$((n + 1))
+    done < "$dir/session-log.tsv"
+    echo "$n"
+}
+
+# The number this round will carry in both the log and the archive. Decided once, before the CLI runs,
+# because the two used to derive it separately and disagree: the log read the counter before the round
+# and the archive wrote it after, so every entry pointed one round off -- a session event could not be
+# matched to the outcome, stderr and events of the attempt it described. `history_recorded` keeps a
+# legacy directory's first round numbered from where its archive really is.
+next_round_number() {
+    local counter="$STATE_DIR/round-counter"
+    if [[ -f "$counter" ]]; then
+        echo $(( $(cat "$counter") + 1 ))
+    else
+        echo 1
+    fi
+}
+
+# Whether a session began and was never deliberately ended. This is what separates a first round
+# ("new") from a session replaced without explanation ("restarted").
+#
+# The log answers it when it exists. For a state directory that predates the log, the archive does: a
+# round's outcome names the session it ran on, so an outcome with a real id is evidence that a session
+# existed. An attempt whose CLI died before reporting thread.started leaves `session=none`, which is
+# evidence of nothing -- and treating it as evidence is the defect: it would make the *next* real
+# session look like it replaced a session that never was.
+has_unfinished_session() {
+    local dir="$1" last
+    if [[ -f "$dir/session-log.tsv" ]]; then
+        last="$(tail -1 "$dir/session-log.tsv" 2>/dev/null | cut -f2 || true)"
+        case "$last" in
+            finished|discarded) return 1 ;;
+            *)                  return 0 ;;
+        esac
+    fi
+    # No log: the archive is the only evidence, and only a recorded session counts. `session=none` is
+    # what an attempt that never established one wrote, so it proves nothing; a real id anywhere is
+    # proof that a session existed, even alongside such attempts. Counted rather than pattern-matched,
+    # because a pattern that excludes "none" by its first letter would also exclude a real id.
+    [[ -d "$dir/rounds" ]] || return 1
+    local total real
+    total="$(grep -h '^session=' "$dir"/rounds/*-outcome.txt 2>/dev/null | wc -l | tr -d '[:space:]')"
+    real="$(grep -h '^session=none$' "$dir"/rounds/*-outcome.txt 2>/dev/null | wc -l | tr -d '[:space:]')"
+    [[ "$total" -gt "$real" ]]
+}
+
 usage() {
     cat >&2 <<'EOF'
 usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [--note <text>]
@@ -105,7 +181,8 @@ usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [-
                       same thing for a harness that wants to say it once; --task wins over it.
                       Without either, the task is the keyless one and keeps the top-level paths;
                       'default' is the label that task is listed under and is not a key to take.
-  --tasks             list the sessions this repository holds: key, session, kind, rounds, running
+  --tasks             list the sessions this repository holds: key, session, kind, rounds, running,
+                      state (open/lost/closed, from the session log) and rounds spent in that session
   --design            put the approach to the reviewer before any code is written; ends with
                       PLAN-STATUS instead of REVIEW-STATUS and needs no change in the tree
   --retry             the previous round produced no verdict; resume the same session and say so
@@ -113,7 +190,13 @@ usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [-
   --note <text>       put the implementation agent's own words to the reviewer
   --note-file <path>  the same, read from a file (both may be given; they are joined)
   --timeout <sec>     bound a run that has not finished in this long (default 1800, 0 = none)
-  --finish            clear this task's reviewer session for the next task
+  --finish            clear this task's reviewer session: the user's call, not the agent's
+
+The session is kept until the user says the task is done, so that the reviewer remembers its own
+findings across the rounds of one task. --finish is the agent's only way to end it early and it is
+therefore run on the user's word, never on the agent's judgement; an agent that clears it on its own
+loses the reviewer's memory of findings that are still open. Running past the task's three-round
+budget makes every round more expensive, so the round that starts over budget says so.
 
 The model is gpt-6.1-sol; OMT_REVIEW_MODEL overrides it.
 EOF
@@ -205,7 +288,7 @@ if [[ "$list_tasks" == 1 ]]; then
         exit 64
     fi
     task_row() {
-        local key="$1" dir="$2" session kind rounds running
+        local key="$1" dir="$2" session kind rounds running health last_event in_session
         session="$(cat "$dir/codex-session-id" 2>/dev/null || true)"
         kind="$(cat "$dir/last-round-kind" 2>/dev/null || true)"
         rounds=0
@@ -214,9 +297,34 @@ if [[ "$list_tasks" == 1 ]]; then
         fi
         running="no"
         [[ -d "$dir/lock" ]] && running="yes"
-        printf '%-20s %-38s %-7s %-7s %s\n' "$key" "${session:-none}" "${kind:--}" "$rounds" "$running"
+        # The health column is what the outcome files cannot say: whether the task is still on a
+        # session, whether that session is a replacement, and how much context it has already spent.
+        # `restarted` is open because a replacement session was created; `lost` is not, because the
+        # resume failed and the remembered session is gone.
+        health="none"
+        last_event=""
+        if [[ -f "$dir/session-log.tsv" ]]; then
+            last_event="$(tail -1 "$dir/session-log.tsv" 2>/dev/null | cut -f2 || true)"
+            case "$last_event" in
+                new|resumed|restarted) health="open" ;;
+                lost)                  health="lost" ;;
+                finished|discarded)    health="closed" ;;
+            esac
+        elif [[ -n "$session" ]]; then
+            # A state directory that predates the log: the pointer is the only evidence there is, and
+            # reading it as closed would hide a session that is genuinely still open -- which is the
+            # question the column exists to answer before a cmsg.
+            health="open"
+        fi
+        in_session="-"
+        if [[ -f "$dir/session-log.tsv" ]]; then
+            in_session=0
+            in_session="$(session_rounds_so_far "$dir" "${kind:-review}")"
+        fi
+        printf '%-20s %-38s %-7s %-7s %-7s %-9s %s\n' "$key" "${session:-none}" "${kind:--}" \
+            "$rounds" "$running" "$health" "$in_session"
     }
-    printf '%-20s %-38s %-7s %-7s %s\n' "task" "session" "kind" "rounds" "running"
+    printf '%-20s %-38s %-7s %-7s %-7s %-9s %s\n' "task" "session" "kind" "rounds" "running" "state" "in-session"
     task_row "default" "$BASE_DIR"
     for dir in "$TASKS_DIR"/*/; do
         [[ -d "$dir" ]] || continue
@@ -284,6 +392,7 @@ KIND_FILE="$STATE_DIR/last-round-kind"
 ROUNDS_DIR="$STATE_DIR/rounds"
 LOCK_DIR="$STATE_DIR/lock"
 TIMEOUT_MARKER="$STATE_DIR/timed-out"
+SESSION_LOG="$STATE_DIR/session-log.tsv"
 
 mkdir -p "$STATE_DIR" "$ROUNDS_DIR"
 
@@ -322,6 +431,17 @@ if [[ "$finish" == 1 ]]; then
         exit 75
     fi
     trap release_lock EXIT
+    # Recorded before the pointer is removed, and with the id it named: --finish is the *only* way a
+    # session ends by decision, so it is the event that tells a later reader this hand-off was on
+    # purpose rather than a session that went missing. Logged only when a session was actually held:
+    # running --finish twice must not invent a second closure.
+    if [[ -f "$SESSION_FILE" ]]; then
+        # The round the session last ran, read from the counter rather than ROUND_NUMBER: --finish is
+        # not a round, so numbering the closure with the next round would point at an attempt that does
+        # not exist. It names the session being closed, which is what a later reader looks up.
+        log_session_event "$STATE_DIR" finished "$(cat "$SESSION_FILE")" \
+            "$(cat "$STATE_DIR/round-counter" 2>/dev/null || echo -)" "$(cat "$KIND_FILE" 2>/dev/null || echo -)"
+    fi
     rm -f "$SESSION_FILE" "$OUTPUT_FILE" "$STATE_DIR/last-plan.txt" "$KIND_FILE" "$JSON_FILE" \
         "$MESSAGE_FILE" "$STATUS_FILE" "$TIMEOUT_MARKER" "$JSON_FILE.stream-message"
     if [[ -n "$TASK_SOURCE" ]]; then
@@ -406,6 +526,11 @@ else
     MARKER_NAME="REVIEW-STATUS"
     MARKER_VALUES="PASS or FINDINGS"
 fi
+
+# This round's number, decided here and used by both the session log and archive_round, so a session
+# event and the attempt it describes carry the same number. Set before the refusals below on purpose:
+# a refused call archives nothing and logs nothing, and a number it never used costs nothing.
+ROUND_NUMBER="$(next_round_number)"
 
 # Nothing to review is not the same as a review that found nothing. With the index, the working tree
 # and the untracked files all matching HEAD there is no change for the reviewer to look at, and a round
@@ -535,17 +660,50 @@ keep_session() {
     fi
 }
 
+# Records which session this round began or resumed, once per round. Idempotent because two paths
+# reach it: the normal one after the CLI returns, and the signal handler, which `exit`s before the
+# normal path could log. An interrupted first round is exactly the case that needs it -- without this
+# the log would open on a later round's `resumed` and the session's beginning would be unrecorded.
+# The id is read from the pointer, not passed in, so both paths name the same session: the CLI's own
+# thread.started, kept by keep_session by the time either path logs.
+ROUND_SESSION_LOGGED=0
+log_round_session() {
+    [[ "$ROUND_SESSION_LOGGED" == 0 ]] || return 0
+    [[ -n "${INTENDED_EVENT:-}" ]] || return 0
+    local session
+    # The pointer first: on a first round it does not exist until the CLI has answered, and the log
+    # entry is worthless without the session it names. keep_session is a no-op when it already exists.
+    keep_session
+    session="$(cat "$SESSION_FILE" 2>/dev/null || true)"
+    # No id means no session was established -- a first round whose CLI died before thread.started.
+    # Recording an event for it would report a session that never existed as open and unclosable
+    # (--finish has no pointer to clear, so the health view would never say closed). The attempt itself
+    # is still archived under rounds/, which is where an attempt that had no session belongs.
+    [[ -n "$session" ]] || return 0
+    # Idempotence is read off the log, not off a flag set before or after the write. A flag set first
+    # loses the entry when a signal lands between the flag and the append; a flag set last writes it
+    # twice when the signal lands between the append and the flag, because the handler then sees the
+    # round as unrecorded. This round's event pair is what decides: it can appear at most once.
+    if [[ -f "$SESSION_LOG" ]] && awk -F'\t' -v e="$INTENDED_EVENT" -v r="$ROUND_NUMBER" \
+        '$2 == e && $4 == r { found = 1 } END { exit !found }' "$SESSION_LOG"; then
+        ROUND_SESSION_LOGGED=1
+        return 0
+    fi
+    log_session_event "$STATE_DIR" "$INTENDED_EVENT" "$session" "$ROUND_NUMBER" "$ROUND_KIND"
+    ROUND_SESSION_LOGGED=1
+}
+
 # Every attempt's evidence is kept — events, the final message, the CLI's stderr and the outcome — so
 # that a failed round cannot take the previous round's review with it, and a failure can be explained
 # later from what it actually printed.
 archive_round() {
     [[ "$ARCHIVED" == 0 ]] || return 0
     ARCHIVED=1
-    local reason="$1" code="$2" stamp round_number
-    round_number=1
-    if [[ -f "$STATE_DIR/round-counter" ]]; then
-        round_number=$(( $(cat "$STATE_DIR/round-counter") + 1 ))
-    fi
+    local reason="$1" code="$2" stamp
+    # The number this round was already logged under, so the archive and the session log name the same
+    # attempt. Recomputed only if a caller ever archives without one, which keeps the counter honest
+    # rather than writing a stamp with an empty number.
+    local round_number="${ROUND_NUMBER:-$(next_round_number)}"
     printf '%s\n' "$round_number" > "$STATE_DIR/round-counter"
     stamp="$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%03d' "$round_number")"
     [[ -s "$JSON_FILE" ]] && cp "$JSON_FILE" "$ROUNDS_DIR/$stamp-events.jsonl"
@@ -575,6 +733,7 @@ on_signal() {
     # Only now, with nothing left writing to the event stream: a CLI that answered the first TERM by
     # creating its session would have its id thrown away if this ran before the grace period.
     keep_session
+    log_round_session
     REASON="interrupted (signal $signal)"
     CODE="$signal"
     # Record this round as unfinished, so a later `--retry` resumes *it* rather than reading a verdict from an
@@ -590,6 +749,12 @@ trap 'on_signal 143' TERM
 
 if [[ "$fresh" == 1 && -f "$SESSION_FILE" ]]; then
     echo "Discarding the reviewer session (--fresh): its memory of earlier findings is gone." >&2
+    # Distinct from `finished`: --fresh drops a session mid-task on purpose, so the log has to say the
+    # memory was deliberately thrown away rather than that the task ended. Without the id the old
+    # session would be unrecoverable from this record alone -- its rollout outlives the pointer, and
+    # `codex exec resume <id>` can still reach it.
+    log_session_event "$STATE_DIR" discarded "$(cat "$SESSION_FILE")" \
+        "$(cat "$STATE_DIR/round-counter" 2>/dev/null || echo -)" "$(cat "$KIND_FILE" 2>/dev/null || echo -)"
     rm -f "$SESSION_FILE"
 fi
 
@@ -761,31 +926,21 @@ EOF
 
 REPO_CONTEXT=$(cat <<'EOF'
 
-本仓库的上下文，评审时按这些规则判断（不要改文件、不要代改代码、不要自行撤销结论）：
+本仓库的上下文：AGENTS.md 全文已在本会话开头给出，它是权威规范，评审按它判断——特别是 Testing tiers
+（分层依据是**谁判定通过与否**，不是用什么传输；B 层发现必须晋升为 A 层断言，或在还不能断言时先补一个
+可断言的状态字段）、Review budget and triage（3 轮预算、按影响而非标签分级）、以及 *What the reviewer is
+asked to weigh here* 的四条检查项。不要改文件、不要代改代码、不要自行撤销结论。
 
-- 项目：`oh-my-tab`，macOS 菜单栏窗口切换器。Rust + objc2/AppKit/CoreGraphics 的 FFI，无 Swift bridge。
-  重点检查：unsafe/FFI 的生命周期与所有权、`msg_send!` 的选择器与字段名、主线程不变量（AppKit 与动态注册的
+只有这几点需要额外记住：
+
+- 项目：`oh-my-tab`，macOS 菜单栏窗口切换器，Rust + objc2/AppKit/CoreGraphics 的 FFI，无 Swift bridge。
+  重点检查：unsafe/FFI 生命周期与所有权、`msg_send!` 的选择器与字段名、主线程不变量（AppKit 与动态注册的
   Objective-C 回调必须在主线程）、`Mutex/RwLock` 的所有权与重入、动态 ObjC 类对 Rust 侧字段的依赖。
-- 验证分层按 AGENTS.md 的定义（分层依据是**谁判定通过与否**，不是用什么传输）：A1 = 纯 headless 测试 + `--smoke-*`
-  跑在真实 AppKit 视图树上；A2 = `scripts/e2e/*.sh`（入口 `scripts/e2e/run-all.sh`），断言 app 自己写出的 JSON
-  状态与真实输入/WindowServer 状态；B = MCP + 截图，由人或 agent 判定，**从不作为门禁**。
-  晋升规则按 AGENTS.md 原文：B 层发现的 bug 要么落一条 A 层断言，**要么在还不能断言时先补一个使它能被断言的状态字段**
-  （两者都合规，不要因为改动选择后者就判违规）。
-- 门禁：`cargo fmt --check`、`cargo clippy`、`cargo test`、`cargo check --release`；UI/交互改动另有
-  `scripts/dev-restart.sh` 与相应 e2e 场景。评审者看不到"跑过哪些门禁"，需要时请在结论里明确索取。
-- 规范文档：`docs/design-style{,-en}.md` 是用户可见外观的规范；代码与文档冲突时**文档为准**，除非同一改动
-  里改了文档并给出理由。
+- 门禁是 `cargo fmt --check`、`cargo clippy`、`cargo test`、`cargo check --release`；评审者看不到跑了哪些
+  门禁，需要时请在结论里明确索取。
+- 代码与 `docs/design-style{,-en}.md` 冲突时**文档为准**，除非同一改动里改了文档并给出理由。
 
-以下四类问题在本仓库反复出现，请作为重点检查项：
-
-1. **定量声明必须有可复现的命令**。文档或注释里的任何数字（对比度、比例、坐标、尺寸、耗时）都应能由一条具名
-   命令复现；如果测量手段后来被修正，旧数字立即作废，文档与代码注释必须同步。把未验证的数字写成已确认，是
-   本仓库已发生过多次的真实缺陷。
-2. **没有反例自检的"仪器"不是门禁**。任何验收手段都应带反例回归（例如 `--selftest`），并检查它是否覆盖了
-   *曾经击败过它* 的场景；只覆盖顺利用例的仪器不算数。
-3. **开发开关不得泄漏**。e2e/场景跑完必须把 app 留在可用状态；一个把面板文字画成透明、或把纯色窗口钉在面板后
-   的实例被留给用户，是已经发生过的事故。
-4. **文档不得被悄悄放宽或夸大**。检查这一改动是否削弱了文档中的承诺，或把"目标值"写成了"已强制执行"。
+省着用上下文：优先 `git diff` 与定点读取，不要整文件读取——工具输出会一直留在上下文里，越读越贵。
 EOF
 )
 
@@ -916,10 +1071,43 @@ else
     FIRST_PROMPT="$FIRST_REVIEW_PROMPT"
 fi
 
+# Which session this round starts on, recorded *before* the CLI runs: the log is about what the round
+# intended to do, and a round that dies on a lost session still has to say the session was lost. The
+# `lost` case can only be told apart from a working resume after the CLI answers, so the intent is
+# written here and corrected below when the CLI reports that the thread does not exist.
+INTENDED_EVENT=""
+if [[ -f "$SESSION_FILE" ]]; then
+    INTENDED_EVENT="resumed"
+elif has_unfinished_session "$STATE_DIR"; then
+    # No pointer but the log shows a session that was never deliberately ended: it was replaced rather
+    # than finished, and that unexplained gap is what this event names.
+    INTENDED_EVENT="restarted"
+else
+    INTENDED_EVENT="new"
+fi
+
+# The budget warning. AGENTS.md budgets a task at three review rounds; a session that has already run
+# that many is carrying a context that grows every round, and the round that finally hits --timeout
+# loses its work. This only says so: ending a task is the user's call, so the round proceeds.
+BUDGET_ROUNDS=3
+if [[ "$ROUND_KIND" == "review" && "$INTENDED_EVENT" == "resumed" ]]; then
+    spent="$(session_rounds_so_far "$STATE_DIR" review)"
+    if [[ "$spent" -ge "$BUDGET_ROUNDS" ]]; then
+        echo "Note: this session has already run $spent review rounds (AGENTS.md budgets $BUDGET_ROUNDS)." >&2
+        echo "Its context grows every round, and a round that hits --timeout loses its work. When the task is" >&2
+        echo "done, --finish closes it; to close it now, --finish then start again and hand the still-open" >&2
+        echo "findings over in --note." >&2
+    fi
+fi
+
 if [[ ! -f "$SESSION_FILE" ]]; then
     echo "Starting new Codex reviewer session..."
     status=0
     run_codex exec --model "$MODEL" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT" || status=$?
+    # Logged after the CLI ran, because only then does the new session have an id: the record has to
+    # name the session it began, or a later reader cannot follow it to its rollout. A round whose CLI
+    # never created one is recorded with no id, which is the honest description of that attempt.
+    log_round_session
 else
     SESSION_ID="$(cat "$SESSION_FILE")"
     if [[ "$design" == 1 ]]; then
@@ -934,8 +1122,22 @@ else
     fi
     echo "$SESSION_ID"
     echo
+    # Through the same idempotent entry point the signal path uses: a resume that is interrupted must
+    # not end up recorded twice, once here and once by the handler.
+    log_round_session
     status=0
     run_codex exec resume "$SESSION_ID" --model "$MODEL" --json -o "$MESSAGE_FILE" "$PROMPT" || status=$?
+    # A resume against a thread the CLI no longer holds fails before any turn: the session is gone, and
+    # the log has to say `lost` rather than `resumed`, or the memory gap stays invisible. The wording is
+    # the CLI's own; it is matched because it is the only signal that separates "this session is gone"
+    # from every other way a resume can fail, and a false negative costs only a mislabelled event.
+    if [[ "$status" -ne 0 ]] && grep -qi 'no rollout found for thread id' "$STDERR_FILE" 2>/dev/null; then
+        # Same round number as the `resumed` this attempt already logged: it is the second half of one
+        # attempt, and session_rounds_so_far skips it for the same reason -- the round was tried once.
+        log_session_event "$STATE_DIR" lost "$SESSION_ID" "$ROUND_NUMBER" "$ROUND_KIND"
+        echo "The reviewer session $SESSION_ID is gone: the CLI has no rollout for it." >&2
+        echo "The log records it as lost. --fresh starts a new one (its memory is lost); a retry cannot." >&2
+    fi
 fi
 
 # One pass over the event stream: what happened, and what the final message was. The CLI's own -o file

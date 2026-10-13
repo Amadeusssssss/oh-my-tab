@@ -115,6 +115,17 @@ case "$mode" in
     plan-fail)    start; echo "boom: the transport went away" >&2; exit 1 ;;
     resume-fail)  if [[ "$is_resume" == 1 ]]; then echo "session not found" >&2; exit 1; fi
                   start; msg "$(passing)"; turn_done ;;
+    # The real CLI's wording when the thread it was told to resume no longer exists. The helper keys
+    # the `lost` event off exactly this sentence, so the stub has to say it verbatim: a paraphrasing
+    # stub would let a detection that no longer matches the CLI pass the gate.
+    thread-gone)  if [[ "$is_resume" == 1 ]]; then
+                      echo "Error: thread/resume: thread/resume failed: no rollout found for thread id $resume_id (code -32600)" >&2
+                      exit 1
+                  fi
+                  start; msg "$(passing)"; turn_done ;;
+    # A CLI that dies before it reports a thread.started: the attempt produces events and even a
+    # verdict, but no session. Nothing about the round may be recorded as a session existing.
+    no-session)   echo '{"type":"turn.started"}'; msg "$(passing)"; turn_done ;;
 esac
 exit 0
 STUB
@@ -569,6 +580,242 @@ run ok --tasks --design
 check "a listing takes no round of its own" 64 "--tasks lists" "$tmp/err.txt"
 run ok --tasks --task beta
 check "and no task" 64 "--tasks lists" "$tmp/err.txt"
+
+echo "the session log separates a clean hand-off from a lost session"
+# The defect this guards: an outcome file writes `reason=none` both when a task ended on purpose and
+# when its session went missing, so after the fact the two are indistinguishable. The log is the record
+# that tells them apart, and these cases falsify it from both sides.
+log=".agent-review/tasks/beta/session-log.tsv"
+if [[ -f "$log" ]]; then
+    echo "  ok   the log exists for a task that ran"
+else
+    echo "  FAIL no session log was written for the task"
+    failures=$((failures + 1))
+fi
+expect "the first round is recorded as a session beginning" "$(printf '\tnew\tstub-beta\t')" "$log"
+expect "and a later round as a resume" "$(printf '\tresumed\tstub-beta\t')" "$log"
+
+# A session the CLI no longer holds must be recorded as lost, not as a resume -- this is the one case
+# the whole log exists for, so it is asserted with the CLI's own error text.
+echo "a resume against a session the CLI no longer holds"
+run thread-gone --task beta
+check "the round is refused" 1 "is gone" "$tmp/err.txt"
+expect "the loss is named in the log" "$(printf '\tlost\tstub-beta\t')" "$log"
+expect "and the log still shows the session it tried" "stub-beta" "$log"
+# The counter-example: a lost session is not a closure. If `lost` were logged as a hand-off, a task
+# whose session vanished would read as deliberately ended and its memory gap would go unnoticed.
+expect_absent "a lost session is not recorded as finished" "$(printf '\tfinished\t')" "$log"
+
+# --finish is the one deliberate end, and it must be distinguishable from the loss above.
+echo "--finish records the hand-off it performs"
+run ok --finish --task beta
+check "--finish still takes the key" 0 - "$tmp/out.txt"
+expect "the closure is recorded" "$(printf '\tfinished\tstub-beta\t')" "$log"
+if [[ -f .agent-review/tasks/beta/codex-session-id ]]; then
+    echo "  FAIL the pointer survived --finish"
+    failures=$((failures + 1))
+else
+    echo "  ok   and only then does the pointer go"
+fi
+
+echo "--tasks reports whether a task is still on a session"
+run ok --tasks
+check "the listing is produced" 0 - "$tmp/out.txt"
+expect "a closed task reads as closed" "closed" "$tmp/out.txt"
+run ok --task gamma
+check "a fresh task runs" 0 - "$tmp/out.txt"
+run ok --tasks
+expect "and reads as open, on its session" "open" "$tmp/out.txt"
+run ok --tasks --task gamma
+check "a listing still takes no task" 64 "--tasks lists" "$tmp/err.txt"
+
+echo "a session replaced without --finish is not reported as a clean end"
+# The second counter-example, and the harder one: a pointer that disappears without a --finish is a
+# restart, not a hand-off. Deleting it here stands in for the ways that happens in practice (a failed
+# first round that never recorded an id, a session cleared outside the helper).
+gamma_log=".agent-review/tasks/gamma/session-log.tsv"
+rm -f .agent-review/tasks/gamma/codex-session-id
+run ok --task gamma
+check "a round after the pointer vanished runs" 0 - "$tmp/out.txt"
+expect "it is recorded as a restart" "$(printf '\trestarted\t')" "$gamma_log"
+expect_absent "and not as a finished task" "$(printf '\tfinished\t')" "$gamma_log"
+
+echo "a round after --finish is a new session, not an unexplained restart"
+# The other half of the same distinction, and the defect the end-to-end probe caught: after a --finish
+# the task *has* history, so a "has any history" test called the next round `restarted` and reported a
+# deliberate hand-off as a session that went missing. It must be `new`, and it must not be `restarted`.
+delta_log=".agent-review/tasks/delta/session-log.tsv"
+run ok --task delta
+check "the first round runs" 0 - "$tmp/out.txt"
+run ok --finish --task delta
+check "--finish takes the key" 0 - "$tmp/out.txt"
+run ok --task delta
+check "the round after --finish runs" 0 - "$tmp/out.txt"
+expect "it is recorded as a new session" "$(printf '\tnew\tstub-delta\t')" "$delta_log"
+expect_absent "not as a restart" "$(printf '\trestarted\t')" "$delta_log"
+if [[ "$(grep -c "$(printf '\tnew\t')" "$delta_log")" == "2" ]]; then
+    echo "  ok   both sessions began with a new event"
+else
+    echo "  FAIL expected two session beginnings: $(cat "$delta_log")"
+    failures=$((failures + 1))
+fi
+
+echo "a failed attempt that never created a session is not history"
+# The third defect from the review: a first round whose CLI dies before thread.started writes an
+# outcome with `session=none`. Treating the archive as proof that a session existed made the *next*
+# round `restarted`, reporting a replacement of a session that never was. It must be `new`, and the
+# no-session attempt must not appear in the log at all -- there is no session to name.
+zeta_log=".agent-review/tasks/zeta/session-log.tsv"
+run no-session --task zeta
+check "an attempt with no session is still archived" 0 - "$tmp/out.txt"
+if [[ -f "$zeta_log" ]]; then
+    echo "  FAIL a session event was logged for an attempt that had no session: $(cat "$zeta_log")"
+    failures=$((failures + 1))
+else
+    echo "  ok   an attempt that established no session logs no session event"
+fi
+expect_absent "and the health view does not claim a session" "stub-zeta" "$tmp/out.txt"
+run ok --task zeta
+check "the next round runs" 0 - "$tmp/out.txt"
+expect "it begins a session rather than replacing one" "$(printf '\tnew\tstub-zeta\t')" "$zeta_log"
+expect_absent "and is not called a restart" "$(printf '\trestarted\t')" "$zeta_log"
+
+echo "the round number is the same in the log and the archive"
+# The second defect from the review: the log read the counter before the round and the archive wrote it
+# after, so every entry was one round off and an event could not be matched to the evidence it
+# described. The number in the log must name an archived outcome that exists.
+num_task="numbers"
+num_log=".agent-review/tasks/$num_task/session-log.tsv"
+for i in 1 2 3; do
+    run ok --task "$num_task"
+    check "round $i runs" 0 - "$tmp/out.txt"
+done
+for n in 1 2 3; do
+    if [[ "$(awk -F'\t' -v n="$n" '$4 == n { c++ } END { print c + 0 }' "$num_log")" == "1" ]]; then
+        echo "  ok   the log names round $n exactly once"
+    else
+        echo "  FAIL the log does not name round $n exactly once: $(cat "$num_log")"
+        failures=$((failures + 1))
+    fi
+    if ls ".agent-review/tasks/$num_task/rounds/"*-"$(printf '%03d' "$n")"-outcome.txt >/dev/null 2>&1; then
+        echo "  ok   and an archive outcome carries $n"
+    else
+        echo "  FAIL no archive outcome carries round $n: $(ls ".agent-review/tasks/$num_task/rounds/" | tr '\n' ' ')"
+        failures=$((failures + 1))
+    fi
+done
+# The third round of the session is the third the session has run, and the budget warning counts
+# attempts, not events: a loss is the second half of a resume and must not be counted twice.
+run ok --tasks
+expect "the session counts its own rounds" "3" "$tmp/out.txt"
+
+echo "a lost session is counted once, not once per event"
+# The fourth defect from the review: `lost` was counted as an extra round on top of the `resumed` it
+# belongs to, so the session looked busier than it was and the budget warning fired early.
+loss_task="losses"
+loss_log=".agent-review/tasks/$loss_task/session-log.tsv"
+run ok --task "$loss_task"
+check "the first round runs" 0 - "$tmp/out.txt"
+run thread-gone --task "$loss_task"
+check "the resume fails as a lost session" 1 "is gone" "$tmp/err.txt"
+run ok --task "$loss_task"
+check "a fresh round runs again" 0 - "$tmp/out.txt"
+if [[ "$(grep -c "$(printf '\tlost\t')" "$loss_log")" == "1" ]]; then
+    echo "  ok   the loss is recorded"
+else
+    echo "  FAIL the loss was not recorded once: $(cat "$loss_log")"
+    failures=$((failures + 1))
+fi
+# Two attempts ran (the first round and the retry), so the session has spent two rounds, not three --
+# the lost resume and the round after it are one attempt each, and the loss is not a third.
+resumes="$(grep -c "$(printf '\tresumed\t')" "$loss_log")"
+if [[ "$resumes" == "2" ]]; then
+    echo "  ok   the two resumed attempts are on record"
+else
+    echo "  FAIL expected two resumes, got $resumes: $(cat "$loss_log")"
+    failures=$((failures + 1))
+fi
+# The counting rule itself: new(1) + resumed(2) + lost(not counted) + resumed(3) is three rounds spent
+# across two sessions' worth of log lines -- the loss must not make it four.
+run ok --tasks
+if awk '$1 == "losses" { print $7 }' "$tmp/out.txt" | grep -qx "3"; then
+    echo "  ok   the loss is not counted as an extra round"
+else
+    echo "  FAIL the session's round count is wrong: $(awk '$1 == "losses"' "$tmp/out.txt")"
+    failures=$((failures + 1))
+fi
+
+echo "an interrupted first round still records that its session began"
+# The defect this guards: the log entry for a new session is written after the CLI returns, but a round
+# stopped by a signal exits through the handler before reaching that line. Without a record on both
+# paths the log would open on a later round's `resumed`, leaving the session's beginning unrecorded.
+# A real SIGTERM is used, not --timeout: the timeout returns through the normal path and would pass
+# even with the signal path broken, which is exactly how this assertion first failed to bite.
+int_task="interrupted-start"
+rm -rf ".agent-review/tasks/$int_task"
+STUB_MODE=hang PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh --task "$int_task" >/dev/null 2>&1 &
+int_pid=$!
+for _ in $(seq 1 100); do [[ -s ".agent-review/tasks/$int_task/last-review.jsonl" ]] && break; sleep 0.1; done
+for _ in $(seq 1 100); do [[ -s ".agent-review/tasks/$int_task/codex-session-id" ]] && break; sleep 0.1; done
+kill -TERM "$int_pid" 2>/dev/null
+set +e
+wait "$int_pid"
+set -e
+int_log=".agent-review/tasks/$int_task/session-log.tsv"
+expect "the interrupted first round records its session" "$(printf '\tnew\tstub-interrupted-start\t')" "$int_log"
+expect_value "and the pointer names the same session it logged" "stub-interrupted-start" \
+    ".agent-review/tasks/$int_task/codex-session-id"
+# The idempotence half: one round must contribute exactly one event, not one per path.
+if [[ "$(grep -c "$(printf '\tnew\t')" "$int_log")" == "1" ]]; then
+    echo "  ok   the round is recorded once, not once per path"
+else
+    echo "  FAIL the round was recorded more than once: $(cat "$int_log")"
+    failures=$((failures + 1))
+fi
+
+echo "the session-log write is not gated by the in-memory flag"
+# The window the review found: with ROUND_SESSION_LOGGED set before the append, a signal landing
+# between them loses the entry -- verified by widening that window and delivering SIGTERM inside it,
+# which leaves the round archived with no session event at all. The fix removes the dependence on that
+# ordering (the log itself is the idempotence key), so the ordering is what is asserted here.
+#
+# This is a static check on purpose, and the reason is worth stating: the window is two adjacent shell
+# statements, so no test can deterministically land a signal inside it -- a timing-based test would be
+# flaky, and a flaky gate is worse than none. Reading the ordering off the source fails on the
+# defective implementation every time, which is what a regression gate has to do.
+log_body="$(sed -n '/^log_round_session()/,/^}/p' ./scripts/codex-review.sh)"
+append_line="$(printf '%s\n' "$log_body" | grep -n 'log_session_event' | head -1 | cut -d: -f1)"
+guard_line="$(printf '%s\n' "$log_body" | grep -n 'ROUND_SESSION_LOGGED=1' | tail -1 | cut -d: -f1)"
+if [[ -n "$append_line" && -n "$guard_line" && "$guard_line" -gt "$append_line" ]]; then
+    echo "  ok   the flag is set after the append, never before it"
+else
+    echo "  FAIL the flag is set at or before the append (flag=$guard_line append=$append_line): a signal"
+    echo "       between them would lose the event, which is the defect this fix removed"
+    failures=$((failures + 1))
+fi
+# The other direction, so the check cannot pass on an implementation that never sets it at all.
+if printf '%s\n' "$log_body" | grep -q 'log_session_event'; then
+    echo "  ok   and the append is what the ordering is about"
+else
+    echo "  FAIL log_round_session no longer appends an event"
+    failures=$((failures + 1))
+fi
+
+echo "the round budget warning"
+# AGENTS.md budgets three review rounds per task, so the session is over budget when it starts a
+# fourth. The warning must stay silent through the first three and fire on the fourth: one that always
+# fires is noise, and one that never fires is not a gate. Both sides are asserted here.
+budget_task="budget"
+for i in 1 2 3 4; do
+    run ok --task "$budget_task"
+    check "budget round $i runs" 0 - "$tmp/out.txt"
+    if [[ "$i" -le 3 ]]; then
+        expect_absent "round $i does not warn yet" "budgets 3" "$tmp/err.txt"
+    else
+        expect "round $i warns that the session is over budget" "budgets 3" "$tmp/err.txt"
+        expect "and names the way out" "--finish" "$tmp/err.txt"
+    fi
+done
 
 echo "a signal sent to the script alone, while the CLI ignores TERM"
 rm -f "$tmp/child.pid" "$tmp/script-exit.txt"

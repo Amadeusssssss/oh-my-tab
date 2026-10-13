@@ -131,8 +131,21 @@ scripts/codex-review-selftest.sh            # check the helper itself, against a
 
 - One session per task, and a re-review resumes **that** session so the reviewer remembers its previous
   findings, the agent's answers, and what was already tried. `--retry` resumes a round that produced no
-  verdict; a round that reached one is re-reviewed by running the reviewer again. `--finish` clears the session
-  at the end of the task.
+  verdict; a round that reached one is re-reviewed by running the reviewer again.
+- **`--finish` is the user's call, not the agent's.** The session is kept until the user says the task is
+  done — not until the agent judges the work finished. An agent that clears the session on its own judgement
+  silently discards the reviewer's memory of still-open findings, and a later round re-reports what was
+  already settled or assumes settled what was not. Two consequences:
+  - Run `--finish` **only** when the user states the feature is complete or the review is over (for example
+    「这个功能完成了」「审查到此为止」). Do not run it to tidy up, to save tokens, or because the work looks
+    like it has landed.
+  - On `cmsg` (see *Git and commits*), if the task's session is still open, say so and offer to close it —
+    do not close it silently. `scripts/codex-review.sh --tasks` shows the state: `open` means the task is
+    still on its session, `closed` means it was ended on purpose.
+- A session that has run past the budget grows more expensive every round, and a round that hits `--timeout`
+  loses its work. The helper warns on the round that starts over budget; closing the session is still the
+  user's decision, and the way to close it early without losing continuity is `--finish` followed by a fresh
+  round that hands the still-open findings over in `--note`.
 - When more than one task is in flight at once — two agents working two tasks, or a design round for one task
   while another task's implementation is under review — each task names its own key with `--task <slug>` (or
   says it once through `OMT_REVIEW_TASK`), so that no round can resume another task's session, read its
@@ -222,6 +235,6 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 ## Git and commits
 
 - Do not commit, push, stage, or rewrite history unless explicitly requested. `style` is for code-style changes, not UI styling.
-- If the input is exactly `/cmsg` or `cmsg`, inspect `git diff --cached`, `git diff`, and `git diff HEAD`; base the result on the combined diff and return exactly one English Conventional Commits line: `type: description`. Check `AD` status against the combined diff before deciding scope.
+- If the input is exactly `/cmsg` or `cmsg`, inspect `git diff --cached`, `git diff`, and `git diff HEAD`; base the result on the combined diff and return exactly one English Conventional Commits line: `type: description`. Check `AD` status against the combined diff before deciding scope. A commit is not the end of a review task, so **do not run `--finish` here**: if the task's reviewer session is still open, say so alongside the message and offer to close it (see *Independent reviewer*).
 - If the user replies exactly `allow commit` after a message was provided, recheck status and all three diffs, then commit only the intended changes with that exact message; ask if scope is ambiguous.
 - If the user replies exactly `allow push`, recheck the worktree, commit only intended changes with that exact message, and push the current branch to its configured upstream; ask if scope or upstream is ambiguous.
