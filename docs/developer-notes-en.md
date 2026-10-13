@@ -300,6 +300,101 @@ Two operational notes.
 
 
 
+## Global key bindings
+
+Window control and the quick actions are one feature: one ordered binding list, one action registry,
+one event engine, one master switch. `[key_bindings]` holds `enabled` and `[[key_bindings.items]]`
+holds `action` / `trigger` / `enabled`.
+
+- **One engine.** `key_bindings::engine` owns the only session-level tap for bindings and resolves a
+  press against an immutable `Arc<BindingTable>` snapshot. The tap never reads the config: liveness
+  is decided once, when the table is built (master switch AND row switch), so no second place can
+  keep a binding alive or kill it. `Action::group` survives as a classification for the picker and
+  for "does this act on the frontmost window", no longer as a gate. Adding an action means adding a variant in
+  `key_bindings::action`, an `ALL` entry, a config id, a label key in every locale, and an
+  `execute` arm; nothing else enumerates actions.
+- **Press pairing.** A press the engine swallows is remembered by its physical keycode until the
+  matching release, so releasing Option before the main key still pairs, and a repeat or release the
+  engine never took is passed through instead of firing an action. Our own synthesized input (mouse
+  key mappings, the lock-screen chord, Finder's Cmd+N) carries `SYNTHETIC_MARKER` and is filtered
+  before the record is touched — without that, a binding on the lock-screen chord would lock again
+  on every pass.
+- **Reserved chords.** The app switcher (`keyboard.modifier` + Tab, extra modifiers allowed) and the
+  clipboard shortcut own their chords; both are computed from the effective config, never from a
+  hardcoded list. `Config::settle_reserved_shortcuts` is the one place that resolves a collision, and
+  it runs both at load (after per-field fallback) and at runtime before anything is published: the
+  clipboard yields first (it can be rebound, the switcher cannot), then the bindings yield to what
+  the switcher and the clipboard finally own. A clipboard that already holds its default still
+  collides, so the binding is the side that gives way. The settled config is what gets persisted,
+  cached (`event_monitor`'s chord), painted and published, so no later `publish(new)` can disagree
+  with it. Both settings UIs refuse to create such a pair, and chords with no Command/Option/Control
+  are refused: a binding is swallowed everywhere.
+- **Recording and the add flow.** The settings recorder keeps the engine suspended from the start of
+  a recording until the captured chord has actually been released (`RecStage::WaitingRelease`, with
+  the captured key's repeats and release swallowed, decided by the pure `release_wait_step`); the
+  engine passes every event through while `RECORDING` is set. A recorded chord becomes a *draft* in
+  the add row, which asks for confirmation before writing, and a cancelled recording, a closed
+  window, a revoked permission or a page switch clears it.
+- **Execution rules** live in `key_bindings::execute`, the only main-thread entry: the settings
+  recorder wins (no binding runs while a chord is being recorded), an in-flight switcher session is
+  cancelled first (its modifier release would otherwise commit the card selected before this
+  action), and a window action never acts on this app's own windows (fixed-layout panels; it no-ops
+  rather than quietly acting on a background window). Bindings always fire otherwise — including
+  while oh-my-tab is frontmost.
+- **Migration is one-way.** The pre-binding `[window_control]` and `[quick_actions]` sections are
+  still read and seeded into the list (row switch from the matching flag, never ANDed at load), then
+  never written back: the first save drops them, so a downgrade loses the binding list. The master
+  switch is OR-ed from everything the older files could have stated — the sections' `enabled` flags
+  and the retired `key_bindings.window_control_enabled` / `quick_actions_enabled` keys an interim
+  build wrote — so a user who had either group on keeps it; a `key_bindings.enabled` the file states
+  itself always wins. Because those two switches now share one master switch, a group that was **off**
+  is migrated with its rows seeded **off**: rows enabled while their group was off would come alive
+  with the master switch the other group holds, arming interceptions the user had turned off (the
+  window-direction rows override Option+arrows in text fields). A group that is on keeps its per-row
+  flags, so switching the master switch off and on again restores exactly the bindings the user had.
+  The same fold applies to an interim file that already carries its own `items`: its disabled group's
+  rows are switched off in place, preserving their order and triggers, because that file was written
+  while the two switches were still separate. A `key_bindings.enabled` the file states itself is the
+  user's own merged decision, so it folds nothing into either list. When both groups were off the rows
+  keep their flags — the feature is simply not enabled yet. A missing list seeds the factory entries;
+  `items = []` means the user deleted every binding and is respected; a mistyped entry is dropped on
+  its own, keeping its siblings.
+- **One page, one switch.** The settings page is a single card: the master switch, then every binding
+  in config order (window control and quick actions are no longer shown as separate cards), and a
+  footer band carrying a ＋ / − segmented control. Turning the master switch off freezes the rows,
+  the footer and the panel rather than hiding them, so the user can see what is installed before
+  enabling it. The status-bar menu carries one Key Bindings item over the master switch: an item can
+  only express one state, so two group items could not be merged into it.
+- **Row selection and the footer.** A row is chosen by clicking it; the selection is drawn as a
+  `selection_bg` wash behind the row and is what the footer's − acts on (with nothing selected it is
+  disabled). ＋ opens the add panel; − deletes the selected row **without a confirmation step** (the
+  user's explicit choice), and the selection then moves to the row that took the deleted one's place
+  — the new last row when the deleted one was last, and cleared outright when the list empties.
+  The selection is an index, and it is only safe because every path that changes the list's *shape*
+  drops it first: `sync_from_config` clears it when the shape changed, and the − handler re-reads the
+  config and refuses an index past the end. A switch-only change keeps it, so − stays usable while
+  the user flips rows. It is published as `key_bindings_selected` for A2.
+- **The whole-row hit target is registered as a layout exception.** Row selection is a transparent
+  `NSButton` covering the entire row, with the keycaps, label and switch drawn on top of it. It is the
+  only interactive view `--smoke-settings-layout` allows to intersect its own row's content: that
+  validator treats "an interactive view covering a label or another control" as a defect, which is
+  right for a normal control and wrong for this one. It therefore carries
+  `ROW_HIT_TARGET_IDENTIFIER`, and the validator skips it on **both** sides of the overlap comparison
+  (`collect_debug_layout`). Missing that step does not produce a visual bug -- it makes the validator
+  **panic on the key-bindings page**, so every page after it goes unvalidated.
+- **Adding happens in a panel.** ＋ opens a floating `NSPanel` (the model the Mouse page's mapping
+  panel established) holding the action popup, the chord row and Cancel/OK; the page itself stays a
+  plain list. The panel owns the draft until OK, so nothing is written before the user agrees. Two
+  rules keep the panel honest: changing the action drops any chord recorded for the previous action,
+  and OK re-reads the popup before writing, so a stale draft can never be confirmed against a
+  different action. Leaving the page closes the panel and cancels the recording; so does closing
+  settings. The panel is created `alloc`/`init` and `setReleasedWhenClosed: false`, and
+  `close_binding_panel` clears every stored view slot *before* releasing it — the panel deallocates
+  its content view's subtree, so a slot left filled would dangle.
+- **e2e state.** `--e2e-state` publishes `key_bindings_entries`, `key_bindings_live` and
+  `key_bindings_enabled`, so a scenario can assert the migration and that nothing is live while the
+  master switch is off.
+
 ## Building and testing
 
 `scripts/dev-restart.sh` is the normal way to run the app during development. It builds the development `.app` and re-assembles and re-signs it only when its inputs change (the built binary, the bundled resources, the signing identity), using the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery; signing is done without a secure timestamp so a local build never depends on Apple's timestamp service), then launches it through the per-user `launchd` domain. **Only two identities are accepted -- the Apple-issued one and the self-signed one; ad-hoc is refused**, and a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` asks for the self-signed identity on purpose. A stable signing identity is what keeps the Accessibility, Screen Recording and keychain grants alive across rebuilds; when nothing changed the existing bundle is reused, so a restart does not reset them.

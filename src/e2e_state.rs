@@ -1288,6 +1288,37 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"settings_mouse_page_materialized\": {},\n",
         crate::settings::e2e_mouse_page_materialized()
     ));
+    // Key bindings: how many bindings the engine's published table holds (live = enabled row under
+    // the master switch) and how many entries the config lists. A scenario asserts the two differ
+    // exactly where a switch says so, and that both follow an edit.
+    json.push_str(&format!(
+        "  \"key_bindings_live\": {},\n",
+        crate::key_bindings::live_binding_count()
+    ));
+    json.push_str(&format!(
+        "  \"key_bindings_enabled\": {},\n",
+        crate::config::CONFIG
+            .read()
+            .map(|cfg| cfg.key_bindings.enabled)
+            .unwrap_or(false)
+    ));
+    json.push_str(&format!(
+        "  \"key_bindings_entries\": {},\n",
+        crate::config::CONFIG
+            .read()
+            .map(|cfg| cfg.key_bindings.items.as_ref().map(Vec::len).unwrap_or(0))
+            .unwrap_or(0)
+    ));
+    // The row the footer's − would delete (`null` when nothing is selected). A scenario asserts the
+    // selection follows a click, survives a switch flip, and is dropped when the list's shape changes
+    // behind the page's back -- which is what keeps − aimed at the row the user picked.
+    json.push_str(&format!(
+        "  \"key_bindings_selected\": {},\n",
+        match crate::settings::bindings::selected_binding_index() {
+            Some(index) => index.to_string(),
+            None => "null".to_string(),
+        }
+    ));
     // The app's own wall time for the last settings open, in milliseconds: the click path's latency, as one
     // number a scenario can bound (`settings_open_ms`).
     json.push_str(&format!(
@@ -1484,9 +1515,16 @@ mod tests {
 mod ax_pid_evidence_tests {
     use super::*;
 
+    /// `REJECTED_WINDOWS` is process-global while the staging is thread-local, so these tests must
+    /// not interleave: publishing one test's staged pass between another's `begin_collection_pass`
+    /// and its assertion replaces the list that assertion reads, which failed intermittently (about
+    /// one run in fifteen) when the suite ran in parallel. Mirrors `EVIDENCE_TEST_LOCK`.
+    static REJECTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A directed refresh must move only its own pid's evidence; a full pass replaces both sets.
     #[test]
     fn rejection_reasons_are_published_with_the_accepted_result_only() {
+        let _guard = REJECTION_TEST_LOCK.lock().unwrap();
         // A discarded pass must not rewrite what an applied frame's cards carry: stage without
         // publishing and the previous reasons stay.
         begin_collection_pass();
@@ -1518,6 +1556,7 @@ mod ax_pid_evidence_tests {
 
     #[test]
     fn a_directed_pass_replaces_only_its_own_pid() {
+        let _guard = REJECTION_TEST_LOCK.lock().unwrap();
         begin_collection_pass();
         card_rejected(7, 20, CardRejection::AxExcluded);
         card_rejected(8, 30, CardRejection::Title);

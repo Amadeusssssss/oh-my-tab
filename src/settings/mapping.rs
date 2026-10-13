@@ -347,6 +347,7 @@ pub(super) fn notify_main(sel: Sel) {
 /// Defensive recording cancel: when the settings window OKs/cancels/closes while a
 /// recording is in progress, reset the state so nothing lingers.
 pub(crate) fn cancel_recording_from_main() {
+    let binding_recording = *REC_MODE.lock().unwrap() == RecMode::KeyBinding;
     if *REC_STAGE.lock().unwrap() != RecStage::Idle {
         *REC_STAGE.lock().unwrap() = RecStage::Idle;
         *REC_MODS.lock().unwrap() = 0;
@@ -360,6 +361,16 @@ pub(crate) fn cancel_recording_from_main() {
                 crate::event_tap::CFRunLoopStop(rl);
             }
         }
+    }
+    // The tap can be stopped under an in-flight key-binding recording (window close, service
+    // stop). Only the state is reset here: this runs on the permission supervisor's thread as well
+    // as on the main thread, and the settings UI may only be touched from the main one, so the add
+    // row's cleanup is marshalled through the same selector a cancellation uses.
+    let bindings_idle = reset_key_binding_recording_state();
+    // A draft (recorded, not yet confirmed) has to be cleared too, and it is not a mode -- the
+    // recording already finished, so only the draft check can see it.
+    if binding_recording || bindings_idle || super::bindings::has_draft() {
+        notify_main(sel!(handleRecordingCancelled:));
     }
 }
 
@@ -396,6 +407,128 @@ pub(super) unsafe fn finish_recording(success: bool) {
     } else {
         sel!(handleRecordingCancelled:)
     });
+}
+
+/// Whether a captured chord has been let go: the main key is up and no chord modifier is still
+/// held. The recording stays suspended until then (see `RecStage::WaitingRelease`), so the binding
+/// engine never acts on a chord the user is still holding.
+fn release_settled(captured_key_up: bool, flags: u32) -> bool {
+    captured_key_up && flags & RECORDING_MODIFIER_MASK == 0
+}
+
+/// The chord modifiers a recording tracks (`cmd | shift | alt | ctrl`).
+const RECORDING_MODIFIER_MASK: u32 = 0x0010_0000 | 0x0008_0000 | 0x0004_0000 | 0x0002_0000;
+
+/// One event the release wait has to classify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseEvent {
+    /// A key press: the keycode, whether the system marked it as a held-key repeat, and the flag
+    /// set it arrived with (what tells a bare Escape from a modified one).
+    Down {
+        keycode: u16,
+        autorepeat: bool,
+        flags: u32,
+    },
+    Up {
+        keycode: u16,
+        /// The flag set current once this release has been processed.
+        flags: u32,
+    },
+    /// A modifier state change (`flagsChanged`); the payload is the new flag set.
+    Modifiers { flags: u32 },
+}
+
+/// What the recorder does with one event while waiting for the captured chord to be released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseStep {
+    /// Hand the event to whatever app is frontmost.
+    PassThrough,
+    /// Take the event: it belongs to the captured chord, which the app never saw press.
+    Swallow,
+    /// The chord is released; the recording finishes with what was captured.
+    Settled,
+    /// Bare Escape: abandon the recording.
+    Cancel,
+}
+
+/// One step of the release wait. Pure, so the whole sequence -- press, held-key repeat, another key,
+/// the captured key's release, then the modifier's -- is assertable without a live tap.
+///
+/// Two rules it encodes: the captured key's repeats stay swallowed (the app must not receive a
+/// repeat of a press it never saw), and an unrelated key does *not* end the wait (ending it early
+/// would resume the binding engine while the captured chord is still held).
+///
+/// The "key is up" latch is passed in, not derived here: the caller keeps it across events with
+/// `captured_key_up_after`, because a *second* press of the captured key must clear it and a bare
+/// `true` on every release would not. On the captured key's own release the latch is true by
+/// construction, which is why that arm passes `true`.
+fn release_wait_step(
+    captured: Option<u16>,
+    captured_key_up: bool,
+    event: ReleaseEvent,
+) -> ReleaseStep {
+    let Some(captured) = captured else {
+        return ReleaseStep::PassThrough;
+    };
+    match event {
+        ReleaseEvent::Down {
+            keycode,
+            autorepeat,
+            flags,
+        } => {
+            if keycode == captured {
+                // The captured key's repeat belongs to the press we swallowed.
+                return ReleaseStep::Swallow;
+            }
+            if !autorepeat && keycode == 53 && flags & RECORDING_MODIFIER_MASK == 0 {
+                // Only a *bare* Escape abandons the recording. Escape with a modifier held is just
+                // another key: cancelling there would resume the binding engine while the captured
+                // chord is still down.
+                return ReleaseStep::Cancel;
+            }
+            ReleaseStep::PassThrough
+        }
+        ReleaseEvent::Up { keycode, flags } => {
+            if keycode != captured {
+                return ReleaseStep::PassThrough;
+            }
+            // The captured key's release is ours. If the modifiers were let go first (the other
+            // order), no further event is coming, so this release is what settles the recording --
+            // otherwise the wait would hang with the engine still suspended.
+            if release_settled(true, flags) {
+                ReleaseStep::Settled
+            } else {
+                ReleaseStep::Swallow
+            }
+        }
+        ReleaseEvent::Modifiers { flags } => {
+            if release_settled(captured_key_up, flags) {
+                ReleaseStep::Settled
+            } else {
+                ReleaseStep::PassThrough
+            }
+        }
+    }
+}
+
+/// The next value of "the captured key is up" after one event.
+///
+/// The latch has to follow a *second* press of the captured key, not just its first release. A
+/// held-key repeat is not a fresh press and leaves it alone.
+fn captured_key_up_after(
+    captured: Option<u16>,
+    captured_key_up: bool,
+    event: ReleaseEvent,
+) -> bool {
+    match event {
+        ReleaseEvent::Down {
+            keycode,
+            autorepeat,
+            ..
+        } if Some(keycode) == captured && !autorepeat => false,
+        ReleaseEvent::Up { keycode, .. } if Some(keycode) == captured => true,
+        _ => captured_key_up,
+    }
 }
 
 /// Recording tap callback (recording thread): a combo keyDown finishes the recording
@@ -451,15 +584,61 @@ unsafe fn recording_tap_callback_inner(
         12 => {
             // flagsChanged: during WaitingCombo, accumulate modifiers live and refresh the
             // popup (e.g. holding Cmd shows ⌘). The event passes through (untouched).
-            if *REC_STAGE.lock().unwrap() == RecStage::WaitingCombo {
+            let stage = *REC_STAGE.lock().unwrap();
+            if stage == RecStage::WaitingCombo {
                 let flags = CGEventGetFlags(event) as u32;
                 *REC_MODS.lock().unwrap() =
                     flags & (0x0010_0000 | 0x0008_0000 | 0x0004_0000 | 0x0002_0000);
                 notify_main(sel!(handleRecordingStage:));
+            } else if stage == RecStage::WaitingRelease {
+                let flags = CGEventGetFlags(event) as u32;
+                let captured = *REC_CAPTURED_KEY.lock().unwrap();
+                if release_wait_step(
+                    captured,
+                    REC_CAPTURED_KEY_UP.load(Ordering::SeqCst),
+                    ReleaseEvent::Modifiers { flags },
+                ) == ReleaseStep::Settled
+                {
+                    finish_recording(true);
+                }
             }
             event
         }
         10 => {
+            // While waiting for the release: the captured key's repeats stay swallowed, another
+            // key passes through without ending the wait (the engine resumes only once the captured
+            // chord is actually released), and bare Escape abandons the recording.
+            if *REC_STAGE.lock().unwrap() == RecStage::WaitingRelease {
+                let autorepeat = CGEventGetIntegerValueField(event, 8) != 0;
+                let keycode = CGEventGetIntegerValueField(event, 9) as u16;
+                let captured = *REC_CAPTURED_KEY.lock().unwrap();
+                let step_event = ReleaseEvent::Down {
+                    keycode,
+                    autorepeat,
+                    flags: CGEventGetFlags(event) as u32,
+                };
+                // A fresh press of the captured key while a modifier is still held must clear the
+                // "up" latch: the key is down again, so the wait is not satisfied, and leaving the
+                // stale true would let a modifier release settle the recording mid-press.
+                let key_up = captured_key_up_after(
+                    captured,
+                    REC_CAPTURED_KEY_UP.load(Ordering::SeqCst),
+                    step_event,
+                );
+                REC_CAPTURED_KEY_UP.store(key_up, Ordering::SeqCst);
+                return match release_wait_step(captured, key_up, step_event) {
+                    ReleaseStep::Swallow => std::ptr::null_mut(),
+                    ReleaseStep::Cancel => {
+                        finish_recording(false);
+                        std::ptr::null_mut()
+                    }
+                    ReleaseStep::Settled => {
+                        finish_recording(true);
+                        std::ptr::null_mut()
+                    }
+                    ReleaseStep::PassThrough => event,
+                };
+            }
             // keyDown: only handled while waiting for the combo.
             if *REC_STAGE.lock().unwrap() == RecStage::WaitingCombo {
                 let keycode = CGEventGetIntegerValueField(event, 9) as u16;
@@ -472,10 +651,43 @@ unsafe fn recording_tap_callback_inner(
                 }
                 let desc = describe_shortcut(keycode, mods);
                 *REC_DESC.lock().unwrap() = desc;
-                finish_recording(true);
+                // Hold the recording open until the chord is released: the engine stays suspended
+                // for the whole press, and the captured key's own keyUp is swallowed with it (the
+                // app never saw its keyDown, so it must not see a bare release).
+                *REC_CAPTURED_KEY.lock().unwrap() = Some(keycode);
+                REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
+                *REC_STAGE.lock().unwrap() = RecStage::WaitingRelease;
                 return std::ptr::null_mut();
             }
             event
+        }
+        11 => {
+            if *REC_STAGE.lock().unwrap() != RecStage::WaitingRelease {
+                return event;
+            }
+            let keycode = CGEventGetIntegerValueField(event, 9) as u16;
+            let captured = *REC_CAPTURED_KEY.lock().unwrap();
+            let flags = CGEventGetFlags(event) as u32;
+            // The captured key's release is the flag the settle needs; the modifier release arrives
+            // separately as flagsChanged.
+            let key_up = captured_key_up_after(
+                captured,
+                REC_CAPTURED_KEY_UP.load(Ordering::SeqCst),
+                ReleaseEvent::Up { keycode, flags },
+            );
+            REC_CAPTURED_KEY_UP.store(key_up, Ordering::SeqCst);
+            match release_wait_step(captured, key_up, ReleaseEvent::Up { keycode, flags }) {
+                ReleaseStep::Swallow => std::ptr::null_mut(),
+                ReleaseStep::Cancel => {
+                    finish_recording(false);
+                    std::ptr::null_mut()
+                }
+                ReleaseStep::Settled => {
+                    finish_recording(true);
+                    std::ptr::null_mut()
+                }
+                ReleaseStep::PassThrough => event,
+            }
         }
         _ => event,
     }
@@ -487,8 +699,10 @@ unsafe fn recording_tap_callback_inner(
 pub(super) unsafe fn recording_thread() {
     let rl = crate::event_tap::CFRunLoopGetCurrent();
     *REC_RUNLOOP.0.lock().unwrap() = Some(rl);
-    // otherMouseDown(25) | keyDown(10) | flagsChanged(12)
-    let mask: crate::event_tap::CGEventMask = (1u64 << 25) | (1u64 << 10) | (1u64 << 12);
+    // otherMouseDown(25) | keyDown(10) | keyUp(11) | flagsChanged(12); keyUp is what ends the
+    // release wait after a chord is captured.
+    let mask: crate::event_tap::CGEventMask =
+        (1u64 << 25) | (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
     let created = crate::event_tap::create_tap_with_retry(
         crate::event_tap::tap_location::HID_EVENT_TAP,
         crate::event_tap::tap_placement::HEAD_INSERT,
@@ -934,20 +1148,52 @@ pub(super) unsafe fn update_mapping_panel() {
     }
 }
 
+/// Whether the mapping edit panel is open (the page switch uses this to close it).
+pub(super) fn mapping_panel_is_open() -> bool {
+    EDIT_PANEL
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false)
+}
+
 /// Close the mapping edit panel (idempotent).
 pub(super) fn close_mapping_panel() {
     // take(): an if-let scrutinee MutexGuard lives for the WHOLE if block, so locking the
     // same Mutex inside it self-deadlocks (the beach ball, verified). take() moves the
     // value out and the guard drops immediately.
-    if let Some(p) = EDIT_PANEL.lock().unwrap().take() {
-        unsafe {
-            let _: () = msg_send![p.0, orderOut: std::ptr::null::<AnyObject>()];
-        }
+    //
+    // Every view the panel holds is taken out *before* the panel is released: those slots are bare
+    // pointers, and releasing the panel deallocates its content view and subviews with it, so a slot
+    // left filled would be a dangling pointer the next render or notification writes through.
+    let panel = EDIT_PANEL.lock().unwrap().take();
+    let btn_label = EDIT_PANEL_BTN_LABEL.lock().unwrap().take();
+    let action = EDIT_PANEL_ACTION.lock().unwrap().take();
+    let action_copy = action;
+    let combo_btn = EDIT_PANEL_COMBO_BTN.lock().unwrap().take();
+    let combo_label = EDIT_PANEL_COMBO_LABEL.lock().unwrap().take();
+    let ok = EDIT_PANEL_OK.lock().unwrap().take();
+    let dim = EDIT_DIM.lock().unwrap().take();
+    // The slots are empty now; the handles themselves are Copy, so this is a plain discard.
+    let _ = (btn_label, action, combo_btn, combo_label, ok);
+    // The action popup is a custom select registered by address in maps that outlive it, so it is
+    // forgotten here, before the panel that owns it is released.
+    if let Some(popup) = action_copy {
+        unsafe { super::select::forget_settings_select(popup.0) };
     }
-    // Remove the dim layer.
-    if let Some(d) = EDIT_DIM.lock().unwrap().take() {
+    // Remove the dim layer from the content view it was added to; that view owns it, so this is what
+    // drops the reference (the dim layer is not the panel's to release).
+    if let Some(d) = dim {
         unsafe {
             let _: () = msg_send![d.0, removeFromSuperview];
+        }
+    }
+    // The panel is created with `alloc`/`init` (+1) and `setReleasedWhenClosed: false`, so nothing
+    // else ever releases it: this is the one place that can. Its subviews were each balanced at build
+    // time and are owned by the content view, so releasing the panel releases them in turn.
+    if let Some(p) = panel {
+        unsafe {
+            let _: () = msg_send![p.0, orderOut: std::ptr::null::<AnyObject>()];
+            release_obj(p.0);
         }
     }
     *EDIT_BUTTON.lock().unwrap() = None;
@@ -973,6 +1219,8 @@ pub(crate) extern "C" fn handle_recording_finished(
     let mode = *REC_MODE.lock().unwrap();
     let desc = REC_COMPLETED_DESC.lock().unwrap().clone();
     match mode {
+        // No recording was in flight (a late callback): nothing to apply.
+        RecMode::Idle => return,
         // The panel recorded the trigger: update the panel.
         RecMode::PanelTrigger => {
             *EDIT_BUTTON.lock().unwrap() = Some(btn);
@@ -989,20 +1237,31 @@ pub(crate) extern "C" fn handle_recording_finished(
             }
             log_debug!("[mouse] panel combo recorded");
         }
+        RecMode::KeyBinding => finish_key_binding_recording(&desc),
         RecMode::ClipboardShortcut => {
-            let error = match crate::mouse::shortcut::validate_clipboard_shortcut(&desc) {
+            // The chord is checked against the effective config, so it cannot take a chord a
+            // binding holds or one the app switcher owns.
+            let status = {
+                let cfg = crate::config::CONFIG.read().unwrap();
+                crate::key_bindings::clipboard_shortcut_status(
+                    &desc,
+                    cfg.key_bindings.items.as_deref().unwrap_or(&[]),
+                    crate::key_bindings::modifier_flag(&cfg.keyboard.modifier),
+                )
+            };
+            let error = match status {
                 Ok(_) => {
                     super::apply_recorded_clipboard_shortcut(&desc);
                     None
                 }
-                Err(crate::mouse::shortcut::ClipboardShortcutError::Invalid) => Some(tf(
+                Err(crate::key_bindings::ClipboardStatus::Invalid) => Some(tf(
                     "errors.clipboard_shortcut_invalid",
                     &[(
                         "value",
                         crate::mouse::shortcut::display_shortcut(&desc).as_str(),
                     )],
                 )),
-                Err(crate::mouse::shortcut::ClipboardShortcutError::Conflict) => {
+                Err(crate::key_bindings::ClipboardStatus::Conflict) => {
                     Some(t("errors.clipboard_shortcut_conflict"))
                 }
             };
@@ -1010,7 +1269,12 @@ pub(crate) extern "C" fn handle_recording_finished(
         }
     }
     *REC_COMPLETED_DESC.lock().unwrap() = String::new();
+    *REC_CAPTURED_KEY.lock().unwrap() = None;
+    REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
+    *REC_MODE.lock().unwrap() = RecMode::Idle;
     *REC_STAGE.lock().unwrap() = RecStage::Idle;
+    // The mode is settled now, so the panel can be told the truth about its buttons.
+    refresh_panel_after_recording();
 }
 
 /// Main-thread callback: recording cancelled/failed.
@@ -1022,8 +1286,17 @@ pub(crate) extern "C" fn handle_recording_cancelled(
     if *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut {
         super::set_clipboard_shortcut_recording_ui(false, None);
     }
+    // Unconditional: the caller may already have reset the mode (that is exactly what the
+    // background cancellation path does), and `recording_ended` is idempotent -- it clears a draft
+    // if one is waiting and puts the add row back otherwise.
+    super::bindings::recording_ended();
+    reset_key_binding_recording_state();
     REC_COMPLETED_DESC.lock().unwrap().clear();
     *REC_STAGE.lock().unwrap() = RecStage::Idle;
+    // Same ordering rule as the completed path: the panel's buttons depend on the recording mode,
+    // so they are refreshed only once it has been reset -- otherwise a cancelled recording leaves
+    // the record button disabled and the user cannot try again.
+    refresh_panel_after_recording();
     log_debug!("[mouse] button-mapping recording cancelled");
 }
 
@@ -1041,12 +1314,344 @@ pub(crate) extern "C" fn handle_clipboard_shortcut_record(
     REC_COMPLETED_DESC.lock().unwrap().clear();
     *REC_MODS.lock().unwrap() = 0;
     *REC_MODE.lock().unwrap() = RecMode::ClipboardShortcut;
+    *REC_CAPTURED_KEY.lock().unwrap() = None;
+    REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
     *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
     REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
     super::set_clipboard_shortcut_recording_ui(true, None);
     log_debug!("[settings] clipboard shortcut recording started");
     *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+}
+
+/// Start a recording for a new key binding: the Key Bindings page's "Record Shortcut".
+///
+/// Shares the recorder with the clipboard shortcut and the mouse mappings, so Esc handling and tap
+/// teardown are the same in all three. The engine's in-flight press and gesture state is reset on
+/// entry and on every exit, so a press swallowed just before the recorder opened cannot stay
+/// swallowed, and two modifier taps on either side of a recording cannot read as one gesture.
+pub(crate) unsafe fn start_key_binding_recording(action: crate::key_bindings::Action) {
+    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
+        return;
+    }
+    *REC_PENDING_ACTION.lock().unwrap() = Some(action);
+    REC_DESC.lock().unwrap().clear();
+    REC_COMPLETED_DESC.lock().unwrap().clear();
+    *REC_MODS.lock().unwrap() = 0;
+    *REC_MODE.lock().unwrap() = RecMode::KeyBinding;
+    *REC_CAPTURED_KEY.lock().unwrap() = None;
+    REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
+    *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
+    REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+    crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
+    crate::key_bindings::reset_input_state();
+    super::bindings::set_add_message(None);
+    super::bindings::update_panel_ok();
+    log_debug!("[settings] key-binding recording started");
+    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+}
+
+/// Finish a key-binding recording: turn the chord into a draft the add row asks the user to
+/// confirm, so nothing is written by the act of recording alone.
+fn finish_key_binding_recording(desc: &str) {
+    let action = REC_PENDING_ACTION.lock().unwrap().take();
+    let result = match action {
+        Some(action) => super::bindings::recording_captured(action, desc),
+        None => Err(t("settings.binding_record_failed")),
+    };
+    if let Err(error) = &result {
+        super::bindings::set_add_message(Some(error));
+    }
+    crate::key_bindings::reset_input_state();
+    // The recorder is done, but `REC_MODE` is still `KeyBinding` here (the caller sets it back to
+    // `Idle` after this returns). Refreshing the panel now would compute OK from the stale mode and
+    // leave it disabled after a perfectly good recording, so the refresh is deferred to the caller's
+    // post-transition hook.
+    log_debug!(
+        "[settings] key-binding recording finished (draft accepted={})",
+        result.is_ok()
+    );
+}
+
+/// Refresh the panel now that a recording has fully finished (`REC_MODE` back to `Idle`). Split
+/// from `finish_key_binding_recording` because the panel's enabled state depends on that mode.
+pub(crate) fn refresh_panel_after_recording() {
+    super::bindings::update_panel_ok();
+}
+
+/// Whether a binding recording or a draft is waiting: used by the page switch, since neither
+/// belongs to a page the user has left.
+pub(crate) fn pending_binding_recording() -> bool {
+    *REC_MODE.lock().unwrap() == RecMode::KeyBinding || super::bindings::has_draft()
+}
+
+/// Whether the *recorder* is running, ignoring any draft. Distinct from
+/// `pending_binding_recording` because the panel's close path asks this while a draft may still be
+/// live, so folding the draft in would make the answer depend on what the caller is about to clear.
+pub(crate) fn binding_recording_pending() -> bool {
+    *REC_MODE.lock().unwrap() == RecMode::KeyBinding
+}
+
+/// Leave any in-flight key-binding recording, state only: safe on any thread, and idempotent.
+/// Returns whether something was actually in flight.
+pub(crate) fn reset_key_binding_recording_state() -> bool {
+    if *REC_MODE.lock().unwrap() != RecMode::KeyBinding {
+        return false;
+    }
+    *REC_MODE.lock().unwrap() = RecMode::Idle;
+    *REC_PENDING_ACTION.lock().unwrap() = None;
+    crate::key_bindings::reset_input_state();
+    true
+}
+
+#[cfg(test)]
+mod recording_release_tests {
+    use super::{
+        captured_key_up_after, release_settled, release_wait_step, ReleaseEvent, ReleaseStep,
+    };
+
+    const CMD: u32 = 0x0010_0000;
+
+    /// The whole sequence of one recording: press, held-key repeat, an unrelated key, then the
+    /// releases. The wait settles only at the end, and nothing of the captured chord leaks.
+    #[test]
+    fn the_release_wait_keeps_the_chord_and_settles_only_when_it_is_let_go() {
+        const E: u16 = 0x0E;
+        const J: u16 = 0x26;
+        let captured = Some(E);
+        // Held-key repeat of the captured key: ours, not the app's.
+        assert_eq!(
+            release_wait_step(
+                captured,
+                false,
+                ReleaseEvent::Down {
+                    keycode: E,
+                    autorepeat: true,
+                    flags: CMD
+                }
+            ),
+            ReleaseStep::Swallow
+        );
+        // Another key, pressed fresh: passes through, but must not end the wait.
+        assert_eq!(
+            release_wait_step(
+                captured,
+                false,
+                ReleaseEvent::Down {
+                    keycode: J,
+                    autorepeat: false,
+                    flags: CMD
+                }
+            ),
+            ReleaseStep::PassThrough
+        );
+        // The captured key's release: swallowed, and still not settled while Cmd is held.
+        assert_eq!(
+            release_wait_step(
+                captured,
+                true,
+                ReleaseEvent::Up {
+                    keycode: E,
+                    flags: CMD
+                }
+            ),
+            ReleaseStep::Swallow
+        );
+        assert_eq!(
+            release_wait_step(captured, true, ReleaseEvent::Modifiers { flags: CMD }),
+            ReleaseStep::PassThrough
+        );
+        // Cmd released: now the recording may end.
+        assert_eq!(
+            release_wait_step(captured, true, ReleaseEvent::Modifiers { flags: 0 }),
+            ReleaseStep::Settled
+        );
+        // An unrelated release is the app's.
+        assert_eq!(
+            release_wait_step(
+                captured,
+                true,
+                ReleaseEvent::Up {
+                    keycode: J,
+                    flags: CMD
+                }
+            ),
+            ReleaseStep::PassThrough
+        );
+    }
+
+    /// The other release order: the modifiers go first, so the captured key's own release is the
+    /// last event of the recording and has to settle it (no further flagsChanged is coming).
+    #[test]
+    fn a_modifier_released_first_still_settles_on_the_key_release() {
+        const E: u16 = 0x0E;
+        let captured = Some(E);
+        assert_eq!(
+            release_wait_step(captured, false, ReleaseEvent::Modifiers { flags: 0 }),
+            ReleaseStep::PassThrough
+        );
+        assert_eq!(
+            release_wait_step(
+                captured,
+                true,
+                ReleaseEvent::Up {
+                    keycode: E,
+                    flags: 0
+                }
+            ),
+            ReleaseStep::Settled
+        );
+    }
+
+    #[test]
+    fn a_bare_escape_still_abandons_the_recording() {
+        assert_eq!(
+            release_wait_step(
+                Some(0x0E),
+                false,
+                ReleaseEvent::Down {
+                    keycode: 53,
+                    autorepeat: false,
+                    flags: 0
+                }
+            ),
+            ReleaseStep::Cancel
+        );
+        // Escape while a chord modifier is held is another key: it passes through and the wait
+        // continues, so the engine stays suspended until the captured input is really released.
+        const CTRL: u32 = 0x0004_0000;
+        assert_eq!(
+            release_wait_step(
+                Some(0x0E),
+                false,
+                ReleaseEvent::Down {
+                    keycode: 53,
+                    autorepeat: false,
+                    flags: CTRL
+                }
+            ),
+            ReleaseStep::PassThrough
+        );
+        // A held Escape (a repeat) is not a fresh escape either.
+        assert_eq!(
+            release_wait_step(
+                Some(0x0E),
+                false,
+                ReleaseEvent::Down {
+                    keycode: 53,
+                    autorepeat: true,
+                    flags: 0
+                }
+            ),
+            ReleaseStep::PassThrough
+        );
+        // With no capture there is nothing to release.
+        assert_eq!(
+            release_wait_step(None, false, ReleaseEvent::Modifiers { flags: 0 }),
+            ReleaseStep::PassThrough
+        );
+    }
+
+    #[test]
+    fn the_settle_predicate_ignores_unrelated_state_bits() {
+        assert!(!release_settled(false, 0));
+        assert!(!release_settled(true, CMD));
+        assert!(release_settled(true, 0));
+        assert!(release_settled(true, 0x0001_0000));
+    }
+
+    /// The captured key pressed a *second* time before its modifier is let go. The press is ours and
+    /// swallowed, and the release wait must not still think the key is up: settling on the modifier
+    /// release would leave the key physically held, so the repeats and the release that follow would
+    /// reach the frontmost app as input it never saw pressed.
+    #[test]
+    fn a_second_press_of_the_captured_key_clears_the_release_latch() {
+        const E: u16 = 0x0E;
+        let captured = Some(E);
+        // First press settle: E released while Cmd is held.
+        let up = captured_key_up_after(
+            captured,
+            false,
+            ReleaseEvent::Up {
+                keycode: E,
+                flags: CMD,
+            },
+        );
+        assert!(up);
+        assert_eq!(
+            release_wait_step(
+                captured,
+                up,
+                ReleaseEvent::Up {
+                    keycode: E,
+                    flags: CMD
+                }
+            ),
+            ReleaseStep::Swallow
+        );
+        // E pressed again with Cmd still held: the latch has to clear, and the press is swallowed.
+        let down = ReleaseEvent::Down {
+            keycode: E,
+            autorepeat: false,
+            flags: CMD,
+        };
+        let up = captured_key_up_after(captured, up, down);
+        assert!(
+            !up,
+            "a fresh press of the captured key means it is down again"
+        );
+        assert_eq!(release_wait_step(captured, up, down), ReleaseStep::Swallow);
+        // So releasing Cmd now must NOT settle the recording mid-press.
+        assert_eq!(
+            release_wait_step(captured, up, ReleaseEvent::Modifiers { flags: 0 }),
+            ReleaseStep::PassThrough
+        );
+        // And the held-key repeat is still swallowed.
+        let repeat = ReleaseEvent::Down {
+            keycode: E,
+            autorepeat: true,
+            flags: 0,
+        };
+        let up = captured_key_up_after(captured, up, repeat);
+        assert!(!up);
+        assert_eq!(
+            release_wait_step(captured, up, repeat),
+            ReleaseStep::Swallow
+        );
+        // Letting go of E now settles it, as it should.
+        let release = ReleaseEvent::Up {
+            keycode: E,
+            flags: 0,
+        };
+        let up = captured_key_up_after(captured, up, release);
+        assert!(up);
+        assert_eq!(
+            release_wait_step(captured, up, release),
+            ReleaseStep::Settled
+        );
+    }
+
+    /// The latch follows only the captured key: another key's press and release leave it unchanged.
+    #[test]
+    fn another_key_does_not_move_the_release_latch() {
+        const E: u16 = 0x0E;
+        const J: u16 = 0x26;
+        let down = ReleaseEvent::Down {
+            keycode: J,
+            autorepeat: false,
+            flags: CMD,
+        };
+        let up = ReleaseEvent::Up {
+            keycode: J,
+            flags: CMD,
+        };
+        // Already up: another key must not mark the captured key as down again.
+        assert!(captured_key_up_after(Some(E), true, down));
+        assert!(captured_key_up_after(Some(E), true, up));
+        // Already down: another key must not release it either.
+        assert!(!captured_key_up_after(Some(E), false, down));
+        assert!(!captured_key_up_after(Some(E), false, up));
+    }
 }
 
 #[cfg(test)]

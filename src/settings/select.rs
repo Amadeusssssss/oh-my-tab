@@ -59,6 +59,50 @@ unsafe impl Sync for SettingsSelectItemClass {}
 
 static SETTINGS_SELECT_ITEM_CLASS: OnceLock<SettingsSelectItemClass> = OnceLock::new();
 
+/// Forget one select, closing its popup and dropping every address-keyed entry for it.
+///
+/// A select is registered by its own address in four maps (state, label views, arrow views and item
+/// labels). A panel that owns a select and is about to be released must call this first: the maps
+/// outlive the views, so a stale key makes the next `close_open_settings_selects` send `window` to a
+/// freed address, and a recycled address can pair a new popup with an old label pointer.
+pub(super) unsafe fn forget_settings_select(button: *mut AnyObject) {
+    if button.is_null() {
+        return;
+    }
+    let key = button as usize;
+    let popup = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|state| state.popup);
+    if let Some(popup) = popup.filter(|popup| *popup != 0) {
+        let popup = popup as *mut AnyObject;
+        // The option rows' label views are registered by address too, and they belong to this popup:
+        // drop them while it is still alive, or the maps keep pointers into the freed popup.
+        if let Some(panel) = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|state| state.panel)
+            .filter(|panel| *panel != 0)
+        {
+            settings_select_remove_item_labels(panel as *mut AnyObject);
+        }
+        close_select_popup(popup);
+    }
+    SETTINGS_SELECT_STATES.lock().unwrap().remove(&key);
+    SETTINGS_SELECT_LABEL_VIEWS.lock().unwrap().remove(&key);
+    SETTINGS_SELECT_ARROW_VIEWS.lock().unwrap().remove(&key);
+    if ACTIVE_SETTINGS_SELECT
+        .lock()
+        .unwrap()
+        .is_some_and(|active| active == key)
+    {
+        *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
+        unsafe { remove_select_monitor() };
+    }
+}
+
 /// Clear runtime state before the settings window and its controls are destroyed.
 pub(super) fn clear_settings_select_registry() {
     // Close any popup windows first: once the registry is cleared they can never be found again and

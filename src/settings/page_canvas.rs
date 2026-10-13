@@ -226,6 +226,46 @@ unsafe fn views_added_since(view: *mut AnyObject, mark: usize) -> Vec<*mut AnyOb
     (mark..count).map(|index| subview_at(view, index)).collect()
 }
 
+/// A row's live box height: its build-time height adjusted by however much its owner changed the
+/// row's consumption through `set_row_consume`.
+///
+/// Every caller of `set_row_consume` registers its row with `next_block`, where consumption *is* the
+/// box height, so the consumption delta is the height delta. A row nobody resized is unaffected.
+/// The layout and the card bottoms already follow the live consumption, so this is the height the
+/// card-coverage check has to measure.
+#[cfg(debug_assertions)]
+fn live_row_height(row: &Row, live_consume: Option<f64>) -> f64 {
+    let consume = live_consume.unwrap_or(row.consume);
+    (row.height + (consume - row.consume)).max(0.0)
+}
+
+/// Whether a card whose bottom edge sits at `bottom_rel` contains a row box that starts at `origin`
+/// and is `height` tall.
+///
+/// A row's box may reach the section cursor, which sits `card_header_gap` above the card's top edge,
+/// so the limit is the row origin plus that gap; the row's bottom must stay inside the card.
+#[cfg(debug_assertions)]
+fn card_covers_row(origin: f64, height: f64, top_limit: f64, bottom_rel: f64) -> bool {
+    origin + height <= top_limit && origin >= bottom_rel - 0.5
+}
+
+/// The row's height as the card-coverage check must measure it: the live box, derived from the
+/// consumption the layout actually used. Returns `None` when the row sits inside the card.
+#[cfg(debug_assertions)]
+fn card_coverage_gap(
+    row: &Row,
+    live_consume: Option<f64>,
+    origin: f64,
+    top_limit: f64,
+    bottom_rel: f64,
+) -> Option<f64> {
+    let height = live_row_height(row, live_consume);
+    if card_covers_row(origin, height, top_limit, bottom_rel) {
+        return None;
+    }
+    Some(origin + height)
+}
+
 impl PageCanvas {
     /// An unbound canvas (before the settings window is built).
     pub(super) const fn empty() -> Self {
@@ -765,18 +805,26 @@ impl PageCanvas {
                     let Some(Some(origin)) = relative.origins.get(row_index) else {
                         continue;
                     };
-                    let height = self.rows[row_index].height;
-                    // A row's box may reach the section cursor, which sits `card_header_gap` above
-                    // the card's top edge; its bottom must stay inside the card.
+                    // The row's *live* box, not the build-time one: a block whose owner changed its
+                    // height through `set_row_consume` (the Mouse table, the About host, the key
+                    // bindings list) is laid out from the live consume, so measuring the stale
+                    // build-time height would fail this check on a list that shrank below its
+                    // provisional height.
                     let top_limit = top_rel + layout.card_header_gap + 0.5;
-                    if !(origin + height <= top_limit && *origin >= bottom_rel - 0.5) {
+                    let coverage = card_coverage_gap(
+                        &self.rows[row_index],
+                        row_consumes.get(row_index).copied(),
+                        *origin,
+                        top_limit,
+                        bottom_rel,
+                    );
+                    if let Some(row_top) = coverage {
                         log_info!(
-                            "[settings] card {index} does not cover row {row_index}: card=[{bottom_rel:.1},{top_rel:.1}] row=[{origin:.1},{:.1}]",
-                            origin + height
+                            "[settings] card {index} does not cover row {row_index}: card=[{bottom_rel:.1},{top_rel:.1}] row=[{origin:.1},{row_top:.1}]"
                         );
                     }
                     debug_assert!(
-                        origin + height <= top_limit && *origin >= bottom_rel - 0.5,
+                        coverage.is_none(),
                         "card {index} does not cover row {row_index}"
                     );
                 }
@@ -1122,5 +1170,101 @@ mod tests {
         assert_eq!(hidden.origins[0], Some(-step));
         assert_eq!(hidden.origins[1], Some(-2.0 * step));
         assert_eq!(hidden.origins[2], None);
+    }
+
+    /// A block row: `next_block` consumes exactly the height it is given.
+    #[cfg(debug_assertions)]
+    fn block(height: f64) -> Row {
+        Row {
+            views: Vec::new(),
+            consume: height,
+            height,
+            group: None,
+            section: 0,
+        }
+    }
+
+    /// A block the page declares provisionally and its owner then shrinks must still sit inside its
+    /// card: the check has to measure the live consumption, not the build-time height.
+    ///
+    /// This is the 2026-10-13 crash: the key bindings page declared a 200pt block, a one-binding
+    /// list shrank it to 56pt through `set_row_consume`, and the card-coverage assertion compared
+    /// the stale 200pt height against the shrunk geometry and panicked while opening settings.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_shrunk_block_still_sits_inside_its_card() {
+        let layout = SettingsLayout::new(400.0);
+        let master = layout.row_gap + layout.described_row_h;
+        let provisional = 200.0;
+        let shrunk = 40.0 + 2.0 * 8.0;
+        let rows = [
+            row(layout.described_row_h, None),
+            block(provisional),
+            // The block is the card's last row, so the card closes on it.
+        ];
+        let consumes = [master, shrunk];
+        let walk = RelativeLayout::of_with(&rows, &consumes, &[], layout, 1, &[]);
+        let origin = walk.origins[1].expect("the block is visible");
+        let bottom_rel = origin - layout.card_bottom_inset;
+        // The card's top edge, plus the gap a row's box may reach above it.
+        let top_limit = walk.section_rels[0] + 0.5;
+
+        // Measuring the stale build-time height is what used to trip the check.
+        assert_eq!(
+            card_coverage_gap(
+                &rows[1],
+                Some(rows[1].consume),
+                origin,
+                top_limit,
+                bottom_rel
+            ),
+            Some(origin + provisional),
+            "the stale build-time height must be the failing one, or this test proves nothing"
+        );
+        assert_eq!(
+            card_coverage_gap(
+                &rows[1],
+                consumes.get(1).copied(),
+                origin,
+                top_limit,
+                bottom_rel
+            ),
+            None,
+            "the shrunk block must sit inside its card"
+        );
+    }
+
+    /// An empty list collapses the block to nothing; the card must still cover it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_empty_block_still_sits_inside_its_card() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [block(200.0)];
+        let consumes = [0.0];
+        let walk = RelativeLayout::of_with(&rows, &consumes, &[], layout, 1, &[]);
+        let origin = walk.origins[0].expect("the block is visible");
+        let bottom_rel = origin - layout.card_bottom_inset;
+        assert_eq!(
+            card_coverage_gap(&rows[0], consumes.first().copied(), origin, 0.5, bottom_rel),
+            None
+        );
+    }
+
+    /// A row nobody resized keeps its build-time height even when a sibling is resized.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn live_row_height_leaves_an_unresized_row_alone() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [row(layout.described_row_h, None), block(200.0)];
+        let consumes = [layout.row_gap + layout.described_row_h, 120.0];
+        assert_eq!(
+            live_row_height(&rows[0], consumes.first().copied()),
+            layout.described_row_h
+        );
+        assert_eq!(
+            live_row_height(&rows[1], consumes.get(1).copied()),
+            120.0,
+            "a grown block measures its live height"
+        );
     }
 }

@@ -11,12 +11,6 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
 use objc2_foundation::NSRect;
 
-use crate::event_monitor::GlobalEvent;
-use crate::event_tap::{
-    self, tap_location, tap_options, tap_placement, CFRunLoopGetCurrent, CGEventGetFlags,
-    CGEventGetIntegerValueField, CGEventMask, CGEventRef, CGEventTapProxy, CGEventType,
-    K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
-};
 use crate::ffi::{
     kCFBooleanFalse, kCFBooleanTrue, AXError, AXUIElementCopyActionNames,
     AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementPerformAction,
@@ -29,17 +23,9 @@ use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::thread;
 use std::time::Instant;
 
 // See CGEventTypes.h; keycodes are from Carbon HIToolbox Events.h.
-use crate::event_tap::keyboard::{
-    EVENT_KEY_DOWN as K_CG_EVENT_KEY_DOWN, EVENT_KEY_UP as K_CG_EVENT_KEY_UP,
-    FIELD_AUTOREPEAT as K_CG_KEYBOARD_EVENT_AUTOREPEAT,
-    FIELD_KEYCODE as K_CG_KEYBOARD_EVENT_KEYCODE, FLAG_COMMAND as K_FLAG_COMMAND,
-    FLAG_CONTROL as K_FLAG_CONTROL, FLAG_OPTION as K_FLAG_OPTION, FLAG_SHIFT as K_FLAG_SHIFT,
-    VK_DOWN as K_VK_DOWN, VK_LEFT as K_VK_LEFT, VK_RIGHT as K_VK_RIGHT, VK_UP as K_VK_UP,
-};
 
 const K_AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
 const K_AX_POSITION: &str = "AXPosition";
@@ -78,29 +64,6 @@ pub(crate) enum Direction {
     Right = 1,
     Up = 2,
     Down = 3,
-}
-
-impl Direction {
-    /// Rebuild a direction from the bridge integer (unknown values are dropped).
-    pub(crate) fn from_isize(v: isize) -> Option<Self> {
-        match v {
-            0 => Some(Self::Left),
-            1 => Some(Self::Right),
-            2 => Some(Self::Up),
-            3 => Some(Self::Down),
-            _ => None,
-        }
-    }
-
-    fn from_keycode(code: u16) -> Option<Self> {
-        match code {
-            K_VK_LEFT => Some(Self::Left),
-            K_VK_RIGHT => Some(Self::Right),
-            K_VK_UP => Some(Self::Up),
-            K_VK_DOWN => Some(Self::Down),
-            _ => None,
-        }
-    }
 }
 
 /// A rectangle in the AX global coordinate space (primary-display top-left origin, y down,
@@ -532,36 +495,6 @@ pub(crate) fn display_move_target(
         SnapState::Normal | SnapState::Minimized => translated_frame(frame, from, to),
     };
     Some((target, target_frame))
-}
-
-fn direction_enabled(dir: Direction) -> bool {
-    crate::config::CONFIG
-        .read()
-        .map(|c| {
-            c.window_control.enabled
-                && match dir {
-                    Direction::Up => c.window_control.up,
-                    Direction::Down => c.window_control.down,
-                    Direction::Left => c.window_control.left,
-                    Direction::Right => c.window_control.right,
-                }
-        })
-        .unwrap_or(false)
-}
-
-fn display_move_enabled(dir: Direction) -> bool {
-    crate::config::CONFIG
-        .read()
-        .map(|c| {
-            c.window_control.enabled
-                && match dir {
-                    Direction::Up => c.window_control.display_up,
-                    Direction::Down => c.window_control.display_down,
-                    Direction::Left => c.window_control.display_left,
-                    Direction::Right => c.window_control.display_right,
-                }
-        })
-        .unwrap_or(false)
 }
 
 /// A deferred cross-display frame verification. AppKit/the target app may resize asynchronously
@@ -1099,14 +1032,8 @@ pub(crate) fn on_snap_verify(arg: *mut c_void) {
 
 /// Main thread: run one window-control step (a direction delivered by the bridge).
 pub(crate) fn apply_direction(dir: Direction) {
-    // The event may land on the main thread after the feature was switched off; re-check.
-    if !direction_enabled(dir) {
-        return;
-    }
     let (app_name, pid) = crate::ffi::frontmost_app_info();
-    // No frontmost app, or the frontmost app is ourselves (our settings text fields keep the
-    // move-by-word semantics of Option+arrows).
-    if pid <= 0 || pid == std::process::id() as i32 {
+    if pid <= 0 {
         return;
     }
     unsafe {
@@ -1193,11 +1120,8 @@ pub(crate) fn apply_direction(dir: Direction) {
 /// Main thread: move the frontmost window to an adjacent display, keeping maximized windows
 /// maximized on the destination display.
 pub(crate) fn apply_display_move(dir: Direction) {
-    if !display_move_enabled(dir) {
-        return;
-    }
     let (app_name, pid) = crate::ffi::frontmost_app_info();
-    if pid <= 0 || pid == std::process::id() as i32 {
+    if pid <= 0 {
         return;
     }
     unsafe {
@@ -1728,148 +1652,240 @@ fn cocoa_to_ax(r: NSRect, primary_top: f64) -> AxRect {
     }
 }
 
-// Same shape as mouse/event_tap.rs: dedicated thread + RunLoop reference + stop flag.
+/// A direct, idempotent window target: what the binding picker's window actions ask for, as
+/// opposed to the arrow keys, which step through states. Each target maps to exactly one rect on
+/// one screen, so pressing the same binding twice leaves the window where it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectTarget {
+    Maximize,
+    Minimize,
+    Center,
+    HalfTop,
+    HalfBottom,
+    HalfLeft,
+    HalfRight,
+    QuarterTopLeft,
+    QuarterTopRight,
+    QuarterBottomLeft,
+    QuarterBottomRight,
+}
 
-static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::new();
-static WC_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
+impl DirectTarget {
+    /// The plan for one screen's visible area and the window's current frame (pure; unit-tested).
+    pub(crate) fn plan(self, visible: AxRect, current: AxRect) -> Plan {
+        let f = snap_frames(visible);
+        match self {
+            Self::Maximize => Plan::Maximize(f.max),
+            Self::Minimize => Plan::Minimize,
+            // Centering keeps the window's size: a target must not silently resize a window the
+            // user only asked to move.
+            Self::Center => Plan::Move(centered_frame(current, visible)),
+            Self::HalfTop => Plan::Move(f.top),
+            Self::HalfBottom => Plan::Move(f.bottom),
+            Self::HalfLeft => Plan::Move(f.left),
+            Self::HalfRight => Plan::Move(f.right),
+            Self::QuarterTopLeft => Plan::Move(f.top_left),
+            Self::QuarterTopRight => Plan::Move(f.top_right),
+            Self::QuarterBottomLeft => Plan::Move(f.bottom_left),
+            Self::QuarterBottomRight => Plan::Move(f.bottom_right),
+        }
+    }
+}
 
-/// The tap callback: handles Option+arrows and Option+Shift+arrow keys. When enabled it
-/// swallows matching keyDown/keyUp and forwards non-autorepeat keyDowns to the main thread;
-/// when disabled everything passes through (a disabled feature returns the combo to the
-/// system). Also passes through when we are the frontmost app, keeping move-by-word intact in
-/// our settings text fields.
-unsafe extern "C" fn window_control_tap_callback(
-    _proxy: CGEventTapProxy,
-    event_type: CGEventType,
-    event: CGEventRef,
-    _user_info: *mut c_void,
-) -> CGEventRef {
-    if crate::input_monitor::handle_disabled_event(event_type, "winctl", TAP_CONTROL.is_stopping())
-    {
-        return event;
+/// Center a window in the visible area without changing its size (pure; unit-tested).
+pub(crate) fn centered_frame(current: AxRect, visible: AxRect) -> AxRect {
+    AxRect {
+        x: visible.x + (visible.w - current.w) / 2.0,
+        y: visible.y + (visible.h - current.h) / 2.0,
+        w: current.w,
+        h: current.h,
     }
-    if !crate::input_monitor::taps_allowed() {
-        return event;
+}
+
+/// Main thread: run one direct window target on the frontmost window. A window already in the
+/// target state is left exactly as it is, so holding or repeating the binding never flickers.
+pub(crate) fn apply_direct(target: DirectTarget) {
+    let (app_name, pid) = crate::ffi::frontmost_app_info();
+    if pid <= 0 {
+        return;
     }
-    if event_type != K_CG_EVENT_KEY_DOWN && event_type != K_CG_EVENT_KEY_UP {
-        return event;
-    }
-    let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
-    let Some(dir) = Direction::from_keycode(keycode) else {
-        return event;
-    };
-    let flags = CGEventGetFlags(event);
-    if flags & K_FLAG_OPTION == 0 || flags & (K_FLAG_COMMAND | K_FLAG_CONTROL) != 0 {
-        return event;
-    }
-    let display_move = flags & K_FLAG_SHIFT != 0;
-    // Our own synthesized combos (mouse Key Press mappings post at HID level and loop back
-    // into session taps) must pass through, or a side button mapped to Option+arrow gets
-    // hijacked here.
-    if CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA) == SYNTHETIC_MARKER {
-        return event;
-    }
-    let enabled = if display_move {
-        display_move_enabled(dir)
-    } else {
-        direction_enabled(dir)
-    };
-    if !enabled {
-        return event;
-    }
-    let (_name, pid) = crate::ffi::frontmost_app_info();
-    if pid == std::process::id() as i32 {
-        return event;
-    }
-    if event_type == K_CG_EVENT_KEY_DOWN {
-        // Ignore system autorepeat: holding the key would ping-pong between states; only
-        // physical presses act.
-        let autorepeat = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT);
-        if autorepeat == 0 {
-            if display_move {
-                log_debug!("[winctl] keyDown Option+Shift+{:?}", dir);
-                crate::enqueue_global_event(GlobalEvent::WindowDisplayMove(dir));
-            } else {
-                log_debug!("[winctl] keyDown Option+{:?}", dir);
-                crate::enqueue_global_event(GlobalEvent::WindowControl(dir));
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return;
+        }
+        // Same 300ms budget as the arrow path: an unresponsive app must not stall the main thread.
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let Some(win) = win else {
+            log_debug!("[winctl] no focused window for direct target {:?}", target);
+            return;
+        };
+        if let Some(subrole) = copy_string(win, K_AX_SUBROLE) {
+            if subrole == K_AX_SUBROLE_FULL_SCREEN {
+                log_debug!("[winctl] skip native fullscreen direct target {:?}", target);
+                CFRelease(win);
+                return;
             }
         }
-    }
-    // Swallow matching keyDown/keyUp (autorepeat included); apps never see the combo.
-    std::ptr::null_mut()
-}
-
-/// Enable window control at runtime (shared by the settings hot-switch and the startup path).
-/// Idempotent.
-pub(crate) fn start() {
-    if !crate::input_monitor::taps_allowed() {
-        return;
-    }
-    let mut guard = WC_THREAD.lock().unwrap();
-    if guard.as_ref().is_some_and(|h| !h.is_finished()) {
-        return;
-    }
-    if let Some(finished) = guard.take() {
-        let _ = finished.join();
-    }
-    TAP_CONTROL.prepare_start();
-    *guard = Some(spawn_tap_thread());
-    log_info!("Window control enabled.");
-}
-
-/// Disable window control at runtime (settings hot-switch). Idempotent.
-pub(crate) fn stop() {
-    TAP_CONTROL.stop();
-    let handle = WC_THREAD.lock().unwrap().take();
-    if let Some(h) = handle {
-        let _ = h.join();
-    }
-    log_info!("Window control disabled.");
-}
-
-fn spawn_tap_thread() -> thread::JoinHandle<()> {
-    // Listen mask: keyDown + keyUp.
-    let mask: CGEventMask = (1u64 << K_CG_EVENT_KEY_DOWN) | (1u64 << K_CG_EVENT_KEY_UP);
-    thread::spawn(move || unsafe {
-        crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
-        // Session-level tap: same layer as the switcher, sees real hardware keys; DEFAULT_TAP
-        // is required to swallow events.
-        let created = event_tap::create_tap_with_retry(
-            tap_location::SESSION_EVENT_TAP,
-            tap_placement::HEAD_INSERT,
-            tap_options::DEFAULT_TAP,
-            mask,
-            Some(window_control_tap_callback),
-            std::ptr::null_mut(),
-            "winctl",
-            Some(TAP_CONTROL.cancel_flag()),
-        );
-        let created = match created {
-            Some(created) => created,
-            None => return,
+        let cgwid = ax_window_cgwid(win);
+        // A direct target is an absolute statement: any pending animation for this window is
+        // cancelled rather than continued toward the old goal.
+        cancel_pending_display_move(pid, cgwid);
+        cancel_pending_snap(pid, cgwid);
+        let Some(frame) = read_frame(win) else {
+            log_debug!("[winctl] failed to read window frame");
+            CFRelease(win);
+            return;
         };
-        let rl = CFRunLoopGetCurrent();
-        TAP_CONTROL.register(created.tap, rl);
-        let watchdog = event_tap::start_tap_watchdog(created.tap, TAP_CONTROL.cancel_flag());
-        if !TAP_CONTROL.cancel_flag().load(Ordering::SeqCst) && crate::input_monitor::taps_allowed()
-        {
-            log_debug!("Window control event tap started.");
-            event_tap::CFRunLoopRun();
+        let screens = screens_in_ax_space();
+        if screens.is_empty() {
+            CFRelease(win);
+            return;
         }
-        event_tap::stop_tap_watchdog(watchdog);
-        event_tap::CGEventTapEnable(created.tap, false);
-        TAP_CONTROL.clear(created.tap);
-        event_tap::teardown_event_tap(rl, created);
-    })
+        let cur_screen = screen_index_for(frame, &screens);
+        let visible = screens[cur_screen].visible;
+        let minimized = read_bool(win, K_AX_MINIMIZED).unwrap_or(false);
+        let plan = target.plan(visible, frame);
+        let desired = match plan {
+            Plan::Move(r) | Plan::Maximize(r) => infer_state(r, visible),
+            Plan::Minimize => SnapState::Minimized,
+            Plan::Nothing => SnapState::Normal,
+        };
+        let already = match plan {
+            Plan::Minimize => minimized,
+            Plan::Move(r) => rect_close(frame, r),
+            // "Maximized" is a property of the frame, and a minimized window keeps its old frame:
+            // a minimized window must still be brought back by a maximize binding.
+            Plan::Maximize(r) => !minimized && fills_visible(frame, r),
+            Plan::Nothing => true,
+        };
+        log_debug!(
+            "[winctl] direct {:?} app={:?} pid={} cgwid={:?} frame={:?} plan={:?} already={}",
+            target,
+            app_name,
+            pid,
+            cgwid,
+            frame,
+            plan,
+            already
+        );
+        if !already {
+            match plan {
+                Plan::Move(r) => finish_snap(
+                    win,
+                    pid,
+                    r,
+                    false,
+                    desired,
+                    set_frame_with(win, r, snap_accepts(r, false)),
+                ),
+                Plan::Maximize(r) => finish_snap(
+                    win,
+                    pid,
+                    r,
+                    true,
+                    desired,
+                    set_frame_with(win, r, snap_accepts(r, true)),
+                ),
+                Plan::Minimize => set_minimized(win, true),
+                Plan::Nothing => {}
+            }
+        }
+        CFRelease(win);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        display_move_staging_frame, display_move_target, fills_visible, infer_state,
-        neighbor_screen, plan, rect_close_with, snap_follow_up, snap_frames, AxRect, Direction,
-        Plan, ScreenGeometry, SnapFollowUp, SnapState, SnapWrite, SNAP_EPSILON,
+        centered_frame, display_move_staging_frame, display_move_target, fills_visible,
+        infer_state, neighbor_screen, plan, rect_close_with, snap_follow_up, snap_frames, AxRect,
+        DirectTarget, Direction, Plan, ScreenGeometry, SnapFollowUp, SnapState, SnapWrite,
+        SNAP_EPSILON,
     };
+
+    /// The direct targets are absolute: each one maps to exactly one rect, so pressing the binding
+    /// twice leaves the window where it is (the runtime skips a write when the frame already matches).
+    #[test]
+    fn direct_targets_map_to_fixed_rects() {
+        let v = rect(0.0, 0.0, 1000.0, 800.0);
+        let current = rect(100.0, 100.0, 300.0, 200.0);
+        let expect = |p: Plan| p;
+        assert_eq!(
+            DirectTarget::Maximize.plan(v, current),
+            expect(Plan::Maximize(rect(0.0, 0.0, 1000.0, 800.0)))
+        );
+        assert_eq!(DirectTarget::Minimize.plan(v, current), Plan::Minimize);
+        assert_eq!(
+            DirectTarget::HalfLeft.plan(v, current),
+            Plan::Move(rect(0.0, 0.0, 500.0, 800.0))
+        );
+        assert_eq!(
+            DirectTarget::HalfTop.plan(v, current),
+            Plan::Move(rect(0.0, 0.0, 1000.0, 400.0))
+        );
+        assert_eq!(
+            DirectTarget::HalfRight.plan(v, current),
+            Plan::Move(rect(500.0, 0.0, 500.0, 800.0))
+        );
+        assert_eq!(
+            DirectTarget::HalfBottom.plan(v, current),
+            Plan::Move(rect(0.0, 400.0, 1000.0, 400.0))
+        );
+        assert_eq!(
+            DirectTarget::QuarterTopRight.plan(v, current),
+            Plan::Move(rect(500.0, 0.0, 500.0, 400.0))
+        );
+        assert_eq!(
+            DirectTarget::QuarterBottomLeft.plan(v, current),
+            Plan::Move(rect(0.0, 400.0, 500.0, 400.0))
+        );
+    }
+
+    /// Centering moves a window without resizing it, and is idempotent.
+    #[test]
+    fn centering_keeps_the_size_and_is_idempotent() {
+        let v = rect(0.0, 0.0, 1000.0, 800.0);
+        let current = rect(10.0, 10.0, 300.0, 200.0);
+        let centered = centered_frame(current, v);
+        assert_eq!(centered, rect(350.0, 300.0, 300.0, 200.0));
+        assert_eq!(centered_frame(centered, v), centered);
+        // A window larger than the work area keeps its size too: only the position changes.
+        let huge = rect(0.0, 0.0, 1200.0, 900.0);
+        let centered_huge = centered_frame(huge, v);
+        assert_eq!(centered_huge.w, 1200.0);
+        assert_eq!(centered_huge.h, 900.0);
+        assert_eq!(DirectTarget::Center.plan(v, current), Plan::Move(centered));
+    }
+
+    /// Every direct target that is not "minimize" lands the window in the state its own rect
+    /// implies, which is what the deferred verification reports while an animation is pending.
+    #[test]
+    fn direct_target_rects_infer_back_to_their_own_state() {
+        let v = rect(0.0, 0.0, 1000.0, 800.0);
+        let current = rect(10.0, 10.0, 300.0, 200.0);
+        let cases = [
+            (DirectTarget::Maximize, SnapState::Maximized),
+            (DirectTarget::HalfLeft, SnapState::LeftHalf),
+            (DirectTarget::HalfRight, SnapState::RightHalf),
+            (DirectTarget::HalfTop, SnapState::TopHalf),
+            (DirectTarget::HalfBottom, SnapState::BottomHalf),
+            (DirectTarget::QuarterTopLeft, SnapState::TopLeft),
+            (DirectTarget::QuarterTopRight, SnapState::TopRight),
+            (DirectTarget::QuarterBottomLeft, SnapState::BottomLeft),
+            (DirectTarget::QuarterBottomRight, SnapState::BottomRight),
+        ];
+        for (target, state) in cases {
+            match target.plan(v, current) {
+                Plan::Move(r) | Plan::Maximize(r) => {
+                    assert_eq!(infer_state(r, v), state, "{target:?}");
+                }
+                other => panic!("{target:?} planned {other:?}"),
+            }
+        }
+    }
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> AxRect {
         AxRect { x, y, w, h }

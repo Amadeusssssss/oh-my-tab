@@ -32,6 +32,9 @@ brings it back. Remove an entry when its work lands, and say so in the commit or
 | 22 | The picker header's OTHER static inks (search field, corner close button, filter pills, footer legends) are not repainted when the theme changes while the picker window is reused | clipboard gear/drag review, R1 (finding 6) | LOW | the gear and the drag handle were fixed in `apply_theme` because that change added them; the rest predate it and repainting the whole header is its own change (the header is built once and only the footer and the clear actions are rebuilt today) | next change to the picker header's styling, or the first report of a stale header colour after a light/dark switch |
 | 23 | `scripts/e2e/panel-edge.sh` fails on this machine (checks 1–3 are screenshot-based outline/shadow/material-blur measurements), and it fails the same way at HEAD, so the default A2 aggregate currently reports one FAIL that is not attributable to the change under test | clipboard gear/drag session, 2026-10-12 | MEDIUM (gate) | the failure is environmental and predates this work: verified in a clean `git worktree` of HEAD, where the same three checks fail with identical output while every other scenario passes. Diagnosing it needs a display/backdrop setup the current session does not control (the checks compare a white/gray backdrop capture), which is its own task | next time the panel outline/elevation or the backdrop capture path changes, or when a machine with a known-good capture setup can run it |
 | 24 | The storage notice's action-per-state rule, the purge transaction's completion boundary, and the purge's conservative verification have no A-tier assertion | clipboard blocked-notice task, design rounds 1–6 + implementation, review rounds 1–3, 2026-10-12 | MEDIUM (coverage gap) | the user explicitly required no new tests in this round, and the reviewer confirmed that exception is the user's to give (not the reviewer's) — the fixes themselves were not deferred. What exists instead: the classifier is pure (`notifications::storage_action_key`), each surface reports the action it ACTUALLY applied in `--e2e-state`'s `clipboard_notice` (`grant`/`clear`/`hidden`/`absent`/`unset`), and the existing smokes only cover the `Unavailable` path's button title/selector (`--smoke-clipboard`) and the About row's repaint in `Ready` | next change to `clipboard/notifications.rs`, the purge transaction (`clipboard/storage.rs`, `clipboard/persist.rs`), the settings banner or the picker empty state — or the first report of a wrong or dead action. Cheapest assertions: (a) pure — `ClearAndRestart` for the four blocked reasons, `GrantKeychain` only for `Unavailable`, `None` for `PurgePending`/`Ready`/`Uninitialized`; (b) smoke — park a blocked state, then assert the panel button's title+selector and the banner's `clipboard_notice` value; (c) completion boundary — capture a load outcome with the generation a purge's first bump produced, then assert `apply_load_outcome` drops it after the boundary advanced the generation (the `apply_stale_load_for_tests` shape already exists); (d) purge verification — a surviving regular file and an unreadable cache entry each keep the transaction incomplete, while a confirmed non-file object (the test-mode `history` subdirectory) does not; (e) the sealed-cache probe — an unreadable entry or a symlink answers "unknown" (no key creation, and no auto-isolation: `Blocked`, not the permanently-lost-key path) |
+| 25 | Key bindings, phase 2: editing an existing row's chord in place (改键), parameter-bearing actions (open an app / a folder / a URL / a Settings pane), desktop switching, window restore, the press/release two-phase switcher action, and grouping the action picker (the self-drawn popup has no separator items) | key-bindings feature, design rounds 1–3 + implementation review rounds 1–3, 2026-10-12 | — (scope) | the user froze phase 1 to parameter-free actions and deferred 改键; deleting a default row and adding a new one already reaches the same result, and Restore Defaults undoes it. Desktop switching needs a working mechanism (the synthetic Dock swipe is a probe that does not move the Space on macOS 26) and restore needs per-window pre-snap state that nothing persists today | next change to `src/key_bindings/`, or when the user asks for phase 2 |
+| 26 | No A2 scenario drives a user binding's record → confirm → execute path end to end (the switcher and clipboard hotkeys have their own scenarios, but a binding recorded in the settings UI does not) | key-bindings implementation, review round 3, 2026-10-12 | MEDIUM (coverage gap) | such a scenario must inject a global chord through the system event stream and therefore steal focus, so it needs the user's consent every run; the recorder's decisions are asserted in A1 instead (`release_wait_step`'s full sequence, `draft_rejection`, the queue's trigger re-authorization, the migration and fallback matrix), and `scripts/e2e/settings-layout.sh` asserts the page's geometry, the sidebar entry and the published-state invariants with counter-examples for a snapshot missing those fields. Explicitly unverified in a GUI: that a cancelled recording restores the add row, that a draft is cleared by a window close or a permission revocation, and that leaving the page cancels — the state behind each is asserted in A1 (`has_draft`/`pending_binding_recording`, the unconditional main-thread cleanup), but no scenario drives the interaction | next change to the recorder or the add row, or the first report of a recorded binding not firing, a stuck add row, or a stale draft |
+| 27 | `scripts/e2e/settings-layout.sh` has not been run since the Key Bindings page was merged into one flat list, so its geometry assertions (one card covers its row, the card bottom follows the live row height) and the migrated-state invariant (`key_bindings_live: 5, key_bindings_entries: 13, key_bindings_enabled: true` for a mixed legacy config) are verified only in part | key-bindings implementation, review round 12, 2026-10-12 | MEDIUM (coverage gap) | the scenario drives the real window and steals focus, so it needs the user's consent per run. What *is* verified: `binding_state_problem`'s counter-examples pass standalone (including the `live=5 / entries=13 / enabled=true` snapshot that the corrected mixed-group migration now produces, checked on the user's real config — `[key_bindings] published 5 live binding(s) from 13 entr(ies)`, down from 13 before the fix), the card-coverage debug assertion is exercised by all seven settings pages plus the 1/18/0-binding variants under `scripts/dev-restart.sh` with zero coverage or panic lines, and the `live_row_height` regression is pinned by A1 tests | next change to the Key Bindings page layout or `page_canvas.rs`, or the next A2 run with focus consent |
 
 ## Closed in the same session (do not reopen)
 
@@ -76,6 +79,29 @@ so a later reader does not re-derive them. The fixes are in the tree, with their
   Trigger: the change that adds that channel (then sample the frontmost pid on the main thread and carry it
   back as plain data), or any move of the terminal into product behaviour.
 
+- `setEnabled:` alone leaves a **layer-filled `SettingsButton` looking active**: the styled button
+  draws its own layer fill, which `setEnabled:` does not dim, so a disabled primary button keeps its
+  full accent and reads as pressable (hit-testing is still correct; only the appearance lies). Found
+  while building the Key Bindings add panel's OK button, which now dims itself at half opacity
+  locally (`apply_panel_button_dim`), matching the style doc's disabled rule (50% opacity on the
+  control's fill). Deferred because the honest fix belongs in
+  `SettingsRow::set_view_enabled_with_tooltip` — one branch for styled buttons — and that changes the
+  appearance of every disabled button in the app, which is its own visual review rather than
+  something to smuggle into this change. Trigger: the next change to `set_view_enabled_with_tooltip`
+  or `SettingsButtonRole`, a visual pass over disabled controls, or the first report (screenshot) of a
+  disabled button that looks enabled.
+
+- The **styled-button disabled appearance** is only fixed locally. `setEnabled:` does not dim a
+  layer-filled `SettingsButton`, so a disabled button keeps its full fill and reads as pressable
+  (hit-testing is correct; only the appearance lies). The Key Bindings add panel dims its own two
+  buttons at half opacity (`apply_panel_button_dim`, the style doc's §10 rule), but every other
+  disabled styled button in the app still shows its normal fill. A general fix belongs in
+  `SettingsRow::set_view_enabled_with_tooltip` (one branch for styled buttons) and changes the
+  appearance of every disabled button, which is its own visual pass rather than something to fold
+  into a layout change. Trigger: the next change to `set_view_enabled_with_tooltip` or
+  `SettingsButtonRole`, a visual review of disabled controls, or a report (screenshot) of a disabled
+  button that looks enabled.
+
 - Recovery-coverage evidence for the cross-desktop raise (raised in review round 2 as MEDIUM: deleting the
   pre-action wait also shortened the recovery coverage). Three states still lack a counter-example: a first
   AX raise that matches no element, a target that only arrives late, and a cross-desktop *minimized* restore.
@@ -107,3 +133,30 @@ so a later reader does not re-derive them. The fixes are in the tree, with their
   old storage aside as `*.failed-<ts>` -- was performed on this machine. No backlog work is pending here;
   what remains unverified is a *release* install that predates Developer ID signing, which would need the
   same one-time reset (the release channel does sign with Developer ID today).
+
+- **The whole-row selection overlay must stay below the row's controls** (2026-10-13). Moving the
+  binding row onto the shared builders put the overlay on top (`addSubview:` appends, and the end is
+  the top), so the transparent overlay swallowed the switch's clicks and clicking the switch selected
+  the row instead. Fixed with `addSubview:positioned:relativeTo:` at index -1, and
+  `debug_validate_row_overlay_is_below_controls` (A1, via `--smoke-settings-layout`) asserts the
+  ordering; falsified by restoring the plain `addSubview:` (reports overlay index 5 vs switch 4).
+  Note for the next reader: a `hitTest:`-based check was tried first and was **not** usable from a
+  smoke runner -- it returns an unrelated view depending on window coordinate state. Subview order is
+  the deterministic fact.
+
+- **The key-bindings footer's segment gating has one A1 assertion, not an A2 one** (2026-10-13).
+  `--smoke-settings-layout` drives `update_binding_controls_enabled` and asserts both segment flags
+  against the page state (falsified: removing the `-` selection gate makes it report
+  `remove=true (want false)`). What is *not* asserted is the end-to-end route: an A2 scenario that
+  selects a row, clicks the `-` cell and watches `entries` fall. That was verified by hand this round
+  (`selected row 1` -> `removing selected row 1` -> `2 entr(ies)`), and `+` -> `binding add panel
+  opened`, but tier-B evidence is not an assertion. Deferred as unrun coverage. Trigger: the next
+  change to the footer control, or `scripts/e2e/settings-layout.sh` gaining a key-bindings section.
+
+- **`NSControl::setEnabled:` on a segmented control deserves a comment, not a rule** (2026-10-13).
+  The first cut of the joined footer control ordered its whole-control `setEnabled:` after the
+  per-segment calls, on the theory that `NSControl`'s setter resets every segment. Measured against
+  the real control (falsified both orders through `--smoke-settings-layout`): it does **not** -- both
+  orders produce identical per-segment flags, so the original ordering was never a bug. The comments
+  now record the measurement instead of the theory. No further work; recorded so the wrong theory is
+  not "fixed" again from the AppKit header alone.

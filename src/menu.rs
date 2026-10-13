@@ -28,7 +28,7 @@ pub(crate) struct ThumbnailState {
 }
 
 pub(crate) struct ServiceMenuState {
-    pub(crate) items: [*mut AnyObject; 6],
+    pub(crate) items: [*mut AnyObject; 5],
 }
 
 // Fixed-title menu items (settings / reload / clear_caches / quit); re-titled in bulk by refresh_menu_titles on locale change.
@@ -205,31 +205,30 @@ pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     }
 }
 
-const SERVICE_MENU_TITLE_KEYS: [&str; 6] = [
+const SERVICE_MENU_TITLE_KEYS: [&str; 5] = [
     "menu.service_windows",
     "menu.service_mouse",
     "menu.service_clipboard",
-    "menu.service_window_control",
-    "menu.service_quick_actions",
+    "menu.service_key_bindings",
     "menu.service_keystroke_display",
 ];
 
-const SERVICE_MENU_SYMBOLS: [&str; 6] = [
+const SERVICE_MENU_SYMBOLS: [&str; 5] = [
     "rectangle.on.rectangle",
     "computermouse",
     "doc.text",
-    "rectangle.split.2x2",
-    "bolt.circle",
+    "command.square",
     "keyboard",
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ServiceToggle {
+/// The status-bar service switches. `KeyBindings` is one item over one master switch: window
+/// control and quick actions are a single feature now, and one item can only express one state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceToggle {
     Windows,
     Mouse,
     Clipboard,
-    WindowControl,
-    QuickActions,
+    KeyBindings,
     KeystrokeDisplay,
 }
 
@@ -239,9 +238,8 @@ impl ServiceToggle {
             0 => Some(Self::Windows),
             1 => Some(Self::Mouse),
             2 => Some(Self::Clipboard),
-            3 => Some(Self::WindowControl),
-            4 => Some(Self::QuickActions),
-            5 => Some(Self::KeystrokeDisplay),
+            3 => Some(Self::KeyBindings),
+            4 => Some(Self::KeystrokeDisplay),
             _ => None,
         }
     }
@@ -251,8 +249,9 @@ impl ServiceToggle {
             Self::Windows => cfg.windows.enabled,
             Self::Mouse => cfg.mouse.enabled,
             Self::Clipboard => cfg.clipboard.enabled,
-            Self::WindowControl => cfg.window_control.enabled,
-            Self::QuickActions => cfg.quick_actions.enabled,
+            // The binding master switch: the legacy sections are read-only now, so the menu drives
+            // the switch the engine actually consults.
+            Self::KeyBindings => cfg.key_bindings.enabled,
             Self::KeystrokeDisplay => cfg.keystroke_display.enabled,
         }
     }
@@ -262,8 +261,7 @@ impl ServiceToggle {
             Self::Windows => cfg.windows.enabled = enabled,
             Self::Mouse => cfg.mouse.enabled = enabled,
             Self::Clipboard => cfg.clipboard.enabled = enabled,
-            Self::WindowControl => cfg.window_control.enabled = enabled,
-            Self::QuickActions => cfg.quick_actions.enabled = enabled,
+            Self::KeyBindings => cfg.key_bindings.enabled = enabled,
             Self::KeystrokeDisplay => cfg.keystroke_display.enabled = enabled,
         }
     }
@@ -310,7 +308,7 @@ unsafe fn make_menu_item(
 
 /// Build the directly expanded service-toggle section between Settings and shortcut mode.
 pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyObject) {
-    let items: [*mut AnyObject; 6] = std::array::from_fn(|index| {
+    let items: [*mut AnyObject; 5] = std::array::from_fn(|index| {
         let item = make_menu_item(
             target,
             &t(SERVICE_MENU_TITLE_KEYS[index]),
@@ -335,7 +333,7 @@ pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyOb
 /// unanchored help-tag window for an `NSMenuItem` tooltip and strands it at the screen origin. The
 /// clipboard warning it used to show lives as the visible caption on the Clipboard settings page.
 pub(crate) fn refresh_service_menu() {
-    let enabled: [bool; 6] = {
+    let enabled: [bool; 5] = {
         let cfg = CONFIG.read().unwrap();
         std::array::from_fn(|index| {
             ServiceToggle::from_tag(index as isize)
@@ -381,10 +379,33 @@ pub(crate) extern "C" fn handle_toggle_service(_self: *mut c_void, _cmd: Sel, se
     let Some(service) = ServiceToggle::from_tag(tag) else {
         return;
     };
-    let old_cfg = CONFIG.read().unwrap().clone();
-    let mut new_cfg = old_cfg.clone();
+    toggle_service(service);
+}
+
+/// Flip one service switch, the way both the menu and a `feature.toggle_*` binding do it: config
+/// write, persist, the full apply pass (which starts or stops the owning engine) and the surfaces
+/// that mirror the switch.
+pub(crate) fn toggle_service(service: ServiceToggle) {
+    let old_cfg = match CONFIG.read() {
+        Ok(cfg) => cfg.clone(),
+        Err(_) => return,
+    };
     let enabled = !service.enabled(&old_cfg);
+    toggle_service_to(service, enabled);
+}
+
+/// Set one service switch to an explicit state. The disabled direction of the clipboard keeps its
+/// documented meaning (the history and its files are deleted, see `apply_config_change`).
+pub(crate) fn toggle_service_to(service: ServiceToggle, enabled: bool) {
+    let old_cfg = match CONFIG.read() {
+        Ok(cfg) => cfg.clone(),
+        Err(_) => return,
+    };
+    let mut new_cfg = old_cfg.clone();
     service.set_enabled(&mut new_cfg, enabled);
+    if new_cfg == old_cfg {
+        return;
+    }
     if let Ok(mut current) = CONFIG.write() {
         *current = new_cfg.clone();
     }
@@ -398,7 +419,7 @@ pub(crate) extern "C" fn handle_toggle_service(_self: *mut c_void, _cmd: Sel, se
     refresh_service_menu();
     log_info!(
         "Service {:?}: {}",
-        tag,
+        service,
         if enabled { "enabled" } else { "disabled" }
     );
 }

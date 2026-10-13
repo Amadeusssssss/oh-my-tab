@@ -57,21 +57,10 @@ pub(super) enum ControlField {
     ClipboardMaxEntries,
     ClipboardAutoExpireDays,
     ClipboardPinFollow,
-    WindowControlEnabled,
-    WindowControlUp,
-    WindowControlDown,
-    WindowControlLeft,
-    WindowControlRight,
-    WindowControlDisplayUp,
-    WindowControlDisplayDown,
-    WindowControlDisplayLeft,
-    WindowControlDisplayRight,
-    QuickActionsEnabled,
-    QuickActionOpenSettings,
-    QuickActionOpenFinder,
-    QuickActionShowDesktop,
-    QuickActionLockScreen,
-    QuickActionLocatePointer,
+    // The Key Bindings page's two group switches. The per-binding rows are dynamic and dispatch
+    // through their own sender-pointer lookups (`handleBindingToggle:`/`handleBindingDelete:`), not
+    // through this static control table.
+    KeyBindingsEnabled,
     UpdateAutoCheck,
     UpdateAutoDownload,
 }
@@ -214,66 +203,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                 )
             })
             .or_else(|| m(u.clipboard_pin_follow, ControlField::ClipboardPinFollow))
-            .or_else(|| m(u.window_control_enabled, ControlField::WindowControlEnabled))
-            .or_else(|| m(u.window_control_up, ControlField::WindowControlUp))
-            .or_else(|| m(u.window_control_down, ControlField::WindowControlDown))
-            .or_else(|| m(u.window_control_left, ControlField::WindowControlLeft))
-            .or_else(|| m(u.window_control_right, ControlField::WindowControlRight))
-            .or_else(|| {
-                m(
-                    u.window_control_display_up,
-                    ControlField::WindowControlDisplayUp,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.window_control_display_down,
-                    ControlField::WindowControlDisplayDown,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.window_control_display_left,
-                    ControlField::WindowControlDisplayLeft,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.window_control_display_right,
-                    ControlField::WindowControlDisplayRight,
-                )
-            })
-            .or_else(|| m(u.quick_actions_enabled, ControlField::QuickActionsEnabled))
-            .or_else(|| {
-                m(
-                    u.quick_actions_open_settings,
-                    ControlField::QuickActionOpenSettings,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.quick_actions_open_finder,
-                    ControlField::QuickActionOpenFinder,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.quick_actions_show_desktop,
-                    ControlField::QuickActionShowDesktop,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.quick_actions_lock_screen,
-                    ControlField::QuickActionLockScreen,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.quick_actions_locate_pointer,
-                    ControlField::QuickActionLocatePointer,
-                )
-            })
+            .or_else(|| m(u.key_bindings_enabled, ControlField::KeyBindingsEnabled))
             .or_else(|| m(u.update_auto_check, ControlField::UpdateAutoCheck))
             .or_else(|| m(u.update_auto_download, ControlField::UpdateAutoDownload))
     })
@@ -693,65 +623,9 @@ fn apply_control_field(field: ControlField) {
                     let idx: isize = msg_send![u.clipboard_pin_follow, indexOfSelectedItem];
                     cfg.clipboard.pin_follow_selection = idx != 1;
                 }
-                ControlField::WindowControlEnabled => {
-                    let state: isize = msg_send![u.window_control_enabled, state];
-                    cfg.window_control.enabled = state == 1;
-                }
-                ControlField::WindowControlUp => {
-                    let state: isize = msg_send![u.window_control_up, state];
-                    cfg.window_control.up = state == 1;
-                }
-                ControlField::WindowControlDown => {
-                    let state: isize = msg_send![u.window_control_down, state];
-                    cfg.window_control.down = state == 1;
-                }
-                ControlField::WindowControlLeft => {
-                    let state: isize = msg_send![u.window_control_left, state];
-                    cfg.window_control.left = state == 1;
-                }
-                ControlField::WindowControlRight => {
-                    let state: isize = msg_send![u.window_control_right, state];
-                    cfg.window_control.right = state == 1;
-                }
-                ControlField::WindowControlDisplayUp => {
-                    let state: isize = msg_send![u.window_control_display_up, state];
-                    cfg.window_control.display_up = state == 1;
-                }
-                ControlField::WindowControlDisplayDown => {
-                    let state: isize = msg_send![u.window_control_display_down, state];
-                    cfg.window_control.display_down = state == 1;
-                }
-                ControlField::WindowControlDisplayLeft => {
-                    let state: isize = msg_send![u.window_control_display_left, state];
-                    cfg.window_control.display_left = state == 1;
-                }
-                ControlField::WindowControlDisplayRight => {
-                    let state: isize = msg_send![u.window_control_display_right, state];
-                    cfg.window_control.display_right = state == 1;
-                }
-                ControlField::QuickActionsEnabled => {
-                    let state: isize = msg_send![u.quick_actions_enabled, state];
-                    cfg.quick_actions.enabled = state == 1;
-                }
-                ControlField::QuickActionOpenSettings => {
-                    let state: isize = msg_send![u.quick_actions_open_settings, state];
-                    cfg.quick_actions.open_settings = state == 1;
-                }
-                ControlField::QuickActionOpenFinder => {
-                    let state: isize = msg_send![u.quick_actions_open_finder, state];
-                    cfg.quick_actions.open_finder = state == 1;
-                }
-                ControlField::QuickActionShowDesktop => {
-                    let state: isize = msg_send![u.quick_actions_show_desktop, state];
-                    cfg.quick_actions.show_desktop = state == 1;
-                }
-                ControlField::QuickActionLockScreen => {
-                    let state: isize = msg_send![u.quick_actions_lock_screen, state];
-                    cfg.quick_actions.lock_screen = state == 1;
-                }
-                ControlField::QuickActionLocatePointer => {
-                    let state: isize = msg_send![u.quick_actions_locate_pointer, state];
-                    cfg.quick_actions.locate_pointer = state == 1;
+                ControlField::KeyBindingsEnabled => {
+                    let state: isize = msg_send![u.key_bindings_enabled, state];
+                    cfg.key_bindings.enabled = state == 1;
                 }
                 ControlField::UpdateAutoCheck => {
                     let state: isize = msg_send![u.update_auto_check, state];
@@ -1216,25 +1090,6 @@ pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
     }
 }
 
-/// Freeze the eight shortcut switches below the window-control master switch.
-pub(super) unsafe fn update_window_control_controls_enabled(ui: &SettingsUi) {
-    let state: isize = msg_send![ui.window_control_enabled, state];
-    let on = state == 1;
-    let tooltip = t("settings.tooltip_window_control_disabled");
-    for &ctrl in &[
-        ui.window_control_up,
-        ui.window_control_down,
-        ui.window_control_left,
-        ui.window_control_right,
-        ui.window_control_display_up,
-        ui.window_control_display_down,
-        ui.window_control_display_left,
-        ui.window_control_display_right,
-    ] {
-        SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
-    }
-}
-
 /// The slider value's display format (2 decimals, matching the read-only value label).
 pub(super) fn pointer_accel_display(value: f64) -> String {
     format!("{value:.2}")
@@ -1422,53 +1277,20 @@ pub(crate) extern "C" fn handle_clipboard_enabled_toggle(
     }
 }
 
-/// Callback for the window-control master switch: apply immediately, then freeze/unfreeze its
-/// eight shortcut switches.
-pub(crate) extern "C" fn handle_window_control_enabled_toggle(
+/// Callback for the Key Bindings master switch: apply it, then freeze or unfreeze the binding rows
+/// and the add row.
+pub(crate) extern "C" fn handle_key_bindings_toggle(
     _self: *mut c_void,
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    apply_control_field(ControlField::WindowControlEnabled);
+    apply_control_field(ControlField::KeyBindingsEnabled);
     unsafe {
         with_settings_ui(|ui| {
             if let Some(u) = ui.as_ref() {
-                update_window_control_controls_enabled(u);
+                super::bindings::update_binding_controls_enabled(u);
             }
         });
-    }
-}
-
-/// Callback for the quick-actions master switch: apply immediately, then freeze/unfreeze the
-/// five action switches below.
-pub(crate) extern "C" fn handle_quick_actions_enabled_toggle(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _sender: *mut c_void,
-) {
-    apply_control_field(ControlField::QuickActionsEnabled);
-    unsafe {
-        with_settings_ui(|ui| {
-            if let Some(u) = ui.as_ref() {
-                update_quick_actions_controls_enabled(u);
-            }
-        });
-    }
-}
-
-/// Freeze/unfreeze the five action switches below the quick-actions master switch.
-pub(super) unsafe fn update_quick_actions_controls_enabled(ui: &SettingsUi) {
-    let state: isize = msg_send![ui.quick_actions_enabled, state];
-    let on = state == 1;
-    let tooltip = t("settings.tooltip_quick_actions_disabled");
-    for &ctrl in &[
-        ui.quick_actions_open_settings,
-        ui.quick_actions_open_finder,
-        ui.quick_actions_show_desktop,
-        ui.quick_actions_lock_screen,
-        ui.quick_actions_locate_pointer,
-    ] {
-        SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
 }
 
@@ -1484,8 +1306,7 @@ pub(crate) fn refresh_service_controls_from_config() {
                 (u.windows_enabled, cfg.windows.enabled),
                 (u.enable_mouse, cfg.mouse.enabled),
                 (u.clipboard_enabled, cfg.clipboard.enabled),
-                (u.window_control_enabled, cfg.window_control.enabled),
-                (u.quick_actions_enabled, cfg.quick_actions.enabled),
+                (u.key_bindings_enabled, cfg.key_bindings.enabled),
                 (u.keystroke_display_enabled, cfg.keystroke_display.enabled),
             ] {
                 let _: () = msg_send![ctrl, setState: if value { 1isize } else { 0isize }];
@@ -1493,8 +1314,7 @@ pub(crate) fn refresh_service_controls_from_config() {
             update_windows_controls_enabled(u);
             update_mouse_controls_enabled(u);
             update_clipboard_controls_enabled(u);
-            update_window_control_controls_enabled(u);
-            update_quick_actions_controls_enabled(u);
+            super::bindings::update_binding_controls_enabled(u);
         });
     }
 }
@@ -1585,6 +1405,10 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             let _: () = msg_send![u.focused_thumbnail_prewarm, setState: prewarm_state];
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
+            // Key bindings: an external change (a menu toggle, a reloaded file) has to reach the
+            // list. The sync rebuilds the rows only when the list's shape changed, so flipping a
+            // row's switch from its own action does not destroy the control mid-action.
+            super::bindings::sync_from_config(u, &cfg);
         });
     }
     // Outside the borrow (the refill re-borrows the settings slot): if the mouse page is the one on screen,

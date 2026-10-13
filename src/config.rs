@@ -20,8 +20,13 @@ pub struct Config {
     pub updates: UpdatesSection,
     pub clipboard: ClipboardSection,
     pub mouse: MouseSection,
+    /// Legacy (pre-`key_bindings`) sections: still read so an upgrade keeps the user's switches,
+    /// never written back — the migration into `key_bindings.items` is one-way.
+    #[serde(skip_serializing)]
     pub window_control: WindowControlSection,
+    #[serde(skip_serializing)]
     pub quick_actions: QuickActionsSection,
+    pub key_bindings: KeyBindingsSection,
     pub keystroke_display: KeystrokeDisplaySection,
 }
 
@@ -181,6 +186,322 @@ impl Default for WindowControlSection {
             display_down: true,
             display_left: true,
             display_right: true,
+        }
+    }
+}
+
+/// Global key bindings: one ordered list of "trigger -> action" entries, replacing the two
+/// hardcoded interceptions (`window_control`, `quick_actions`).
+///
+/// One master switch gates the whole feature; each entry's own `enabled` is what the old
+/// per-direction/per-action flag was, so an upgrade changes no behaviour. A binding is live only
+/// when the master switch and its own switch are both on. The two legacy `enabled` flags are OR-ed
+/// into the master switch on the way in, and a group that was off contributes no live row (see
+/// `seed_key_bindings`): a user who had either group on keeps exactly what they had, and turning
+/// both off stays off. A file that states `key_bindings.enabled` itself has already made that merged
+/// decision, so its group switches are not reconciled into the rows — the file's per-row flags stand
+/// as written, and a later switch-on finds them unchanged.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct KeyBindingsSection {
+    pub enabled: bool,
+    /// The bindings, in display order. `None` means "not stated" (the key is absent, or its TOML
+    /// type was unusable) and the list is seeded from the legacy sections; `Some(vec![])` is a user
+    /// who deleted every binding and is respected as such.
+    pub items: Option<Vec<crate::key_bindings::KeyBinding>>,
+}
+
+/// The factory binding list, seeded from the two legacy sections: a row takes the matching
+/// per-direction/per-action flag, and `window_on` / `quick_on` are the two groups' effective
+/// switches (the legacy section's `enabled`, or an interim file's retired group key).
+///
+/// The `&&` that decides whether a binding is live is applied when the runtime table is built,
+/// never here, and a row keeps its flag whenever the two groups agree or `fold_groups` is false —
+/// with both off the master switch is off too, so the flags decide nothing until the user turns the
+/// feature on, and a later switch-on must still arm the configured bindings rather than find every
+/// default row dead.
+///
+/// `fold_groups` is false when the file states its own master switch. That switch is then the
+/// user's decision about the merged feature rather than the OR of these two group switches, so
+/// there is nothing to reconcile and the rows keep exactly the per-row flags the file carries --
+/// otherwise the same explicit switch would mean different things depending on whether the file
+/// happened to also carry a list.
+///
+/// The one case that *does* have to be resolved here is a derived master switch over a disagreeing
+/// pair: one group on keeps the single master switch on, so the other group's rows would come alive
+/// with it and arm the very interceptions the user had turned off (the window-direction rows
+/// override Option+arrows in text fields). Those rows are seeded off, which is the only place the
+/// retired group switches can still be honoured now that they share one master switch.
+fn default_binding_items(
+    window_control: &WindowControlSection,
+    quick_actions: &QuickActionsSection,
+    window_on: bool,
+    quick_on: bool,
+    fold_groups: bool,
+) -> Vec<crate::key_bindings::KeyBinding> {
+    let gated =
+        |flag: bool, group_on: bool| flag && (!fold_groups || window_on == quick_on || group_on);
+    let row = |action: &str, trigger: &str, enabled: bool| crate::key_bindings::KeyBinding {
+        action: action.to_string(),
+        trigger: trigger.to_string(),
+        enabled,
+    };
+    vec![
+        row(
+            "window.snap_up",
+            "option+up",
+            gated(window_control.up, window_on),
+        ),
+        row(
+            "window.snap_down",
+            "option+down",
+            gated(window_control.down, window_on),
+        ),
+        row(
+            "window.snap_left",
+            "option+left",
+            gated(window_control.left, window_on),
+        ),
+        row(
+            "window.snap_right",
+            "option+right",
+            gated(window_control.right, window_on),
+        ),
+        row(
+            "window.display_up",
+            "option+shift+up",
+            gated(window_control.display_up, window_on),
+        ),
+        row(
+            "window.display_down",
+            "option+shift+down",
+            gated(window_control.display_down, window_on),
+        ),
+        row(
+            "window.display_left",
+            "option+shift+left",
+            gated(window_control.display_left, window_on),
+        ),
+        row(
+            "window.display_right",
+            "option+shift+right",
+            gated(window_control.display_right, window_on),
+        ),
+        row(
+            "quick.open_settings",
+            "option+i",
+            gated(quick_actions.open_settings, quick_on),
+        ),
+        row(
+            "quick.open_finder",
+            "option+e",
+            gated(quick_actions.open_finder, quick_on),
+        ),
+        row(
+            "quick.show_desktop",
+            "option+d",
+            gated(quick_actions.show_desktop, quick_on),
+        ),
+        row(
+            "quick.lock_screen",
+            "option+l",
+            gated(quick_actions.lock_screen, quick_on),
+        ),
+        row(
+            "quick.locate_pointer",
+            "double-control",
+            gated(quick_actions.locate_pointer, quick_on),
+        ),
+    ]
+}
+
+impl Default for KeyBindingsSection {
+    fn default() -> Self {
+        // A config that never mentioned bindings (a fresh install, or a pre-binding file about to
+        // be migrated) starts from the factory list of the default legacy sections, both off.
+        let window_control = WindowControlSection::default();
+        let quick_actions = QuickActionsSection::default();
+        Self {
+            // Either legacy group being on means the feature was in use; the master switch has to
+            // preserve that, or an upgrade would silently disable a shortcut the user relies on.
+            enabled: window_control.enabled || quick_actions.enabled,
+            items: Some(default_binding_items(
+                &window_control,
+                &quick_actions,
+                window_control.enabled,
+                quick_actions.enabled,
+                // The factory state: nothing has been stated, so the two group defaults are all
+                // there is to reconcile.
+                true,
+            )),
+        }
+    }
+}
+
+impl Config {
+    /// Seed `key_bindings` from the legacy sections. Called once per load, right after
+    /// deserialization and before validation.
+    ///
+    /// Presence is read off the raw document rather than from the deserialized value, because
+    /// `#[serde(default)]` on the section fills a missing field from the *section's* `Default`,
+    /// whose `items` is the factory list — so "the file never stated a list" and "the file stated
+    /// the factory list" are indistinguishable afterwards.
+    ///
+    /// * No `[key_bindings]` table at all: the legacy sections hand over both the group switches and
+    ///   the list.
+    /// * A table without `items`: its group switches are the user's and are kept; only the list is
+    ///   seeded from the legacy flags.
+    /// * A stated list (including `items = []`) is authoritative and is left alone.
+    ///
+    /// Settle every reserved chord in one pass, and report what had to give way.
+    ///
+    /// The order is the rule: the clipboard shortcut yields first (it can be rebound, the switcher
+    /// cannot), and then the bindings yield to whatever the switcher and the clipboard finally own.
+    /// A clipboard that already holds its default and still collides is left alone, so the binding
+    /// is the side that gives way rather than a no-op fallback being reported.
+    ///
+    /// Used after per-field fallback at load, and at runtime before anything is published, so the
+    /// persisted config, the clipboard's cached chord, the settings page and the engine's table all
+    /// come from the same settled values.
+    pub(crate) fn settle_reserved_shortcuts(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let items = self.key_bindings.items.clone().unwrap_or_default();
+        let switcher_modifier = crate::key_bindings::modifier_flag(&self.keyboard.modifier);
+        if let Err(status) = crate::key_bindings::clipboard_shortcut_status(
+            &self.clipboard.shortcut,
+            &items,
+            switcher_modifier,
+        ) {
+            let default = ClipboardSection::default().shortcut;
+            if default != self.clipboard.shortcut {
+                let value = self.clipboard.shortcut.clone();
+                errors.push(match status {
+                    crate::key_bindings::ClipboardStatus::Invalid => format!(
+                        "clipboard.shortcut: {}",
+                        tf("errors.clipboard_shortcut_invalid", &[("value", &value)])
+                    ),
+                    crate::key_bindings::ClipboardStatus::Conflict => format!(
+                        "clipboard.shortcut: {}",
+                        i18n::t("errors.clipboard_shortcut_conflict")
+                    ),
+                });
+                self.clipboard.shortcut = default;
+            }
+        }
+        errors.extend(self.repair_key_binding_conflicts());
+        errors
+    }
+
+    /// Drop the bindings whose chord a reserved shortcut now owns (the app switcher's modifier
+    /// plus Tab, and the effective clipboard shortcut) and report each one.
+    ///
+    /// Called after per-field fallback at load, and again when `keyboard.modifier` changes at
+    /// runtime: switching the switcher to Command+Tab turns a perfectly legal Command+Tab binding
+    /// into one that would swallow the switcher chord. The binding yields in both cases; the
+    /// switcher and the clipboard shortcut cannot be rebound by a binding.
+    pub(crate) fn repair_key_binding_conflicts(&mut self) -> Vec<String> {
+        let reserved = crate::key_bindings::Reserved::from_effective(
+            &self.keyboard.modifier,
+            &self.clipboard.shortcut,
+        );
+        match self.key_bindings.items.as_mut() {
+            Some(items) => crate::key_bindings::drop_reserved_conflicts(items, &reserved),
+            None => Vec::new(),
+        }
+    }
+
+    /// Seed `key_bindings` from the legacy sections and from the retired group switches. Called once
+    /// per load, right after deserialization and before validation.
+    ///
+    /// Presence is read off the raw document rather than from the deserialized value, because
+    /// `#[serde(default)]` on the section fills a missing field from the *section's* `Default`,
+    /// whose `items` is the factory list — so "the file never stated a list" and "the file stated
+    /// the factory list" are indistinguishable afterwards.
+    ///
+    /// * The master switch is the file's `key_bindings.enabled` when it states one.
+    /// * Otherwise it is the OR of the legacy sections' `enabled` flags and of the retired
+    ///   `window_control_enabled` / `quick_actions_enabled` keys (a config written by the interim
+    ///   binding build): a user who had either group on keeps exactly what they had, and a file
+    ///   that had both off stays off. Writing the seeded value back is what retires those keys.
+    /// * A stated list (including `items = []`) keeps its own entries and order; a missing one is
+    ///   seeded from the legacy per-direction/per-action flags.
+    /// * Either way, the group that is off in a *disagreeing* pair has its rows switched off: those
+    ///   rows would otherwise come alive with the one master switch the other group holds, arming the
+    ///   interceptions the user had turned off.
+    ///
+    /// `section` is the raw `[key_bindings]` table, so `enabled` and the retired group keys can be
+    /// told apart from their defaults.
+    fn seed_key_bindings(&mut self, section: Option<&toml::Value>) {
+        let stated = |key: &str| {
+            section
+                .and_then(|table| table.get(key))
+                .and_then(toml::Value::as_bool)
+        };
+        // The retired keys are the interim build's group switches: they stand in for the legacy
+        // sections' own `enabled`, so a file written by that build resolves to the same two groups.
+        let window_on = stated("window_control_enabled").unwrap_or(self.window_control.enabled);
+        let quick_on = stated("quick_actions_enabled").unwrap_or(self.quick_actions.enabled);
+        // An explicitly stated master switch is the user's own decision about the merged feature and
+        // says nothing about the groups, so only a derived one may fold the group state into rows.
+        let stated_master = stated("enabled").is_some();
+        if !stated_master {
+            self.key_bindings.enabled = window_on || quick_on;
+        }
+        // Presence has to come from the raw document, never from `self.key_bindings.items`: the
+        // section is `#[serde(default)]`, so a file that never stated a list already carries the
+        // factory list, and "absent" would be indistinguishable from "the file holds exactly the
+        // factory rows" -- which is how a legacy `up = false` would be resurrected.
+        let has_items = section.is_some_and(|table| table.get("items").is_some());
+        if !has_items {
+            self.key_bindings.items = Some(default_binding_items(
+                &self.window_control,
+                &self.quick_actions,
+                window_on,
+                quick_on,
+                // A stated master switch owns the merged feature and says nothing about the groups,
+                // so the seeded rows keep the file's per-row flags: the same explicit switch must
+                // not mean one thing with a list present and another with it absent.
+                !stated_master,
+            ));
+        } else if !stated_master {
+            // An interim file already carries its own list. It was written when the two group
+            // switches were separate, so the group that was off is folded into those rows now --
+            // otherwise that list would be honoured verbatim and its rows for the disabled group
+            // would start intercepting with the master switch the other group holds. A stated
+            // master switch is the user's own merged decision and folds nothing.
+            if let Some(items) = self.key_bindings.items.as_mut() {
+                apply_group_switches(items, window_on, quick_on);
+            }
+        }
+    }
+}
+
+/// Fold the two retired group switches into an existing binding list: a group that is off in a
+/// disagreeing pair has its rows switched off, and the other group's rows are left exactly as the
+/// file stated them (order, triggers and the user's own per-row switches all preserved).
+///
+/// An entry whose action is unknown belongs to no group and is left alone — validation drops it
+/// with its own error, and guessing a group for it would rewrite a row the user never disabled.
+/// With both groups off, or both on, nothing is touched: the master switch alone says whether the
+/// feature is on, and a later switch-on must find the rows as configured.
+fn apply_group_switches(
+    items: &mut [crate::key_bindings::KeyBinding],
+    window_on: bool,
+    quick_on: bool,
+) {
+    if window_on == quick_on {
+        return;
+    }
+    for item in items.iter_mut() {
+        let Some(action) = crate::key_bindings::Action::from_config_id(&item.action) else {
+            continue;
+        };
+        let group_on = match action.group() {
+            crate::key_bindings::Group::WindowControl => window_on,
+            crate::key_bindings::Group::QuickActions => quick_on,
+        };
+        if !group_on {
+            item.enabled = false;
         }
     }
 }
@@ -1068,20 +1389,27 @@ impl Config {
                 &[("value", &self.clipboard.picker_position)],
             ));
         }
-        match crate::mouse::shortcut::validate_clipboard_shortcut(&self.clipboard.shortcut) {
+        match crate::key_bindings::clipboard_shortcut_status(
+            &self.clipboard.shortcut,
+            self.key_bindings.items.as_deref().unwrap_or(&[]),
+            crate::key_bindings::modifier_flag(&self.keyboard.modifier),
+        ) {
             Ok(_) => {}
-            Err(crate::mouse::shortcut::ClipboardShortcutError::Invalid) => errs.push(format!(
+            Err(crate::key_bindings::ClipboardStatus::Invalid) => errs.push(format!(
                 "clipboard.shortcut: {}",
                 tf(
                     "errors.clipboard_shortcut_invalid",
                     &[("value", &self.clipboard.shortcut)]
                 )
             )),
-            Err(crate::mouse::shortcut::ClipboardShortcutError::Conflict) => errs.push(format!(
+            Err(crate::key_bindings::ClipboardStatus::Conflict) => errs.push(format!(
                 "clipboard.shortcut: {}",
                 i18n::t("errors.clipboard_shortcut_conflict")
             )),
         }
+        errs.extend(crate::key_bindings::validate_items(
+            self.key_bindings.items.as_ref(),
+        ));
 
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
@@ -1303,6 +1631,40 @@ impl Config {
             }
             // file_path has no validation, always valid
             self.logging.file_path = other.logging.file_path;
+        }
+
+        // key bindings
+        if !has_error("key_bindings") {
+            self.key_bindings = other.key_bindings;
+        } else {
+            // The master switch is a plain boolean, so it is always valid. The list is merged
+            // entry by entry: a binding whose own path carries an error drops out of the list
+            // without taking its siblings with it, which is what keeps one bad hand-written entry
+            // from discarding every other binding the user has.
+            self.key_bindings.enabled = other.key_bindings.enabled;
+            if let Some(items) = other.key_bindings.items {
+                let kept: Vec<_> = items
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, _)| {
+                        // Only an unusable *identity* drops the entry: its action id or its trigger
+                        // is what the row's behaviour is. A mistyped `enabled` fell back on its own
+                        // above and must not take the whole binding with it.
+                        let prefix = format!("key_bindings.items[{index}]");
+                        !errs.iter().any(|error| {
+                            error.starts_with(&format!("{prefix}.action"))
+                                || error.starts_with(&format!("{prefix}.trigger"))
+                        })
+                    })
+                    .map(|(_, item)| item)
+                    .collect();
+                // Dropping unusable entries can leave the list empty, and it stays empty: seeding
+                // the factory bindings here would arm shortcuts the user never configured (they
+                // may have deleted every one of them and then mistyped a line). Only a list that is
+                // absent, or whose TOML type is unusable, falls back to the factory list -- that
+                // happens before validation, in `seed_key_bindings`.
+                self.key_bindings.items = Some(kept);
+            }
         }
 
         // keystroke display
@@ -1562,6 +1924,69 @@ fn config_type_schema() -> toml::Value {
             ),
         );
     }
+
+    // The pre-`key_bindings` sections are deserialize-only, so their shape has to be described
+    // here too: without it a wrong TOML type in a legacy file would survive sanitizing as an
+    // unknown field, fail deserialization, and take the whole config down with it.
+    if let Some(root) = value.as_table_mut() {
+        let switches = |names: &[&str]| {
+            let mut table = toml::map::Map::new();
+            for name in names {
+                table.insert((*name).into(), toml::Value::Boolean(false));
+            }
+            toml::Value::Table(table)
+        };
+        root.insert(
+            "window_control".into(),
+            switches(&[
+                "enabled",
+                "up",
+                "down",
+                "left",
+                "right",
+                "display_up",
+                "display_down",
+                "display_left",
+                "display_right",
+            ]),
+        );
+        root.insert(
+            "quick_actions".into(),
+            switches(&[
+                "enabled",
+                "open_settings",
+                "open_finder",
+                "show_desktop",
+                "lock_screen",
+                "locate_pointer",
+            ]),
+        );
+        // `items` is an `Option` in the config (absent = "seed from the legacy sections"), so the
+        // serialized defaults omit it. Describe one element here anyway: the sanitizer walks an
+        // array element-by-element against the schema's first element, and without it a single
+        // mistyped field inside one entry would fail the whole document's deserialization.
+        if let Some(key_bindings) = root
+            .get_mut("key_bindings")
+            .and_then(toml::Value::as_table_mut)
+        {
+            let entry: toml::map::Map<String, toml::Value> = [
+                ("action".to_string(), toml::Value::String(String::new())),
+                ("trigger".to_string(), toml::Value::String(String::new())),
+                ("enabled".to_string(), toml::Value::Boolean(true)),
+            ]
+            .into_iter()
+            .collect();
+            key_bindings.insert(
+                "items".into(),
+                toml::Value::Array(vec![toml::Value::Table(entry)]),
+            );
+            // The retired group switches are deserialize-only like the legacy sections above: a
+            // file written by the interim binding build still carries them, and the sanitizer has
+            // to know their type or a wrong value would fail the whole document.
+            key_bindings.insert("window_control_enabled".into(), toml::Value::Boolean(false));
+            key_bindings.insert("quick_actions_enabled".into(), toml::Value::Boolean(false));
+        }
+    }
     value
 }
 
@@ -1666,7 +2091,13 @@ fn sanitize_config_value(
             let mut sanitized = Vec::with_capacity(actual_array.len());
             for (index, actual_item) in actual_array.iter().enumerate() {
                 let item_path = toml_path_index(path, index);
-                let item_fallback = if path == "mouse.profiles" && index > 0 {
+                let item_fallback = if path == "key_bindings.items" {
+                    // Every binding entry stands on its own. A mistyped field inside one entry must
+                    // fall back to that field's own default — an empty action id or trigger, which
+                    // validation then rejects and drops — and never inherit the first seeded
+                    // entry's action or chord.
+                    None
+                } else if path == "mouse.profiles" && index > 0 {
                     // Only the first profile is the explicit wildcard default. A malformed
                     // optional field in a per-device profile must fall back to omission, not
                     // accidentally inherit the wildcard profile's concrete value.
@@ -1674,14 +2105,22 @@ fn sanitize_config_value(
                 } else {
                     fallback_array.and_then(|items| items.first())
                 };
-                if let Some(value) = sanitize_config_value(
+                match sanitize_config_value(
                     actual_item,
                     item_fallback,
                     schema_item,
                     &item_path,
                     errors,
                 ) {
-                    sanitized.push(value);
+                    Some(value) => sanitized.push(value),
+                    None if path == "key_bindings.items" => {
+                        // Keep the slot. The errors already carry this element's *original* index
+                        // and the validation that follows reports an unusable entry for it, so
+                        // dropping the element here would renumber every later binding and let the
+                        // identity filter delete the wrong one.
+                        sanitized.push(schema_item.clone());
+                    }
+                    None => {}
                 }
             }
             Some(toml::Value::Array(sanitized))
@@ -1737,14 +2176,33 @@ fn parse_config_content(content: &str) -> Result<(Config, Vec<String>, bool), Ve
     let mut needs_persist = !errors.is_empty();
     needs_persist |= loaded.mouse.migrate_legacy();
     needs_persist |= loaded.migrate_card_text_style();
+    // Presence is read off the raw document: Serde cannot tell a missing table (or a missing
+    // `items` key) from one whose fields all took their defaults, and the difference decides what
+    // may be taken over from the legacy sections. The two retired group switches are still accepted
+    // here so an interim file migrates into the master switch instead of losing its state.
+    loaded.seed_key_bindings(actual.get("key_bindings"));
     errors.extend(loaded.validate());
-    if !errors.is_empty() {
+    let mut config = if !errors.is_empty() {
+        // Any validation error means the repaired snapshot on disk differs from what was loaded --
+        // including a purely semantic one (an unknown binding action) that the type sanitizer above
+        // cannot see. It has to be written back, or the same repair is repeated on every launch.
+        needs_persist = true;
         let mut merged = Config::default();
         merged.merge_valid(loaded, &errors);
-        Ok((merged, errors, true))
+        merged
     } else {
-        Ok((loaded, errors, needs_persist))
+        loaded
+    };
+    // Reserved chords are only known once every other field has settled: the clipboard yields
+    // first (an invalid value has fallen back to its default by now), then the bindings yield to
+    // whatever the switcher and the clipboard finally own. Runs on every load, so a hand-edited
+    // file is repaired rather than half-honoured.
+    let conflicts = config.settle_reserved_shortcuts();
+    if !conflicts.is_empty() {
+        errors.extend(conflicts);
+        needs_persist = true;
     }
+    Ok((config, errors, needs_persist))
 }
 
 fn config_path() -> std::path::PathBuf {
@@ -3394,5 +3852,1169 @@ reverse_scroll = true
         // Path: home/.config/oh-my-tab/config.toml with the dir auto-created.
         assert_eq!(p, dir.path().join(".config/oh-my-tab/config.toml"));
         assert!(p.parent().unwrap().exists());
+    }
+
+    /// The factory config carries the thirteen bindings of the two legacy sections, all of them
+    /// with the master switch off — the same "installed but not enabled" state as before.
+    #[test]
+    fn default_config_seeds_the_factory_bindings() {
+        let cfg = Config::default();
+        let items = cfg.key_bindings.items.as_ref().expect("factory list");
+        assert_eq!(items.len(), 13);
+        assert!(!cfg.key_bindings.enabled);
+        assert!(items.iter().all(|item| item.enabled));
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+    }
+
+    /// The two legacy group switches are OR-ed into the one master switch: a user who had either
+    /// group on keeps it, and a file that had both off (or stated neither) stays off.
+    #[test]
+    fn the_legacy_group_switches_or_into_the_master_switch() {
+        let load = |body: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, body).unwrap();
+            let (cfg, errs) = Config::load_or_default_from(&path);
+            assert!(errs.is_empty(), "{errs:?}");
+            cfg.key_bindings.enabled
+        };
+        assert!(load(
+            "[window_control]
+enabled = true
+"
+        ));
+        assert!(load(
+            "[quick_actions]
+enabled = true
+"
+        ));
+        assert!(load(
+            "[window_control]
+enabled = true
+
+[quick_actions]
+enabled = true
+"
+        ));
+        assert!(!load(
+            "[window_control]
+enabled = false
+
+[quick_actions]
+enabled = false
+"
+        ));
+        // A binding-era file that only ever had `items` never enabled the feature.
+        assert!(!load(
+            "[key_bindings]
+items = []
+"
+        ));
+        // A config written by the interim binding build still carries the retired group keys; they
+        // are read into the master switch rather than dropped. The second case pins that the
+        // retired keys are consulted even without a legacy section.
+        assert!(load(
+            "[key_bindings]
+window_control_enabled = true
+quick_actions_enabled = false
+"
+        ));
+        assert!(load(
+            "[key_bindings]
+window_control_enabled = false
+quick_actions_enabled = true
+"
+        ));
+        assert!(!load(
+            "[key_bindings]
+window_control_enabled = false
+quick_actions_enabled = false
+"
+        ));
+        // A stated master switch is authoritative: the retired keys must not override it.
+        assert!(!load(
+            "[key_bindings]
+enabled = false
+window_control_enabled = true
+"
+        ));
+    }
+
+    /// A legacy file keeps its per-row switches, and a group that was off contributes no live row:
+    /// the two legacy switches now share one master switch, so leaving a disabled group's rows
+    /// enabled would arm the very interceptions the user had turned off.
+    #[test]
+    fn legacy_sections_migrate_into_bindings_without_losing_row_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[window_control]
+enabled = true
+up = false
+left = true
+
+[quick_actions]
+enabled = false
+open_finder = false
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            cfg.key_bindings.enabled,
+            "window control was on, so the master switch is too"
+        );
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(!row("window.snap_up").enabled, "up = false must survive");
+        assert!(row("window.snap_left").enabled);
+        assert!(
+            !row("quick.open_finder").enabled,
+            "quick_actions was off, so its rows are seeded off"
+        );
+        assert!(
+            !row("quick.open_settings").enabled,
+            "quick_actions was off, so its rows are seeded off"
+        );
+        // Live set: the master switch on, the "up" row switched off, and no quick-action row live at
+        // all -- the disabled group must not come alive with the master switch the other group holds.
+        let table = crate::key_bindings::BindingTable::build(items, cfg.key_bindings.enabled);
+        assert_eq!(
+            table.lookup_chord(0x7B, crate::mouse::shortcut::FLAG_ALT),
+            Some(crate::key_bindings::Action::SnapLeft)
+        );
+        assert_eq!(
+            table.lookup_chord(0x7E, crate::mouse::shortcut::FLAG_ALT),
+            None,
+            "the row switch is off"
+        );
+        // quick_actions was off in this file: none of its rows may be live, whatever the row flags.
+        assert_eq!(
+            table.lookup_chord(0x0E, crate::mouse::shortcut::FLAG_ALT),
+            None
+        );
+        assert_eq!(
+            table.lookup_chord(0x22, crate::mouse::shortcut::FLAG_ALT),
+            None,
+            "quick.open_settings must not be live either"
+        );
+        // The legacy sections are read but never written back. Merely loading does not rewrite the
+        // file (seeding is idempotent, so the old sections can stay for a downgrade); the next save
+        // is what drops them.
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("[window_control]"));
+        cfg.save_to(&path).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("[window_control]"), "{persisted}");
+        assert!(!persisted.contains("[quick_actions]"), "{persisted}");
+        assert!(persisted.contains("[[key_bindings.items]]"), "{persisted}");
+    }
+
+    /// The mirror of the mixed case, and the reason the group switch has to reach the rows: with
+    /// `quick_actions` on and `window_control` off, the master switch is on for the quick actions,
+    /// and the window-direction rows must stay dead -- they override Option+arrows in text fields.
+    #[test]
+    fn a_disabled_group_contributes_no_live_row_to_the_master_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[window_control]
+enabled = false
+
+[quick_actions]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.key_bindings.enabled, "quick_actions was on");
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(
+            !row("window.snap_up").enabled,
+            "every window row of the disabled group is seeded off"
+        );
+        assert!(!row("window.display_left").enabled);
+        assert!(row("quick.open_finder").enabled);
+        let table = crate::key_bindings::BindingTable::build(items, cfg.key_bindings.enabled);
+        assert_eq!(
+            table.lookup_chord(0x7E, crate::mouse::shortcut::FLAG_ALT),
+            None,
+            "Option+Up must not be intercepted: window_control was off"
+        );
+        assert_eq!(
+            table.lookup_chord(0x7B, 0x0006_0000),
+            None,
+            "Option+Shift+Left must not be intercepted either"
+        );
+        assert_eq!(
+            table.lookup_chord(0x0E, crate::mouse::shortcut::FLAG_ALT),
+            Some(crate::key_bindings::Action::OpenFinder),
+            "the enabled group's rows are live"
+        );
+    }
+
+    /// An interim file that already carries its own list: it was written while the two group
+    /// switches were separate, so the disabled group's rows in *that* list must be switched off
+    /// too. Honouring the list verbatim would let those rows start intercepting with the master
+    /// switch the other group holds -- the same upgrade regression as the seeded path, one step on.
+    #[test]
+    fn an_interim_list_folds_the_disabled_group_switch_into_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[key_bindings]
+window_control_enabled = false
+quick_actions_enabled = true
+
+[[key_bindings.items]]
+action = "window.snap_left"
+trigger = "option+left"
+enabled = true
+
+[[key_bindings.items]]
+action = "window.snap_up"
+trigger = "option+up"
+enabled = false
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+enabled = true
+
+[[key_bindings.items]]
+action = "window.nope"
+trigger = "option+j"
+enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        // The unknown action is still reported; it belongs to no group, so it is left untouched.
+        assert!(
+            errs.iter()
+                .any(|error| error.starts_with("key_bindings.items[3].action")),
+            "{errs:?}"
+        );
+        assert!(cfg.key_bindings.enabled, "quick_actions was on");
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(
+            !row("window.snap_left").enabled,
+            "the window row must be folded off: window_control was off"
+        );
+        assert!(!row("window.snap_up").enabled, "already off, stays off");
+        assert!(
+            row("quick.open_finder").enabled,
+            "the enabled group is untouched"
+        );
+        // Order and triggers are preserved: the folded list is edited, never rebuilt.
+        let order: Vec<&str> = items.iter().map(|item| item.action.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["window.snap_left", "window.snap_up", "quick.open_finder"],
+            "the surviving entries keep the file's order"
+        );
+        // And the live table agrees.
+        let table = crate::key_bindings::BindingTable::build(items, cfg.key_bindings.enabled);
+        assert_eq!(
+            table.lookup_chord(0x7B, crate::mouse::shortcut::FLAG_ALT),
+            None,
+            "Option+Left must not be intercepted: window_control was off"
+        );
+        assert_eq!(
+            table.lookup_chord(0x0E, crate::mouse::shortcut::FLAG_ALT),
+            Some(crate::key_bindings::Action::OpenFinder)
+        );
+    }
+
+    /// The mirror direction, and the other half of the fold: an interim file with the window group
+    /// on and the quick group off must kill the quick rows in its own list.
+    #[test]
+    fn an_interim_list_folds_the_other_disabled_group_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[key_bindings]
+window_control_enabled = true
+quick_actions_enabled = false
+
+[[key_bindings.items]]
+action = "window.snap_left"
+trigger = "option+left"
+enabled = true
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.key_bindings.enabled, "window_control was on");
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(row("window.snap_left").enabled);
+        assert!(
+            !row("quick.open_finder").enabled,
+            "quick_actions was off, so its row is folded off"
+        );
+        let table = crate::key_bindings::BindingTable::build(items, cfg.key_bindings.enabled);
+        assert_eq!(
+            table.lookup_chord(0x0E, crate::mouse::shortcut::FLAG_ALT),
+            None,
+            "Option+E must not be intercepted"
+        );
+        assert_eq!(
+            table.lookup_chord(0x7B, crate::mouse::shortcut::FLAG_ALT),
+            Some(crate::key_bindings::Action::SnapLeft)
+        );
+    }
+
+    /// The same rule on the *seeded* path: a stated master switch does not let the retired group
+    /// keys decide which rows are live. Otherwise the identical explicit switch would mean one thing
+    /// with a list present (no fold) and another with it absent (fold), silently dropping shortcuts.
+    #[test]
+    fn a_stated_master_switch_does_not_fold_a_seeded_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[key_bindings]
+enabled = true
+window_control_enabled = false
+quick_actions_enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.key_bindings.enabled);
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(
+            row("window.snap_left").enabled,
+            "the user enabled the merged feature; the retired group key folds nothing"
+        );
+        assert!(row("quick.open_finder").enabled);
+        let table = crate::key_bindings::BindingTable::build(items, cfg.key_bindings.enabled);
+        assert_eq!(
+            table.lookup_chord(0x7B, crate::mouse::shortcut::FLAG_ALT),
+            Some(crate::key_bindings::Action::SnapLeft),
+            "the seeded window rows are live under the stated master switch"
+        );
+    }
+
+    /// The mirror: with the window group off and quick on, a stated master switch still seeds both
+    /// groups' rows from their own flags.
+    #[test]
+    fn a_stated_master_switch_does_not_fold_a_seeded_list_the_other_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[key_bindings]
+enabled = true
+window_control_enabled = true
+quick_actions_enabled = false
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(row("window.snap_left").enabled);
+        assert!(
+            row("quick.open_finder").enabled,
+            "the retired quick key folds nothing under a stated master switch"
+        );
+    }
+
+    /// A stated master switch still respects a legacy per-row flag: the fold is what the explicit
+    /// switch suppresses, not the file's own `up = false`.
+    #[test]
+    fn a_stated_master_switch_keeps_legacy_row_flags_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[window_control]
+enabled = false
+up = false
+
+[key_bindings]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(
+            !row("window.snap_up").enabled,
+            "the file's own up = false still survives"
+        );
+        assert!(
+            row("window.snap_left").enabled,
+            "the retired/legacy group switch does not fold it off"
+        );
+    }
+
+    /// A file that states its own master switch has made the merged decision itself, so the retired
+    /// group keys must not fold anything into its list: only a *derived* master switch may.
+    #[test]
+    fn a_stated_master_switch_leaves_the_list_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[key_bindings]
+enabled = true
+window_control_enabled = false
+quick_actions_enabled = true
+
+[[key_bindings.items]]
+action = "window.snap_left"
+trigger = "option+left"
+enabled = true
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.key_bindings.enabled);
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let row = |action: &str| {
+            items
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(
+            row("window.snap_left").enabled,
+            "a stated master switch owns the whole list; the retired key is ignored"
+        );
+        assert!(row("quick.open_finder").enabled);
+    }
+
+    /// An explicit `items = []` stays empty through the fold.
+    #[test]
+    fn an_interim_empty_list_survives_the_group_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[key_bindings]
+window_control_enabled = false
+quick_actions_enabled = true
+items = []
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.key_bindings.enabled);
+        assert_eq!(cfg.key_bindings.items.as_deref(), Some(&[][..]));
+    }
+
+    /// A file that has the section (and its switch) but no list contributes only the list: the
+    /// switch the user stated is kept.
+    #[test]
+    fn a_present_section_keeps_its_switch_and_only_seeds_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[window_control]
+enabled = true
+
+[key_bindings]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(
+            cfg.key_bindings.enabled,
+            "the section's own value wins over the legacy one"
+        );
+        assert_eq!(cfg.key_bindings.items.as_ref().unwrap().len(), 13);
+    }
+
+    /// A present `[key_bindings]` that omits `items` contributes only the list; the rows take the
+    /// legacy flags (a legacy `up = false` must not come back enabled from the factory list).
+    #[test]
+    fn a_section_without_items_seeds_the_rows_from_the_legacy_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[window_control]
+enabled = true
+up = false
+left = false
+
+[key_bindings]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(cfg.key_bindings.enabled);
+        let row = |action: &str| {
+            cfg.key_bindings
+                .items
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|item| item.action == action)
+                .unwrap_or_else(|| panic!("{action} missing"))
+        };
+        assert!(
+            !row("window.snap_up").enabled,
+            "the legacy up = false survived"
+        );
+        assert!(!row("window.snap_left").enabled);
+        assert!(row("window.snap_right").enabled);
+        assert!(row("window.snap_down").enabled);
+    }
+
+    /// An explicitly empty list is a user who deleted every binding, not a missing list.
+    #[test]
+    fn an_explicitly_empty_list_stays_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[key_bindings]\nitems = []\n").unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(cfg.key_bindings.items.as_deref(), Some(&[][..]));
+    }
+
+    /// One bad entry is dropped with an error; its siblings survive, and the repair is persisted.
+    #[test]
+    fn one_bad_binding_never_discards_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+
+[[key_bindings.items]]
+action = "window.nope"
+trigger = "option+j"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "not-a-trigger"
+
+[[key_bindings.items]]
+action = "quick.open_settings"
+trigger = "option+i"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("key_bindings.items[1].action")));
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("key_bindings.items[2].trigger")));
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let actions: Vec<&str> = items.iter().map(|item| item.action.as_str()).collect();
+        assert_eq!(actions, vec!["quick.open_finder", "quick.open_settings"]);
+    }
+
+    /// A purely semantic repair (an unknown action, which the type sanitizer cannot see) still has
+    /// to be written back: otherwise the same error is reported on every launch and the repaired
+    /// list in memory never reaches the disk.
+    #[test]
+    fn a_semantic_repair_is_persisted_even_without_a_type_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[key_bindings.items]]
+action = "window.nope"
+trigger = "option+j"
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+"#,
+        )
+        .unwrap();
+        let (_, errs) = Config::load_or_default_from(&path);
+        assert!(
+            errs.iter()
+                .any(|error| error.starts_with("key_bindings.items[0].action")),
+            "{errs:?}"
+        );
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !persisted.contains("window.nope"),
+            "the repaired list must be written back: {persisted}"
+        );
+        assert!(persisted.contains("quick.open_finder"), "{persisted}");
+        // And reloading is clean: the repair does not repeat on every launch.
+        let (_, again) = Config::load_or_default_from(&path);
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// A wrong TOML type inside one entry is repaired to that field's default, so the entry is
+    /// dropped by validation instead of inheriting the first seeded entry's action or chord.
+    #[test]
+    fn a_mistyped_field_inside_one_entry_does_not_inherit_the_first_seeded_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[key_bindings.items]]
+action = 123
+trigger = "option+j"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "option+l"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("key_bindings.items[0].action")),
+            "{errs:?}"
+        );
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "quick.lock_screen");
+        assert_eq!(items[0].trigger, "option+l");
+    }
+
+    /// A wrong type for the whole list falls back to the field's default — the factory list — and
+    /// says so, rather than taking the document down.
+    #[test]
+    fn a_mistyped_list_falls_back_to_the_factory_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[key_bindings]\nitems = \"option+e\"\n").unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(
+            errs.iter()
+                .any(|error| error.starts_with("key_bindings.items")),
+            "{errs:?}"
+        );
+        assert_eq!(cfg.key_bindings.items.as_ref().unwrap().len(), 13);
+    }
+
+    /// A non-table element keeps its slot while it is cleaned, so its siblings keep their original
+    /// indices: the identity filter then drops the right entry instead of the one that slid into
+    /// its place.
+    #[test]
+    fn a_malformed_element_does_not_shift_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // A malformed element is authored by hand (a bare key where a table belongs): the sanitizer
+        // has to keep the slot so the two valid entries stay at their own indices.
+        let authored = r#"
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "option+l"
+"#;
+        let mixed = authored.replace(
+            "[[key_bindings.items]]\naction = \"quick.open_finder\"",
+            "items_placeholder = true\n[[key_bindings.items]]\naction = \"quick.open_finder\"",
+        );
+        std::fs::write(&path, mixed).unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        let actions: Vec<&str> = cfg
+            .key_bindings
+            .items
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|item| item.action.as_str())
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["quick.open_finder", "quick.lock_screen"],
+            "{errs:?}"
+        );
+    }
+
+    /// A mistyped `enabled` is repaired on its own: the binding keeps its action and chord instead
+    /// of being deleted with the field.
+    #[test]
+    fn a_mistyped_enabled_keeps_the_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+enabled = "yes"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "option+l"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(
+            errs.iter()
+                .any(|error| error.contains("key_bindings.items[0].enabled")),
+            "{errs:?}"
+        );
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        let actions: Vec<&str> = items.iter().map(|item| item.action.as_str()).collect();
+        assert_eq!(actions, vec!["quick.open_finder", "quick.lock_screen"]);
+        assert!(items[0].enabled, "the field falls back to its default");
+    }
+
+    /// When every entry is unusable the list stays empty: seeding the factory bindings would arm
+    /// shortcuts the user may have deleted on purpose.
+    #[test]
+    fn an_entirely_unusable_list_does_not_resurrect_the_factory_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+items = []
+
+[[key_bindings.items]]
+action = "window.nope"
+trigger = "option+j"
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "not-a-trigger"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("key_bindings.items[0].action")));
+        assert_eq!(
+            cfg.key_bindings.items.as_deref(),
+            Some(&[][..]),
+            "an emptied list stays empty"
+        );
+    }
+
+    #[test]
+    fn duplicate_triggers_keep_the_first_and_drop_the_later_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+e"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "option+e"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("key_bindings.items[1].trigger")));
+        let items = cfg.key_bindings.items.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].action, "quick.open_finder");
+    }
+
+    /// Reserved chords are resolved against the effective config, so the check sees the switcher
+    /// modifier and the clipboard shortcut as they will actually run.
+    ///
+    /// Precedence: the clipboard shortcut refuses a chord a binding already holds (so the clipboard
+    /// falls back), while a binding that collides with the *switcher* chord is dropped. Both UIs
+    /// refuse to create either pair, so this only settles a hand-edited file.
+    #[test]
+    fn reserved_chords_are_resolved_against_the_effective_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[keyboard]
+modifier = "option"
+
+[clipboard]
+shortcut = "cmd+shift+v"
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+tab"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "cmd+shift+v"
+
+[[key_bindings.items]]
+action = "quick.open_settings"
+trigger = "cmd+tab"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        // The clipboard shortcut collided with a binding, so it took its default; the binding that
+        // held the chord survives. Option+Tab is the switcher chord here, so that binding is the
+        // one that yields.
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("clipboard.shortcut")));
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+        let actions: Vec<&str> = cfg
+            .key_bindings
+            .items
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|item| item.action.as_str())
+            .collect();
+        assert_eq!(actions, vec!["quick.lock_screen", "quick.open_settings"]);
+        assert_eq!(errs.len(), 2, "{errs:?}");
+    }
+
+    /// The reviewer's case: an invalid clipboard shortcut falls back to its default, and a binding
+    /// that only collides with that *fallback* value is still caught — the check runs after
+    /// per-field fallback, not against the value the file stated.
+    #[test]
+    fn a_binding_on_the_fallback_clipboard_chord_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[clipboard]
+shortcut = "not-a-key"
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+v"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "option+l"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("clipboard.shortcut")));
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+        let actions: Vec<&str> = cfg
+            .key_bindings
+            .items
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|item| item.action.as_str())
+            .collect();
+        assert_eq!(actions, vec!["quick.lock_screen"], "{errs:?}");
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("key_bindings.items[0].trigger")));
+    }
+
+    /// The exact three-way permutation the review named: an invalid `keyboard.modifier` falls back
+    /// to Command, the clipboard shortcut the file stated collides with the switcher and falls back
+    /// to Option+V, and the binding that holds Option+V must then yield to that fallback.
+    #[test]
+    fn an_invalid_modifier_plus_a_clipboard_conflict_still_drops_the_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[keyboard]
+modifier = "ctrl"
+
+[clipboard]
+shortcut = "cmd+tab"
+
+[[key_bindings.items]]
+action = "quick.open_finder"
+trigger = "option+v"
+
+[[key_bindings.items]]
+action = "quick.lock_screen"
+trigger = "option+l"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("keyboard.modifier")));
+        assert_eq!(cfg.keyboard.modifier, "command");
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+        let actions: Vec<&str> = cfg
+            .key_bindings
+            .items
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|item| item.action.as_str())
+            .collect();
+        assert_eq!(
+            actions,
+            vec!["quick.lock_screen"],
+            "the binding on the fallback clipboard chord yields: {errs:?}"
+        );
+    }
+
+    /// A clipboard shortcut that only conflicts after per-field fallback is caught too: the
+    /// invalid `keyboard.modifier` falls back to Command, which makes cmd+tab the switcher chord.
+    #[test]
+    fn a_clipboard_shortcut_that_conflicts_only_after_fallback_is_repaired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[keyboard]
+modifier = "ctrl"
+
+[clipboard]
+shortcut = "cmd+tab"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(errs
+            .iter()
+            .any(|error| error.starts_with("keyboard.modifier")));
+        assert_eq!(cfg.keyboard.modifier, "command");
+        assert!(
+            errs.iter()
+                .any(|error| error.starts_with("clipboard.shortcut")),
+            "{errs:?}"
+        );
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+    }
+
+    /// Switching the app switcher to another modifier at runtime can hand it a chord a binding
+    /// holds; the binding yields, and the repair reports it.
+    #[test]
+    fn switching_the_switcher_modifier_drops_the_binding_that_would_own_its_chord() {
+        let mut cfg = Config::default();
+        cfg.keyboard.modifier = "option".into();
+        cfg.key_bindings.items = Some(vec![crate::key_bindings::KeyBinding {
+            action: "quick.open_finder".into(),
+            trigger: "cmd+tab".into(),
+            enabled: true,
+        }]);
+        // Option+Tab is the switcher chord here, so a Command+Tab binding is free.
+        assert!(cfg.repair_key_binding_conflicts().is_empty());
+
+        cfg.keyboard.modifier = "command".into();
+        let conflicts = cfg.repair_key_binding_conflicts();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(conflicts[0].starts_with("key_bindings.items[0].trigger"));
+        assert_eq!(cfg.key_bindings.items.as_deref(), Some(&[][..]));
+    }
+
+    /// The clipboard yields when the switcher takes its chord: switching the switcher to Command
+    /// makes a Command+Tab clipboard shortcut unusable, and the clipboard is the side that moves.
+    #[test]
+    fn a_switcher_change_makes_the_clipboard_shortcut_yield() {
+        let mut cfg = Config::default();
+        cfg.keyboard.modifier = "option".into();
+        cfg.clipboard.shortcut = "cmd+tab".into();
+        assert!(cfg.settle_reserved_shortcuts().is_empty());
+        assert_eq!(
+            cfg.clipboard.shortcut, "cmd+tab",
+            "free while Option+Tab is the switcher"
+        );
+
+        cfg.keyboard.modifier = "command".into();
+        let errors = cfg.settle_reserved_shortcuts();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("clipboard.shortcut"));
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+    }
+
+    /// A restored binding that takes the clipboard's chord makes the clipboard move, and the
+    /// binding survives -- the same precedence a load applies.
+    #[test]
+    fn a_restored_binding_takes_the_chord_from_the_clipboard() {
+        let mut cfg = Config::default();
+        cfg.clipboard.shortcut = "option+e".into();
+        cfg.key_bindings.items = Some(vec![crate::key_bindings::KeyBinding {
+            action: "quick.open_finder".into(),
+            trigger: "option+e".into(),
+            enabled: true,
+        }]);
+        let errors = cfg.settle_reserved_shortcuts();
+        assert!(errors.iter().any(|e| e.starts_with("clipboard.shortcut")));
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+        assert_eq!(
+            cfg.key_bindings.items.as_deref().map(<[_]>::len),
+            Some(1),
+            "the binding keeps its chord"
+        );
+    }
+
+    /// The other direction: a binding that takes the *default* clipboard chord yields, with one
+    /// error rather than a no-op clipboard fallback plus a dropped binding.
+    #[test]
+    fn a_binding_on_the_default_clipboard_chord_yields_on_its_own() {
+        let mut cfg = Config::default();
+        cfg.clipboard.shortcut = "option+v".into();
+        cfg.key_bindings.items = Some(vec![crate::key_bindings::KeyBinding {
+            action: "quick.open_finder".into(),
+            trigger: "option+v".into(),
+            enabled: true,
+        }]);
+        let errors = cfg.settle_reserved_shortcuts();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("key_bindings.items[0].trigger"));
+        assert_eq!(cfg.key_bindings.items.as_deref(), Some(&[][..]));
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+    }
+
+    #[test]
+    fn bindings_round_trip_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.key_bindings.enabled = true;
+        cfg.key_bindings.items = Some(vec![
+            crate::key_bindings::KeyBinding {
+                action: "quick.open_finder".into(),
+                trigger: "option+g".into(),
+                enabled: true,
+            },
+            crate::key_bindings::KeyBinding {
+                action: "window.center".into(),
+                trigger: "cmd+ctrl+c".into(),
+                enabled: false,
+            },
+        ]);
+        cfg.save_to(&path).unwrap();
+
+        let (loaded, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "{errs:?}");
+        assert!(loaded.key_bindings.enabled);
+        let items = loaded.key_bindings.items.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].trigger, "option+g");
+        assert_eq!(items[1].action, "window.center");
+        assert!(!items[1].enabled);
+    }
+
+    /// Bindings reserve their chords against the clipboard shortcut in both directions.
+    #[test]
+    fn a_clipboard_shortcut_that_collides_with_a_binding_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[clipboard]
+shortcut = "option+i"
+
+[[key_bindings.items]]
+action = "quick.open_settings"
+trigger = "option+i"
+"#,
+        )
+        .unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(
+            errs.iter()
+                .any(|error| error.starts_with("clipboard.shortcut")),
+            "{errs:?}"
+        );
+        assert_eq!(cfg.clipboard.shortcut, "option+v");
+        // The binding itself is untouched: the clipboard shortcut is what loses.
+        assert_eq!(
+            cfg.key_bindings.items.as_ref().unwrap()[0].trigger,
+            "option+i"
+        );
     }
 }

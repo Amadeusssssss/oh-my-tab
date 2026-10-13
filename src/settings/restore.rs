@@ -250,11 +250,10 @@ fn restore_tab_defaults(tab: usize) {
         3 => {
             cfg.clipboard = d.clipboard;
         }
-        4 => {
-            cfg.window_control = d.window_control;
-        }
-        5 => {
-            cfg.quick_actions = d.quick_actions;
+        SETTINGS_KEY_BINDINGS_PAGE_INDEX => {
+            // One page, one section: restoring it puts the factory bindings and both group
+            // switches back, which is also what drops every binding the user added.
+            cfg.key_bindings = d.key_bindings;
         }
         SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX => {
             cfg.keystroke_display = d.keystroke_display;

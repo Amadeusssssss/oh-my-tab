@@ -570,6 +570,173 @@ impl SettingsRow {
         Self::register_label(label, control);
         control
     }
+
+    /// One shortcut-legend cell: a symbol on a soft wash, vertically centred in the row.
+    ///
+    /// It is a *legend*, not a control (style doc §6.1): no border, no pointer state, no hit target.
+    /// The chip radius comes from the legend scale, not `radius-control`, because a control-sized
+    /// radius reads as a pill on a small chip. The caller positions the run horizontally; the
+    /// vertical centering is derived here from the shared row height so a chip lines up with the
+    /// label and the trailing control without the caller doing arithmetic.
+    pub(super) unsafe fn legend_chip(
+        parent: *mut AnyObject,
+        x: f64,
+        row_y: f64,
+        row_h: f64,
+        size: f64,
+        symbol: &str,
+    ) -> *mut AnyObject {
+        let chip: *mut AnyObject = objc2::msg_send![objc2::class!(NSTextField), alloc];
+        let chip: *mut AnyObject = objc2::msg_send![chip, initWithFrame: NSRect::new(
+            NSPoint::new(x, row_y + (row_h - size) / 2.0),
+            NSSize::new(size, size)
+        )];
+        widgets::set_field(chip, symbol);
+        let _: () = objc2::msg_send![chip, setBezeled: false];
+        let _: () = objc2::msg_send![chip, setDrawsBackground: false];
+        let _: () = objc2::msg_send![chip, setEditable: false];
+        let _: () = objc2::msg_send![chip, setSelectable: false];
+        let _: () = objc2::msg_send![chip, setAlignment: 1isize]; // NSTextAlignmentCenter
+        let font: *mut AnyObject = objc2::msg_send![
+            objc2::class!(NSFont),
+            systemFontOfSize: crate::theme::FONT_CONTROL
+        ];
+        let _: () = objc2::msg_send![chip, setFont: font];
+        widgets::apply_settings_text_role(chip, widgets::SettingsTextRole::Primary);
+        let _: () = objc2::msg_send![chip, setWantsLayer: true];
+        let layer: *mut AnyObject = objc2::msg_send![chip, layer];
+        if !layer.is_null() {
+            let base: u32 = if crate::theme::ui_palette().dark {
+                0xFFFF_FFFF
+            } else {
+                0x0000_0000
+            };
+            crate::ffi::layer_set_background(
+                layer,
+                crate::ffi::hex_to_cg_color((base & 0xFFFF_FF00) | crate::theme::LEGEND_CHIP_ALPHA),
+            );
+            // No border: a border is the visual contract of a pressable control (§6.1).
+            let _: () = objc2::msg_send![layer, setBorderWidth: 0.0f64];
+            let _: () = objc2::msg_send![layer, setCornerRadius: crate::theme::RADIUS_LEGEND_CHIP];
+            let _: () = objc2::msg_send![layer, setMasksToBounds: true];
+        }
+        let _: () = objc2::msg_send![parent, addSubview: chip];
+        release_obj(chip);
+        chip
+    }
+
+    /// A row whose label is preceded by a run of keycap cells (a shortcut legend), with the label
+    /// running up to the trailing control.
+    ///
+    /// Returns the label and the trailing control; the caller owns the keycap views because only it
+    /// knows how many cells the chord needs. Everything else — the label build, vertical centering
+    /// against the shared row height, the accessibility label and the control registration — is the
+    /// shared row behaviour, so a chord row is the same row as any other with a legend in front.
+    pub(super) unsafe fn with_leading_keycaps(
+        parent: *mut AnyObject,
+        label_x: f64,
+        y: f64,
+        h: f64,
+        label_text: &str,
+        control: *mut AnyObject,
+    ) -> (*mut AnyObject, *mut AnyObject) {
+        let (label, control) =
+            widgets::add_row_with_label(parent, label_x, y, 0.0, h, label_text, control);
+        Self::center_label(label, y, h);
+        Self::center_readonly_text_control(control, y, h);
+        Self::center_control(control, y, h);
+        Self::register_label(label, control);
+        (label, control)
+    }
+}
+
+/// A joined two-glyph action control (the System-Settings ＋ / − cluster).
+///
+/// One native `NSSegmentedControl` rather than two adjacent buttons: the AppKit control draws a
+/// single outer border with one divider between the cells and a shared corner radius, which is what
+/// makes the pair read as one control. Two independent buttons each carry their own border and
+/// radius, so they read as two buttons no matter how closely they are placed.
+///
+/// The caller supplies the per-segment symbols and their spoken names; this component owns the
+/// geometry, the momentary tracking mode and the target/action wiring.
+pub(super) struct SettingsActionSegments;
+
+/// One segment of a [`SettingsActionSegments`] control: the symbol it shows and the name VoiceOver
+/// reads for it.
+pub(super) struct SegmentSpec<'a> {
+    pub(super) symbol: &'a str,
+    pub(super) description: &'a str,
+}
+
+impl SettingsActionSegments {
+    /// The control's height. It is the documented minimum hit target (§10), which is also what makes
+    /// the two glyph cells comfortable without a separate hit-area override.
+    pub(super) const HEIGHT: f64 = 28.0;
+    /// One cell's width. Two of these plus the shared divider is the whole control, so a caller can
+    /// compute where the caption after it starts.
+    pub(super) const CELL_W: f64 = 34.0;
+    pub(super) const WIDTH: f64 = Self::CELL_W * 2.0;
+    /// The glyph size inside a cell.
+    pub(super) const GLYPH: f64 = 13.0;
+
+    pub(super) unsafe fn create(
+        x: f64,
+        y: f64,
+        segments: &[SegmentSpec],
+        target: *mut AnyObject,
+        action: Sel,
+    ) -> *mut AnyObject {
+        let control: *mut AnyObject = objc2::msg_send![objc2::class!(NSSegmentedControl), alloc];
+        let control: *mut AnyObject = objc2::msg_send![
+            control,
+            initWithFrame: NSRect::new(
+                NSPoint::new(x, y),
+                NSSize::new(Self::CELL_W * segments.len() as f64, Self::HEIGHT)
+            )
+        ];
+        let _: () = objc2::msg_send![control, setSegmentCount: segments.len() as isize];
+        // Momentary: these are two actions, not a two-way switch, so nothing stays "selected".
+        let _: () = objc2::msg_send![control, setTrackingMode: 2isize];
+        let _: () = objc2::msg_send![control, setSegmentStyle: 1isize]; // NSSegmentStyleRounded
+        for (index, segment) in segments.iter().enumerate() {
+            let image = widgets::make_symbol_image_described(
+                segment.symbol,
+                NSSize::new(Self::GLYPH, Self::GLYPH),
+                segment.description,
+            );
+            if !image.is_null() {
+                let _: () = objc2::msg_send![control, setImage: image, forSegment: index as isize];
+            }
+            let _: () =
+                objc2::msg_send![control, setWidth: Self::CELL_W, forSegment: index as isize];
+        }
+        let _: () = objc2::msg_send![control, setTarget: target];
+        let _: () = objc2::msg_send![control, setAction: action];
+        control
+    }
+
+    /// Which segment the sender reports, or `None` when the control reports no selection.
+    ///
+    /// `selectedSegment` is `-1` for "no segment selected", which is a defined AppKit state and not
+    /// segment 0. Clamping it to 0 would turn an unknown click into the first segment's action -- for
+    /// the footer's `+ / −` pair that means a stray deletion path is never reached, but an
+    /// unrecognised sender could open the add panel. Callers match on the value instead.
+    pub(super) unsafe fn selected_segment(sender: *mut AnyObject) -> Option<usize> {
+        if sender.is_null() {
+            return None;
+        }
+        let index: isize = objc2::msg_send![sender, selectedSegment];
+        usize::try_from(index).ok()
+    }
+
+    /// Enable or disable one cell. `−` is armed by a selection and frozen by the master switch, so
+    /// the two halves have different availability and a whole-control `setEnabled:` would be wrong.
+    pub(super) unsafe fn set_segment_enabled(control: *mut AnyObject, index: usize, enabled: bool) {
+        if control.is_null() {
+            return;
+        }
+        let _: () = objc2::msg_send![control, setEnabled: enabled, forSegment: index as isize];
+    }
 }
 
 /// Native controls shared by settings rows and the window chrome.
@@ -767,6 +934,10 @@ pub(crate) enum SettingsButtonRole {
     Footer,
     Primary,
     Destructive,
+    /// A full-row hit target with no chrome of its own: no fill, no border, no hover wash. Used where
+    /// a row is made selectable and the selection highlight is drawn by the owner, so the surface must
+    /// not add a second visual state on top of it.
+    Transparent,
 }
 
 impl SettingsButtonRole {
@@ -779,7 +950,16 @@ impl SettingsButtonRole {
             Self::Footer => (palette.footer_button_bg, palette.button_text, -1),
             Self::Primary => (palette.accent, palette.accent_text, -2),
             Self::Destructive => (palette.destructive, palette.accent_text, -4),
+            // Tag -5 is the transparent role's own palette slot: its normal and hover fills are both
+            // fully transparent, so the row's selection wash stays the only thing drawn.
+            Self::Transparent => (0x0000_0000, palette.primary_text, -5),
         }
+    }
+
+    /// Whether the role draws any chrome at all. A borderless role must skip the border/fill pass
+    /// entirely, or the hairline and the hover wash would reappear over the owner's own highlight.
+    pub(super) fn borderless(self) -> bool {
+        matches!(self, Self::Transparent)
     }
 }
 
@@ -796,9 +976,15 @@ impl SettingsButton {
         role: SettingsButtonRole,
     ) -> *mut AnyObject {
         let (background, text, hover_tag) = role.style(crate::theme::ui_palette());
-        widgets::make_settings_styled_button(
+        let button = widgets::make_settings_styled_button(
             frame, title, target, action, background, text, hover_tag,
-        )
+        );
+        if role.borderless() {
+            // The styled builder installs the fill and the hairline; strip both so the row's own
+            // selection highlight is the only thing drawn behind the label.
+            widgets::make_button_borderless(button);
+        }
+        button
     }
 
     /// Re-apply a role's palette to an existing button. The warning banner's button carries different
@@ -1782,8 +1968,7 @@ pub(super) enum SettingsSidebarIcon {
     Switcher,
     Mouse,
     Clipboard,
-    WindowControl,
-    QuickActions,
+    KeyBindings,
     KeystrokeDisplay,
     About,
 }
@@ -1797,11 +1982,8 @@ impl SettingsSidebarIcon {
             // `doc.on.clipboard` has a dark overlapping foreground layer in the system glyph;
             // use the clean document outline so the sidebar stays visually balanced.
             Self::Clipboard => "doc.text",
-            // A rectangle split into left/right halves mirrors the window-control
-            // half-screen/quarter-snapping semantics.
-            Self::WindowControl => "rectangle.split.2x2",
-            // A bolt mirrors the quick-actions "jump straight there" semantics.
-            Self::QuickActions => "bolt.circle",
+            // A command-key square: the page is about key chords and the behaviours they run.
+            Self::KeyBindings => "command.square",
             Self::KeystrokeDisplay => "keyboard",
             Self::About => "info.circle",
         }
@@ -1846,8 +2028,7 @@ impl SettingsSidebar {
             t("settings.sidebar_switcher"),
             t("settings.sidebar_mouse"),
             t("settings.sidebar_clipboard"),
-            t("settings.sidebar_window_control"),
-            t("settings.sidebar_quick_actions"),
+            t("settings.sidebar_key_bindings"),
             t("settings.sidebar_keystroke_display"),
             t("settings.sidebar_about"),
         ];
@@ -1889,12 +2070,8 @@ impl SettingsSidebar {
             ("settings.sidebar_mouse", SettingsSidebarIcon::Mouse),
             ("settings.sidebar_clipboard", SettingsSidebarIcon::Clipboard),
             (
-                "settings.sidebar_window_control",
-                SettingsSidebarIcon::WindowControl,
-            ),
-            (
-                "settings.sidebar_quick_actions",
-                SettingsSidebarIcon::QuickActions,
+                "settings.sidebar_key_bindings",
+                SettingsSidebarIcon::KeyBindings,
             ),
             (
                 "settings.sidebar_keystroke_display",

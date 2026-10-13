@@ -170,8 +170,7 @@ pub(super) unsafe fn build_settings_sidebar(
         &mut ui.sidebar_switcher,
         &mut ui.sidebar_mouse,
         &mut ui.sidebar_clipboard,
-        &mut ui.sidebar_window_control,
-        &mut ui.sidebar_quick_actions,
+        &mut ui.sidebar_key_bindings,
         &mut ui.sidebar_keystroke_display,
         &mut ui.sidebar_about,
     ]

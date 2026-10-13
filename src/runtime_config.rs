@@ -36,8 +36,10 @@ struct ChangeFlags {
     clipboard_shortcut: bool,
     // The "separate clear all" switch: the picker header shows or hides its second button live.
     clipboard_clear_actions: bool,
-    window_control: bool,
-    quick_actions: bool,
+    // The binding list or either group switch changed: the engine republishes its table and starts
+    // or stops the tap. The two legacy switches (which used to own a tap each) are covered by this
+    // one flag: one engine now serves both groups.
+    key_bindings: bool,
     keystroke_display: bool,
     updates: bool,
 }
@@ -54,6 +56,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.thumbnail_size
         || flags.keystroke_display
         || flags.mouse
+        || flags.key_bindings
 }
 
 fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> ChangeFlags {
@@ -84,8 +87,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
         clipboard_clear_actions: startup
             || old.clipboard.separate_clear_all != new.clipboard.separate_clear_all,
-        window_control: startup || old.window_control.enabled != new.window_control.enabled,
-        quick_actions: startup || old.quick_actions.enabled != new.quick_actions.enabled,
+        key_bindings: startup || old.key_bindings != new.key_bindings,
         keystroke_display: startup || old.keystroke_display != new.keystroke_display,
         updates: startup
             || old.updates.automatically_check != new.updates.automatically_check
@@ -93,9 +95,47 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
     }
 }
 
+/// Whether this change can create or dissolve a reserved-chord collision: the switcher's modifier,
+/// the clipboard shortcut and the binding list are the three inputs the coordination reads.
+///
+/// Pure, so the wiring is assertable without running the side effects (the same shape as
+/// `needs_in_place_control_sync`).
+fn needs_reserved_shortcut_coordination(flags: &ChangeFlags) -> bool {
+    flags.modifier || flags.clipboard_shortcut || flags.key_bindings
+}
+
 /// Apply all runtime side effects for a new configuration in one pass.
 pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChangeSource) {
     let flags = change_flags(old, new, source);
+
+    // Reserved chords are settled once, before anything below publishes a table, caches the
+    // clipboard chord or paints a control: a modifier change, a clipboard change and a binding edit
+    // can each create a collision, and every consumer has to see the same settled config. The
+    // settled copy is what the branches below read, so no later `publish` can disagree with it.
+    let effective = if needs_reserved_shortcut_coordination(&flags) {
+        let mut candidate = match crate::config::CONFIG.read() {
+            Ok(cfg) => cfg.clone(),
+            Err(_) => new.clone(),
+        };
+        let conflicts = candidate.settle_reserved_shortcuts();
+        if conflicts.is_empty() {
+            candidate
+        } else {
+            for conflict in &conflicts {
+                crate::log_info!("[keybind] {} (reserved shortcut coordination)", conflict);
+            }
+            if let Ok(mut current) = crate::config::CONFIG.write() {
+                *current = candidate.clone();
+            }
+            crate::config::persist_config_now();
+            candidate
+        }
+    } else {
+        match crate::config::CONFIG.read() {
+            Ok(cfg) => cfg.clone(),
+            Err(_) => new.clone(),
+        }
+    };
 
     // A clipboard purge an earlier session could not finish runs first, on every apply and whether
     // the clipboard switch is on or off (`clear_on_quit` failures happen with it on). It must come
@@ -141,7 +181,7 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
 
     if flags.modifier {
-        crate::menu::set_shortcut_mode(new.keyboard.modifier == "command");
+        crate::menu::set_shortcut_mode(effective.keyboard.modifier == "command");
     }
     if flags.startup {
         crate::autostart::sync(new.startup.launch_at_login);
@@ -153,10 +193,13 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         };
         crate::logger::reconfigure(level);
     }
-    if flags.clipboard_shortcut {
-        crate::event_monitor::set_clipboard_shortcut(&new.clipboard.shortcut);
+    if flags.clipboard_shortcut || flags.modifier || flags.key_bindings {
+        // The settled chord, not the requested one: the coordination may have moved it.
+        crate::event_monitor::set_clipboard_shortcut(&effective.clipboard.shortcut);
         crate::settings::refresh_clipboard_shortcut_control_from_config();
-        crate::onboarding::refresh_clipboard_shortcut(&new.clipboard.shortcut);
+        // The settled chord: the coordination above may have moved it, and the guide must name
+        // the shortcut the app actually listens for.
+        crate::onboarding::refresh_clipboard_shortcut(&effective.clipboard.shortcut);
     }
     if flags.clipboard_clear_actions {
         crate::clipboard::update_clear_action_labels();
@@ -230,18 +273,15 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         }
     }
 
-    if flags.window_control {
-        if new.window_control.enabled {
-            crate::window_management::start();
+    if flags.key_bindings || flags.modifier || flags.clipboard_shortcut {
+        // Publish first, then start: a tap that begins between the two must never read a stale
+        // table. The published config is the settled one, so a binding that had to yield is gone
+        // from the table as well. Stopping with both groups off is the graceful direction.
+        crate::key_bindings::publish(&effective);
+        if crate::key_bindings::enabled_in(&effective) {
+            crate::key_bindings::start();
         } else if !matches!(source, ConfigChangeSource::Startup) {
-            crate::window_management::stop();
-        }
-    }
-    if flags.quick_actions {
-        if new.quick_actions.enabled {
-            crate::quick_actions::start();
-        } else if !matches!(source, ConfigChangeSource::Startup) {
-            crate::quick_actions::stop();
+            crate::key_bindings::stop();
         }
     }
     if flags.keystroke_display {
@@ -275,12 +315,81 @@ mod tests {
         let mut new = old.clone();
         new.mouse.enabled = true;
         new.clipboard.enabled = true;
-        new.window_control.enabled = true;
-        new.quick_actions.enabled = true;
+        new.key_bindings.enabled = true;
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
-        assert!(
-            flags.mouse && flags.clipboard_enabled && flags.window_control && flags.quick_actions
-        );
+        assert!(flags.mouse && flags.clipboard_enabled && flags.key_bindings);
+    }
+
+    /// Any part of the binding feature republishes the engine: the master switch, a row switch, or
+    /// an edit to the list itself.
+    /// The coordination has to run for all three inputs, and only for them.
+    /// Every consumer of a settled field inside `apply_config_change` must read the coordinated
+    /// copy: a new one reading the requested config would cache or paint a value the runtime does
+    /// not use (the onboarding hint did exactly that). Source-scanning, like the motion-token test.
+    #[test]
+    fn settled_fields_are_read_from_the_effective_config() {
+        let source = include_str!("runtime_config.rs");
+        let body_start = source
+            .find("pub(crate) fn apply_config_change")
+            .expect("apply_config_change is in this file");
+        let body = &source[body_start..];
+        let body_end = body.find("\n#[cfg(test)]").unwrap_or(body.len());
+        let body = &body[..body_end];
+        for line in body.lines() {
+            if line.contains("clipboard.shortcut") || line.contains("key_bindings") {
+                assert!(
+                    !line.contains("new."),
+                    "settled field read from the requested config: {line}"
+                );
+                assert!(
+                    !line.contains("new:"),
+                    "settled field read from the requested config: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_shortcut_coordination_covers_modifier_clipboard_and_bindings() {
+        let base = Config::default();
+        let flags_for = |mutate: fn(&mut Config)| {
+            let mut new = base.clone();
+            mutate(&mut new);
+            change_flags(&base, &new, ConfigChangeSource::Settings)
+        };
+        assert!(needs_reserved_shortcut_coordination(&flags_for(|cfg| {
+            cfg.keyboard.modifier = "option".into()
+        })));
+        assert!(needs_reserved_shortcut_coordination(&flags_for(|cfg| {
+            cfg.clipboard.shortcut = "cmd+shift+v".into()
+        })));
+        assert!(needs_reserved_shortcut_coordination(&flags_for(|cfg| {
+            cfg.key_bindings.items.as_mut().unwrap()[0].trigger = "option+j".into()
+        })));
+        // An unrelated change must not pay for it.
+        assert!(!needs_reserved_shortcut_coordination(&flags_for(|cfg| {
+            cfg.appearance.theme = "dark".into()
+        })));
+    }
+
+    #[test]
+    fn binding_changes_are_detected_for_switches_and_list_edits() {
+        let old = Config::default();
+        for mutate in [
+            (|cfg: &mut Config| cfg.key_bindings.enabled = true) as fn(&mut Config),
+            |cfg: &mut Config| {
+                cfg.key_bindings.items.as_mut().unwrap()[0].enabled = false;
+            },
+            |cfg: &mut Config| {
+                cfg.key_bindings.items.as_mut().unwrap()[0].trigger = "option+j".into();
+            },
+        ] {
+            let mut new = old.clone();
+            mutate(&mut new);
+            let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+            assert!(flags.key_bindings, "a binding change was not detected");
+        }
+        assert!(!change_flags(&old, &old.clone(), ConfigChangeSource::Settings).key_bindings);
     }
 
     #[test]
@@ -372,6 +481,6 @@ mod tests {
         new.keystroke_display.enabled = true;
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.keystroke_display);
-        assert!(!flags.mouse && !flags.clipboard_enabled && !flags.window_control);
+        assert!(!flags.mouse && !flags.clipboard_enabled && !flags.key_bindings);
     }
 }

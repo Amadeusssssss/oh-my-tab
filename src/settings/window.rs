@@ -12,8 +12,7 @@ fn page_scroll_views(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
         ui.switcher_view,
         ui.mouse_view,
         ui.clipboard_view,
-        ui.window_control_view,
-        ui.quick_actions_view,
+        ui.key_bindings_view,
         ui.keystroke_display_view,
         ui.about_view,
     ]
@@ -181,9 +180,75 @@ pub(super) unsafe fn refresh_settings_warning_banner(ui: &SettingsUi) {
 
 /// Switch the active settings page: align the highlight to the selected button, toggle the
 /// eight content views' visibility, and bold the selected item's label.
+/// An editor that belongs to one page and must not outlive a switch away from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageEditor {
+    /// A key-binding chord recording (and the unconfirmed draft it may have produced).
+    BindingRecording,
+    /// The Key Bindings add panel.
+    BindingPanel,
+    /// The Mouse page's mapping edit panel.
+    MappingPanel,
+}
+
+/// Which editor *classes* have to be wrapped up when the sidebar moves to `idx`.
+///
+/// Pure and free of UI state, so the ownership rule is assertable without a live window: each editor
+/// belongs to one page, and a switch away from that page abandons it. Whether a given editor is
+/// actually open is a separate question the caller answers with `close_page_editor`, which is also
+/// what keeps a closed panel from being disturbed.
+pub(super) fn abandoned_page_editors(idx: usize) -> Vec<PageEditor> {
+    let mut editors = Vec::new();
+    if idx != SETTINGS_KEY_BINDINGS_PAGE_INDEX {
+        editors.push(PageEditor::BindingRecording);
+        editors.push(PageEditor::BindingPanel);
+    }
+    if idx != SETTINGS_MOUSE_PAGE_INDEX {
+        editors.push(PageEditor::MappingPanel);
+    }
+    editors
+}
+
+/// Wrap up one editor if it is actually live, and report whether it was.
+///
+/// Each arm asks its own liveness question: closing an already-closed panel would be harmless, but a
+/// *recording* cancel must not run on a page the user is only arriving at, and the mapping panel is
+/// not this page's to touch unless it is open.
+fn close_page_editor(editor: PageEditor) -> bool {
+    match editor {
+        PageEditor::BindingRecording => {
+            if !mapping::pending_binding_recording() {
+                return false;
+            }
+            mapping::cancel_recording_from_main();
+            true
+        }
+        PageEditor::BindingPanel => {
+            if !bindings::panel_is_open() {
+                return false;
+            }
+            bindings::close_binding_panel();
+            true
+        }
+        PageEditor::MappingPanel => {
+            if !mapping::mapping_panel_is_open() {
+                return false;
+            }
+            mapping::close_mapping_panel();
+            true
+        }
+    }
+}
+
 pub(super) fn select_sidebar(idx: usize) {
     // fall back to the General page if the tag is out of range
     let idx = if idx >= SETTINGS_PAGE_COUNT { 0 } else { idx };
+    // Leaving a page abandons its editors: a recording, a confirmed-but-unwritten draft and the
+    // floating panel that owns them all belong to the page the user is looking at, so none may
+    // outlive a switch to another page. The mouse page's mapping panel is closed on the same rule.
+    for editor in abandoned_page_editors(idx) {
+        close_page_editor(editor);
+    }
     // Dismiss the previous page's disabled hint so the bubble cannot remain across tabs.
     unsafe { tooltip::SettingsTooltip::dismiss() };
     unsafe { widgets::clear_sidebar_hover() };
@@ -199,8 +264,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 ui.sidebar_switcher,
                 ui.sidebar_mouse,
                 ui.sidebar_clipboard,
-                ui.sidebar_window_control,
-                ui.sidebar_quick_actions,
+                ui.sidebar_key_bindings,
                 ui.sidebar_keystroke_display,
                 ui.sidebar_about,
             ];
@@ -209,8 +273,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 ui.switcher_view,
                 ui.mouse_view,
                 ui.clipboard_view,
-                ui.window_control_view,
-                ui.quick_actions_view,
+                ui.key_bindings_view,
                 ui.keystroke_display_view,
                 ui.about_view,
             ];
@@ -218,13 +281,13 @@ pub(super) fn select_sidebar(idx: usize) {
             let frame: NSRect = msg_send![buttons[idx], frame];
             SettingsSidebar::move_highlight(ui.sidebar_highlight, frame);
             // Selected items use an accent-colored bold title; unselected items use the system label color.
+            // Shares the sidebar's order: the index is the page index, so one entry per page.
             let titles = [
                 t("settings.sidebar_general"),
                 t("settings.sidebar_switcher"),
                 t("settings.sidebar_mouse"),
                 t("settings.sidebar_clipboard"),
-                t("settings.sidebar_window_control"),
-                t("settings.sidebar_quick_actions"),
+                t("settings.sidebar_key_bindings"),
                 t("settings.sidebar_keystroke_display"),
                 t("settings.sidebar_about"),
             ];
@@ -256,8 +319,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 "switcher",
                 "mouse",
                 "clipboard",
-                "window-control",
-                "quick-actions",
+                "key-bindings",
                 "keystroke-display",
                 "about",
             ];
@@ -622,8 +684,7 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
             ui.switcher_view,
             ui.mouse_view,
             ui.clipboard_view,
-            ui.window_control_view,
-            ui.quick_actions_view,
+            ui.key_bindings_view,
             ui.keystroke_display_view,
             ui.about_view,
         ]
@@ -659,8 +720,7 @@ unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; SETTINGS
         ui.switcher_view,
         ui.mouse_view,
         ui.clipboard_view,
-        ui.window_control_view,
-        ui.quick_actions_view,
+        ui.key_bindings_view,
         ui.keystroke_display_view,
         ui.about_view,
     ];
@@ -794,8 +854,7 @@ fn show_settings_inner(
                         u.switcher_view,
                         u.mouse_view,
                         u.clipboard_view,
-                        u.window_control_view,
-                        u.quick_actions_view,
+                        u.key_bindings_view,
                         u.keystroke_display_view,
                         u.about_view,
                     ];
@@ -825,7 +884,6 @@ fn show_settings_inner(
             let _: bool =
                 unsafe { msg_send![window, makeFirstResponder: std::ptr::null::<AnyObject>()] };
         }
-        set_text_input_active(false);
     }
     // Conditional rows / the permission banner change the content height, so tighten once more; if the
     // height changed, the scroll offset set above is stale, so park the current page back at the top.
@@ -841,8 +899,7 @@ fn show_settings_inner(
                         u.switcher_view,
                         u.mouse_view,
                         u.clipboard_view,
-                        u.window_control_view,
-                        u.quick_actions_view,
+                        u.key_bindings_view,
                         u.keystroke_display_view,
                         u.about_view,
                     ];
@@ -872,14 +929,23 @@ fn show_settings_inner(
     }
 }
 
-pub(super) fn hide_settings() {
-    // Defensive: wrap up any in-progress recording / edit panel when the window closes.
+/// Wrap up every floating editor that belongs to the settings content: the two edit panels and any
+/// recording either of them owns. Called before the content hierarchy is hidden, replaced or
+/// released, because each panel holds a dim layer parented to a view in that hierarchy.
+pub(super) fn close_floating_editors() {
     cancel_recording_from_main();
     close_mapping_panel();
+    bindings::close_binding_panel();
+}
+
+pub(super) fn hide_settings() {
+    // Defensive: wrap up any in-progress recording and every floating editor when the window closes.
+    // The two panels are separate windows that outlive a `hide`, and each holds a dim layer added to
+    // the settings content view -- which is what this function is about to stop owning.
+    close_floating_editors();
     // A select's panel is a child window and the trigger stays first responder while it is open, so
     // both its state and its focus outlive a hide unless they are wrapped up here.
     super::select::close_open_settings_selects();
-    set_text_input_active(false);
     // Closing settings discards any unconfirmed restore action and resets to one button (both
     // cards).
     collapse_restore_confirmations(false);
@@ -940,6 +1006,9 @@ pub(crate) fn refresh_system_appearance() {
     unsafe {
         // Detach callbacks and registries, then redraw the content hierarchy inside the same
         // visible NSWindow. The window never orders out, changes identity, or changes focus.
+        // Every floating editor goes first: each holds a dim layer parented to the content view that
+        // is about to be rebuilt, so leaving one open would leave it pointing at a freed view.
+        close_floating_editors();
         widgets::clear_sidebar_hover();
         detach_settings_window_runtime(&old_ui, false);
         rebuild_settings_content(old_ui.window);
@@ -1380,8 +1449,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                         ui.switcher_view,
                         ui.mouse_view,
                         ui.clipboard_view,
-                        ui.window_control_view,
-                        ui.quick_actions_view,
+                        ui.key_bindings_view,
                         ui.keystroke_display_view,
                         ui.about_view,
                     ],
@@ -1412,13 +1480,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
-        let page_names = [
+        // One name per page, in sidebar order: the index is the page index.
+        let page_names: [&str; SETTINGS_PAGE_COUNT] = [
             "general",
             "switcher",
             "mouse",
             "clipboard",
-            "window-control",
-            "quick-actions",
+            "key-bindings",
             "keystroke-display",
             "about",
         ];
@@ -1468,8 +1536,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 ui.sidebar_switcher,
                 ui.sidebar_mouse,
                 ui.sidebar_clipboard,
-                ui.sidebar_window_control,
-                ui.sidebar_quick_actions,
+                ui.sidebar_key_bindings,
                 ui.sidebar_keystroke_display,
                 ui.sidebar_about,
             ];
@@ -1666,13 +1733,12 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
-        let names = [
+        let names: [&str; SETTINGS_PAGE_COUNT] = [
             "general",
             "switcher",
             "mouse",
             "clipboard",
-            "window-control",
-            "quick-actions",
+            "key-bindings",
             "keystroke-display",
             "about",
         ];
@@ -1739,6 +1805,34 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 return false;
             }
         }
+        // The binding list's footer is one joined control whose two segments have different
+        // availability (`＋` always while enabled, `−` only with a selection). Driving the production
+        // enable pass and then asserting both flags is what catches a missing per-segment call.
+        select_sidebar(SETTINGS_KEY_BINDINGS_PAGE_INDEX);
+        let _: () = msg_send![window, layoutIfNeeded];
+        // Clear the selection, then drive the SAME function the master switch drives. Calling it (and
+        // nothing after it) is what makes this a check of the production path: a helper that only
+        // inspected the current state would read whatever the last repaint happened to leave, and
+        // `clear_selection` runs the per-segment arm itself, which would mask a mis-ordered pass.
+        // The row's own controls have to keep their clicks: the whole-row selection surface is a
+        // transparent overlay, and `addSubview:` puts a view on top, which is how it once swallowed
+        // the switch.
+        if !bindings::debug_validate_row_overlay_is_below_controls() {
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] the row overlay sits below the row's controls");
+        bindings::clear_selection();
+        with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_ref() {
+                bindings::update_binding_controls_enabled(ui);
+            }
+        });
+        if !bindings::debug_validate_footer_segment_gating() {
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] footer segments are gated correctly");
         log_info!("[smoke-settings-layout] all pages passed");
         // Inline update content (release notes) expands the About page's Updates card. The page
         // document must grow with the card, otherwise the bottom of the notes is cut off and cannot
@@ -2455,6 +2549,10 @@ fn create_settings_window() {
 /// Rebuilds the settings content (after a scroller-style change, to fit the new visible width).
 pub(crate) unsafe fn rebuild_settings_content_now() {
     if let Some(window) = with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window)) {
+        // Same rule as the full rebuild: a floating editor holds a dim layer parented to the content
+        // view this is about to replace, so it has to go first (the scroller-style change reaches
+        // here directly).
+        close_floating_editors();
         rebuild_settings_content(window);
         // Rebuilding creates fresh controls, so restore the current configuration afterward.
         load_settings_values();
@@ -2625,8 +2723,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             sidebar_switcher: std::ptr::null_mut(),
             sidebar_mouse: std::ptr::null_mut(),
             sidebar_clipboard: std::ptr::null_mut(),
-            sidebar_window_control: std::ptr::null_mut(),
-            sidebar_quick_actions: std::ptr::null_mut(),
+            sidebar_key_bindings: std::ptr::null_mut(),
             sidebar_keystroke_display: std::ptr::null_mut(),
             sidebar_about: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
@@ -2634,8 +2731,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             switcher_view: std::ptr::null_mut(),
             mouse_view: std::ptr::null_mut(),
             clipboard_view: std::ptr::null_mut(),
-            window_control_view: std::ptr::null_mut(),
-            quick_actions_view: std::ptr::null_mut(),
+            key_bindings_view: std::ptr::null_mut(),
             keystroke_display_view: std::ptr::null_mut(),
             about_view: std::ptr::null_mut(),
             about_subtitle: std::ptr::null_mut(),
@@ -2703,21 +2799,16 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_shortcut_row_height: 0.0,
             clipboard_pin_follow_row_height: 0.0,
             clipboard_row_gap: 0.0,
-            window_control_enabled: std::ptr::null_mut(),
-            window_control_up: std::ptr::null_mut(),
-            window_control_down: std::ptr::null_mut(),
-            window_control_left: std::ptr::null_mut(),
-            window_control_right: std::ptr::null_mut(),
-            window_control_display_up: std::ptr::null_mut(),
-            window_control_display_down: std::ptr::null_mut(),
-            window_control_display_left: std::ptr::null_mut(),
-            window_control_display_right: std::ptr::null_mut(),
-            quick_actions_enabled: std::ptr::null_mut(),
-            quick_actions_open_settings: std::ptr::null_mut(),
-            quick_actions_open_finder: std::ptr::null_mut(),
-            quick_actions_show_desktop: std::ptr::null_mut(),
-            quick_actions_lock_screen: std::ptr::null_mut(),
-            quick_actions_locate_pointer: std::ptr::null_mut(),
+            key_bindings_enabled: std::ptr::null_mut(),
+            key_bindings_doc: std::ptr::null_mut(),
+            key_bindings_empty: std::ptr::null_mut(),
+            key_bindings_footer: std::ptr::null_mut(),
+            key_bindings_footer_segments: std::ptr::null_mut(),
+            key_bindings_row: 0,
+            key_binding_rows: Vec::new(),
+            key_binding_items_rendered: Vec::new(),
+            key_binding_selected: None,
+            key_binding_selection_bg: std::ptr::null_mut(),
             clipboard_clear_on_quit: std::ptr::null_mut(),
             clipboard_separate_clear_all: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
@@ -2811,12 +2902,11 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let switcher_doc_h = 1432.0;
         let mouse_doc_h = 1620.0;
         let clipboard_doc_h = 978.0;
-        // The window-control page contains the master, four direction switches, and four
-        // cross-display switches.
-        let window_control_doc_h = 1102.0;
-        // Quick-actions page: master plus five action switches, mirroring the window-control
-        // page.
-        let quick_actions_doc_h = 854.0;
+        // The Key Bindings page: one card holding the master switch and the dynamic binding rows
+        // (the bindings module hands the list's height to the page canvas), plus the add row. The
+        // provisional height only has to be generous enough for the build pass; the rows reflow
+        // themselves afterwards.
+        let key_bindings_doc_h = 1500.0;
         let keystroke_display_doc_h = 650.0;
         let about_doc_h = 1300.0;
 
@@ -2836,15 +2926,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let clipboard_root = clipboard_page.scroll;
         let clipboard_view = clipboard_page.document;
         ui.clipboard_view = clipboard_root;
-        let window_control_page =
-            SettingsPage::new(content, page_frame, window_control_doc_h, true);
-        let window_control_root = window_control_page.scroll;
-        let window_control_view = window_control_page.document;
-        ui.window_control_view = window_control_root;
-        let quick_actions_page = SettingsPage::new(content, page_frame, quick_actions_doc_h, true);
-        let quick_actions_root = quick_actions_page.scroll;
-        let quick_actions_view = quick_actions_page.document;
-        ui.quick_actions_view = quick_actions_root;
+        let key_bindings_page = SettingsPage::new(content, page_frame, key_bindings_doc_h, true);
+        let key_bindings_root = key_bindings_page.scroll;
+        let key_bindings_view = key_bindings_page.document;
+        ui.key_bindings_view = key_bindings_root;
         let keystroke_display_page =
             SettingsPage::new(content, page_frame, keystroke_display_doc_h, true);
         let keystroke_display_root = keystroke_display_page.scroll;
@@ -2880,17 +2965,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &mut ui,
         );
 
-        let window_control_shortcuts_card_bottom = page_builder::build_window_control_page(
+        let key_bindings_card_bottom = page_builder::build_key_bindings_page(
             &page_context,
-            window_control_view,
-            window_control_doc_h,
-            &mut ui,
-        );
-
-        let quick_actions_card_bottom = page_builder::build_quick_actions_page(
-            &page_context,
-            quick_actions_view,
-            quick_actions_doc_h,
+            key_bindings_view,
+            key_bindings_doc_h,
             &mut ui,
         );
 
@@ -2916,8 +2994,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                     switcher_root,
                     mouse_root,
                     clipboard_root,
-                    window_control_root,
-                    quick_actions_root,
+                    key_bindings_root,
                     keystroke_display_root,
                     about_root,
                 ],
@@ -2926,8 +3003,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                     switcher_view,
                     mouse_view,
                     clipboard_view,
-                    window_control_view,
-                    quick_actions_view,
+                    key_bindings_view,
                     keystroke_display_view,
                     about_view,
                 ],
@@ -2936,8 +3012,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                     switcher_content_bottom,
                     mouse_content_bottom,
                     clipboard_options_card_bottom,
-                    window_control_shortcuts_card_bottom,
-                    quick_actions_card_bottom,
+                    key_bindings_card_bottom,
                     keystroke_display_card_bottom,
                     compact_card_bottom,
                 ],
@@ -3031,10 +3106,12 @@ unsafe fn detach_settings_window_runtime(ui: &SettingsUi, remove_traffic_light_o
 /// Invalidate the cached settings window (release + set None) so it is rebuilt with the
 pub(crate) fn invalidate_settings_window() {
     SYSTEM_APPEARANCE_REBUILD_PENDING.store(false, Ordering::SeqCst);
-    set_text_input_active(false);
     let ui = with_settings_ui(|slot| slot.take());
     if let Some(u) = ui {
         unsafe {
+            // Before the runtime is detached: the panels' dim layers belong to this window's content
+            // view, which is about to be released.
+            close_floating_editors();
             detach_settings_window_runtime(&u, true);
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
             // its subviews are retained by the parent view and dealloc with the window.
@@ -3049,7 +3126,44 @@ pub(crate) fn invalidate_settings_window() {
 
 #[cfg(test)]
 mod tests {
-    use super::{warning_for_page, PageWarning, SETTINGS_CLIPBOARD_PAGE_INDEX};
+    use super::{
+        abandoned_page_editors, warning_for_page, PageEditor, PageWarning,
+        SETTINGS_CLIPBOARD_PAGE_INDEX, SETTINGS_KEY_BINDINGS_PAGE_INDEX, SETTINGS_MOUSE_PAGE_INDEX,
+    };
+
+    /// Switching away from a page has to wrap up that page's own editors, and only those: leaving
+    /// the Key Bindings page closes its recording and its add panel but leaves the Mouse page's
+    /// mapping panel alone, and vice versa. Getting this wrong is how a floating panel outlives the
+    /// page it belongs to.
+    #[test]
+    fn leaving_a_page_abandons_exactly_that_pages_editors() {
+        let bindings = abandoned_page_editors(SETTINGS_KEY_BINDINGS_PAGE_INDEX);
+        assert!(
+            !bindings.contains(&PageEditor::BindingRecording)
+                && !bindings.contains(&PageEditor::BindingPanel),
+            "staying on the Key Bindings page must not close its own editors: {bindings:?}"
+        );
+        assert!(bindings.contains(&PageEditor::MappingPanel));
+
+        let mouse = abandoned_page_editors(SETTINGS_MOUSE_PAGE_INDEX);
+        assert!(mouse.contains(&PageEditor::BindingRecording));
+        assert!(mouse.contains(&PageEditor::BindingPanel));
+        assert!(
+            !mouse.contains(&PageEditor::MappingPanel),
+            "staying on the Mouse page must not close its own panel: {mouse:?}"
+        );
+
+        // Any other page abandons every editor.
+        let other = abandoned_page_editors(0);
+        assert_eq!(
+            other,
+            vec![
+                PageEditor::BindingRecording,
+                PageEditor::BindingPanel,
+                PageEditor::MappingPanel
+            ]
+        );
+    }
 
     /// The permission warning outranks the storage one on General, and a page that has nothing to
     /// report keeps the strip hidden: that is what decides whether the banner covers a page title.

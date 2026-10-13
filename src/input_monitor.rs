@@ -150,8 +150,7 @@ fn stop_services() {
     crate::keystroke_display::stop();
     crate::event_monitor::stop();
     crate::mouse::stop();
-    crate::window_management::stop();
-    crate::quick_actions::stop();
+    crate::key_bindings::stop();
     crate::settings::cancel_recording_from_main();
 }
 
@@ -165,11 +164,13 @@ fn start_configured_services() {
     if config.mouse.enabled || crate::dev_flags::present("smooth-scroll-force-on") {
         crate::mouse::start();
     }
-    if config.window_control.enabled {
-        crate::window_management::start();
-    }
-    if config.quick_actions.enabled {
-        crate::quick_actions::start();
+    // One engine serves both groups. Publishing belongs to the main thread (`apply_config_change`
+    // does it for every change, including startup): a table built from a clone taken here could
+    // overwrite a newer one published while this thread was working, which would silently revive
+    // bindings the user had just switched off. Starting is this thread's business, and `start`
+    // re-reads the live config, so a late request cannot boot the engine for a disabled feature.
+    if crate::key_bindings::enabled_in(&config) {
+        crate::key_bindings::start();
     }
 }
 

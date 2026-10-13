@@ -15,6 +15,7 @@ mod hash;
 mod i18n;
 mod icon_cache;
 mod input_monitor;
+mod key_bindings;
 mod keystroke_display;
 mod language_tolerance;
 mod logger;
@@ -275,9 +276,7 @@ impl PendingGlobalInput {
             GlobalEvent::KeystrokeDisplayWake => {
                 self.keystroke_display_pending = true;
             }
-            GlobalEvent::WindowControl(_)
-            | GlobalEvent::WindowDisplayMove(_)
-            | GlobalEvent::QuickAction(_) => {
+            GlobalEvent::BindingAction { .. } => {
                 if self.other.len() >= GLOBAL_INPUT_CAPACITY {
                     self.other.pop_front();
                     log_debug!("[kbd] dropped oldest auxiliary input (queue full)");
@@ -469,14 +468,10 @@ fn on_global_input_drain_inner() {
     }
     for event in other {
         match event {
-            GlobalEvent::WindowControl(direction) => window_management::apply_direction(direction),
-            GlobalEvent::WindowDisplayMove(direction) => {
-                window_management::apply_display_move(direction)
-            }
-            GlobalEvent::QuickAction(action) => {
-                if let Some(action) = quick_actions::QuickAction::from_isize(action as isize) {
-                    quick_actions::apply_action(action);
-                }
+            // Every binding action -- window control, display moves, quick actions and the system
+            // and feature actions -- runs through this one main-thread entry.
+            GlobalEvent::BindingAction { action, trigger } => {
+                key_bindings::execute_authorized(action, trigger)
             }
             GlobalEvent::CmdTabPressed
             | GlobalEvent::CmdShiftTabPressed
@@ -1157,22 +1152,6 @@ extern "C" fn on_ax_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     callback_guard::void("on_ax_raise", window_collector::handle_ax_raise_main);
 }
 
-/// Window-control (Option+arrows) main-thread entry: arg is the bridge's NSNumber carrying
-/// the direction.
-extern "C" fn on_window_control(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
-    callback_guard::void("on_window_control", || on_window_control_inner(arg));
-}
-
-fn on_window_control_inner(arg: *mut c_void) {
-    if arg.is_null() {
-        return;
-    }
-    let value: isize = unsafe { msg_send![arg as *mut AnyObject, integerValue] };
-    if let Some(dir) = window_management::Direction::from_isize(value) {
-        window_management::apply_direction(dir);
-    }
-}
-
 /// Main-thread entry for deferred cross-display frame verification.
 extern "C" fn on_display_move_retry(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
     callback_guard::void("on_display_move_retry", || {
@@ -1183,21 +1162,6 @@ extern "C" fn on_display_move_retry(_self: *mut c_void, _cmd: Sel, arg: *mut c_v
 /// Main-thread entry for the deferred snap settle (write the size after the app's animation).
 extern "C" fn on_snap_verify(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
     callback_guard::void("on_snap_verify", || window_management::on_snap_verify(arg));
-}
-
-/// Main thread: run one quick action (an action id delivered by the bridge).
-extern "C" fn on_quick_action(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
-    callback_guard::void("on_quick_action", || on_quick_action_inner(arg));
-}
-
-fn on_quick_action_inner(arg: *mut c_void) {
-    if arg.is_null() {
-        return;
-    }
-    let value: isize = unsafe { msg_send![arg as *mut AnyObject, integerValue] };
-    if let Some(action) = quick_actions::QuickAction::from_isize(value) {
-        quick_actions::apply_action(action);
-    }
 }
 
 fn create_overlay_window() -> *mut AnyObject {
@@ -1554,12 +1518,6 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
-            sel!(handleWindowControl:),
-            on_window_control as *mut c_void,
-            types_v_obj.as_ptr(),
-        );
-        class_addMethod(
-            cls,
             sel!(handleDisplayMoveRetry:),
             on_display_move_retry as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1568,12 +1526,6 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleSnapVerify:),
             on_snap_verify as *mut c_void,
-            types_v_obj.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(handleQuickAction:),
-            on_quick_action as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2030,8 +1982,65 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleWindowControlEnabledToggle:),
-                handle_window_control_enabled_toggle as *mut c_void,
+                sel!(handleKeyBindingsToggle:),
+                handle_key_bindings_toggle as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingToggle:),
+                bindings::handle_binding_toggle as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingSelect:),
+                bindings::handle_binding_select as *mut c_void,
+                types.as_ptr(),
+            );
+            // The footer's joined ＋ / − control reports which segment was clicked, so it is one
+            // selector: mapping the index inside the handler keeps the two halves from drifting into
+            // separate target/action pairs for what is a single control.
+            class_addMethod(
+                cls,
+                sel!(handleBindingFooterAction:),
+                bindings::handle_binding_footer_action as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingPanelAction:),
+                bindings::handle_panel_action_changed as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingPanelRecord:),
+                bindings::handle_panel_record as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingPanelConfirm:),
+                bindings::handle_panel_confirm as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingPanelCancel:),
+                bindings::handle_panel_cancel as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingConfirm:),
+                bindings::handle_binding_confirm as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleBindingCancel:),
+                bindings::handle_binding_cancel as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -2074,12 +2083,6 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleDeviceChanged:),
                 handle_device_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleQuickActionsEnabledToggle:),
-                handle_quick_actions_enabled_toggle as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -2358,15 +2361,20 @@ fn prompt_accessibility_if_needed() {
     }
 }
 
-/// Parses the development switch `--open-settings[=<general|about|0..7|1>]`, forwarded by
-/// `scripts/dev-restart.sh` (argv is the only channel; see the dev_flags module). Returns a
-/// sidebar page index (0=General .. 7=About); None when absent or unparsable, so a normal launch
-/// is unaffected.
+/// Parses the development switch `--open-settings[=<general|about|key-bindings|0..6|1>]`,
+/// forwarded by `scripts/dev-restart.sh` (argv is the only channel; see the dev_flags module).
+/// Returns a sidebar page index (0=General .. 6=About); None when absent or unparsable, so a normal
+/// launch is unaffected.
+///
+/// The numeric form is a page index and follows the sidebar: 5 is Keystroke Display and 6 is About
+/// since `window control` and `quick actions` merged into one page.
 fn open_settings_page_request() -> Option<usize> {
     let spec = crate::dev_flags::value("open-settings")?;
     match spec.trim().to_ascii_lowercase().as_str() {
-        "" | "1" | "true" | "about" | "7" => Some(crate::settings::SETTINGS_ABOUT_PAGE_INDEX),
+        "" | "1" | "true" | "about" => Some(crate::settings::SETTINGS_ABOUT_PAGE_INDEX),
         "general" | "0" => Some(0),
+        "key-bindings" | "bindings" => Some(crate::settings::SETTINGS_KEY_BINDINGS_PAGE_INDEX),
+        "keystroke-display" => Some(crate::settings::SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX),
         other => other
             .parse::<usize>()
             .ok()

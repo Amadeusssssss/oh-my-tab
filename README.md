@@ -147,7 +147,7 @@ The full release pipeline (`release.sh` / `release-dev.sh`, including `--push`),
 
 ## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Settings
 
-Options are managed from the in-app Settings window, and most changes take effect immediately. The window covers appearance, window switching, window control, quick actions, clipboard history, mouse control, startup, and updates.
+Options are managed from the in-app Settings window, and most changes take effect immediately. The window covers appearance, window switching, key bindings (window control and quick actions in one editable list), clipboard history, mouse control, startup, and updates.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 

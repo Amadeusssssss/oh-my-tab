@@ -15,15 +15,15 @@ pub enum GlobalEvent {
     CmdShiftTabPressed,
     CmdReleased,
     ClipboardToggled,
-    // Window control: Option+arrow (the direction crosses to the main thread via the bounded
-    // input aggregator).
-    WindowControl(crate::window_management::Direction),
-    // Display move: Option+Shift+arrow keys (the direction crosses to the main thread via the
-    // bounded input aggregator).
-    WindowDisplayMove(crate::window_management::Direction),
-    // Quick actions: Option+I/E/D/L (the action id crosses to the main thread via the bounded
-    // input aggregator).
-    QuickAction(u8),
+    // A binding fired: the payload is the action registry index (`Action::index`) together with the
+    // trigger that fired it, both crossing to the main thread through the bounded input aggregator.
+    // The trigger travels with the action so the consumer can confirm the press is still authorized
+    // against the config as it is *now* -- a press queued before an edit must not run a binding the
+    // user has since deleted or switched off.
+    BindingAction {
+        action: u16,
+        trigger: crate::key_bindings::Trigger,
+    },
     KeystrokeDisplayWake,
 }
 
@@ -46,9 +46,14 @@ const DEFAULT_CLIPBOARD_SHORTCUT_PACKED: u64 =
 static CLIPBOARD_SHORTCUT_PACKED: AtomicU64 = AtomicU64::new(DEFAULT_CLIPBOARD_SHORTCUT_PACKED);
 
 /// Replace the event-tap's cached binding atomically so a key event never observes half an update.
+///
+/// Only a description the chord grammar cannot parse falls back here: a chord that collides with a
+/// binding or with the switcher is already resolved at config load (the binding yields, or the
+/// clipboard setting itself falls back), so by the time this reads the effective config there is
+/// nothing left to arbitrate.
 pub(crate) fn set_clipboard_shortcut(desc: &str) {
-    let shortcut = crate::mouse::shortcut::validate_clipboard_shortcut(desc)
-        .unwrap_or(DEFAULT_CLIPBOARD_SHORTCUT);
+    let shortcut =
+        crate::mouse::shortcut::parse_shortcut(desc).unwrap_or(DEFAULT_CLIPBOARD_SHORTCUT);
     let packed = ((shortcut.flags as u64) << 16) | shortcut.keycode as u64;
     CLIPBOARD_SHORTCUT_PACKED.store(packed, Ordering::Release);
 }

@@ -210,6 +210,22 @@ pub(super) unsafe fn style_html_button(button: *mut AnyObject, background_hex: u
     let _: () = msg_send![button, setContentTintColor: text_color];
 }
 
+/// Strip a styled settings button back to a pure hit target: no layer fill, no border. Used by the
+/// transparent role, whose owner draws its own selection highlight and must not get a second one.
+pub(super) unsafe fn make_button_borderless(button: *mut AnyObject) {
+    if button.is_null() {
+        return;
+    }
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return;
+    }
+    layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000000));
+    let _: () = msg_send![layer, setBorderWidth: 0.0f64];
+    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
+    let _: () = msg_send![layer, setMasksToBounds: true];
+}
+
 pub(super) struct HtmlActionButtonClass(*mut AnyObject);
 unsafe impl Send for HtmlActionButtonClass {}
 unsafe impl Sync for HtmlActionButtonClass {}
@@ -264,6 +280,9 @@ pub(super) fn action_button_hover_color(tag: isize, palette: crate::theme::UiPal
     match tag {
         -2 => palette.accent_hover,
         -4 => palette.destructive_hover,
+        // The transparent role: a full-row hit target whose owner draws the only visual state (the
+        // selection wash). Painting it on hover would add a second highlight the design does not have.
+        -5 => 0x0000_0000,
         _ => palette.hover_bg,
     }
 }
@@ -279,6 +298,8 @@ pub(super) fn action_button_normal_color(tag: isize, palette: crate::theme::UiPa
         -1 => palette.footer_button_bg,
         -3 => palette.button_bg,
         -4 => palette.destructive,
+        // The transparent role's normal state is no fill at all (see `action_button_hover_color`).
+        -5 => 0x0000_0000,
         // `Compact` uses tag 0 as its normal, non-negative slot.
         _ if tag >= 0 => palette.field_bg,
         _ => palette.button_bg,
@@ -1165,6 +1186,20 @@ pub(super) unsafe fn make_value_label(
     h: f64,
     value: &str,
 ) -> *mut AnyObject {
+    make_label_with_role(x, y, w, h, value, SettingsTextRole::Primary)
+}
+
+/// The same read-only label with an explicit text role. A panel's leading column is secondary
+/// chrome while the value beside it is primary text, so both need the one shared construction
+/// rather than a per-call-site copy of its font/truncation/tooltip rules.
+pub(super) unsafe fn make_label_with_role(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    value: &str,
+    role: SettingsTextRole,
+) -> *mut AnyObject {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     // Height is whatever the caller asks for: a slider readout is only 18pt, so no full-control
     // minimum is enforced here.
@@ -1186,7 +1221,7 @@ pub(super) unsafe fn make_value_label(
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![label, setFont: font];
-    apply_settings_text_role(label, SettingsTextRole::Primary);
+    apply_settings_text_role(label, role);
     label
 }
 
@@ -1270,6 +1305,31 @@ pub(super) unsafe fn make_symbol_image(symbol: &str, size: NSSize) -> *mut AnyOb
         accessibilityDescription: std::ptr::null::<AnyObject>()
     ];
     CFRelease(symbol_ns as *const c_void);
+    if !image.is_null() {
+        let _: () = msg_send![image, setSize: size];
+    }
+    image
+}
+
+/// The same system-symbol image, carrying the description VoiceOver reads for it.
+///
+/// A segmented control has no per-segment label property that takes effect for accessibility; AppKit
+/// documents the images' `accessibilityDescription` as the way to name its segments, so the symbol
+/// has to be built with it rather than with a null description.
+pub(super) unsafe fn make_symbol_image_described(
+    symbol: &str,
+    size: NSSize,
+    description: &str,
+) -> *mut AnyObject {
+    let symbol_ns = make_nsstring(symbol);
+    let description_ns = make_nsstring(description);
+    let image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_ns,
+        accessibilityDescription: description_ns
+    ];
+    CFRelease(symbol_ns as *const c_void);
+    CFRelease(description_ns as *const c_void);
     if !image.is_null() {
         let _: () = msg_send![image, setSize: size];
     }
@@ -3188,6 +3248,30 @@ pub(super) unsafe fn make_settings_page(
     (scroll, document)
 }
 
+/// Whether an overlap pair is a row hit target legitimately covering its own row's content.
+///
+/// Three conditions, all necessary. Skipping the pair whenever either side merely carried the marker
+/// was the first version, and it excused every case below.
+///
+/// 1. **Two hit targets never exempt each other.** Every row owns exactly one, so two intersecting
+///    targets mean a row's selection region has moved onto its neighbour. This is the condition that
+///    catches a correctly-sized target placed in the WRONG row: height and containment cannot see it
+///    (it is one row tall and does contain the next row's controls), but it also overlaps that row's
+///    own target, so the violation is still reported. Without this rule the misplacement passed the
+///    gate entirely.
+/// 2. **The marked view must be one row tall.** A marker on a taller view is a mis-sized region, not a
+///    hit target: it would contain the next row's controls and pass a containment-only test.
+/// 3. **It must contain the other view**, because a control that merely clips the target's edge is
+///    not the row's own content.
+fn row_hit_target_covers(left: &DebugLayoutEntry, right: &DebugLayoutEntry) -> bool {
+    if left.row_hit_target && right.row_hit_target {
+        // Each row has one target; two in the same place is a misplacement, never intended coverage.
+        return false;
+    }
+    (left.is_row_sized_hit_target() && rect_inside(left.frame, right.frame, -0.5))
+        || (right.is_row_sized_hit_target() && rect_inside(right.frame, left.frame, -0.5))
+}
+
 /// Pure rectangle predicates shared by the debug validator and headless layout tests.
 pub(super) fn rects_overlap(a: NSRect, b: NSRect, epsilon: f64) -> bool {
     let left = a.origin.x.max(b.origin.x);
@@ -3204,14 +3288,45 @@ pub(super) fn rect_inside(outer: NSRect, inner: NSRect, margin: f64) -> bool {
         && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height - margin
 }
 
+/// Identifier for a full-row hit target: a transparent button laid over a row's own content so the
+/// whole row is clickable.
+///
+/// The layout validator treats an interactive view overlapping a label or another control as a
+/// defect, and for a normal control that is right. This one is the documented exception: the row's
+/// keycaps, label and switch are meant to sit inside it, and it draws nothing itself. Without this
+/// marker `--smoke-settings-layout` panics on the bindings page instead of validating it.
+pub(super) const ROW_HIT_TARGET_IDENTIFIER: &str = "settings-row-hit-target";
+
+/// True when `view` is a full-row hit target rather than a control competing for the same pixels.
+pub(super) unsafe fn is_row_hit_target(view: *mut AnyObject) -> bool {
+    if view.is_null() {
+        return false;
+    }
+    let identifier: *mut AnyObject = msg_send![view, identifier];
+    crate::ffi::nsstring_to_rust(identifier) == ROW_HIT_TARGET_IDENTIFIER
+}
+
 #[derive(Clone)]
 struct DebugLayoutEntry {
     index: usize,
     frame: NSRect,
     interactive: bool,
+    /// A whole-row hit target. It is transparent coverage over the row's own content, so it must be
+    /// skipped as *either* side of an overlap pair -- the controls it covers are real and stay
+    /// interactive, so clearing its own `interactive` flag is not enough.
+    row_hit_target: bool,
     embedded_in_button: bool,
     text_required_height: Option<f64>,
     text_value: Option<String>,
+}
+
+impl DebugLayoutEntry {
+    /// A hit target covers exactly one row. A marker on a taller view is a mis-sized region rather
+    /// than a hit target, so it is not honoured: it would contain the next row's controls and pass a
+    /// containment-only test.
+    fn is_row_sized_hit_target(&self) -> bool {
+        self.row_hit_target && self.frame.size.height <= SettingsLayout::SINGLE_LINE_ROW_H + 0.5
+    }
 }
 
 /// Collect descendant frames in document coordinates.
@@ -3253,6 +3368,7 @@ unsafe fn collect_debug_layout(
         let interactive = msg_send![child, isKindOfClass: class!(NSButton)]
             || msg_send![child, isKindOfClass: class!(NSSlider)]
             || msg_send![child, isKindOfClass: class!(NSColorWell)]
+            || msg_send![child, isKindOfClass: class!(NSSegmentedControl)]
             || msg_send![child, isKindOfClass: class!(NSPopUpButton)];
         let is_button: bool = msg_send![child, isKindOfClass: class!(NSButton)];
         let is_text = msg_send![child, isKindOfClass: class!(NSTextField)];
@@ -3287,15 +3403,21 @@ unsafe fn collect_debug_layout(
             } else {
                 None
             };
+            // A whole-row hit target is transparent coverage, not a peer control: the row's own
+            // content is *supposed* to sit inside it, so it is excluded from the overlap pass.
+            let hit_target = is_row_hit_target(child);
             entries.push(DebugLayoutEntry {
                 index,
                 frame,
                 interactive: interactive && !inside_button,
+                row_hit_target: hit_target,
                 embedded_in_button: is_text && inside_button,
                 text_required_height,
                 text_value,
             });
         }
+        // A native control's subviews are implementation details (the segmented control builds its
+        // own cells); only a custom `NSButton` carries a label we drew and must inspect.
         let next_inside_native_control = inside_native_control || (interactive && !is_button);
         collect_debug_layout(
             document,
@@ -3357,9 +3479,11 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
     }
     for (left_index, left) in entries.iter().enumerate() {
         for right in entries.iter().skip(left_index + 1) {
+            let covers_own_content = row_hit_target_covers(left, right);
             // Text labels may overlap another label in a deliberately stacked description row,
             // but an interactive control must never intersect a label or another control.
             if (left.interactive || right.interactive)
+                && !covers_own_content
                 && !left.embedded_in_button
                 && !right.embedded_in_button
                 && rects_overlap(left.frame, right.frame, 0.5)
@@ -3519,6 +3643,7 @@ mod tests {
                 SettingsButtonRole::Footer,
                 SettingsButtonRole::Primary,
                 SettingsButtonRole::Destructive,
+                SettingsButtonRole::Transparent,
             ] {
                 let (normal, _text, tag) = role.style(palette);
                 assert_eq!(
@@ -3526,6 +3651,16 @@ mod tests {
                     normal,
                     "{role:?} (tag {tag}) must restore its own normal color on mouse-exit"
                 );
+                if role == SettingsButtonRole::Transparent {
+                    // The transparent role is a hit target, not a control: it must stay invisible in
+                    // *both* states, or hovering a selected row would paint a second highlight over
+                    // the one the row already draws.
+                    assert_eq!(
+                        super::action_button_hover_color(tag, palette),
+                        normal,
+                        "Transparent must not paint on hover either"
+                    );
+                }
             }
         }
     }
@@ -3782,6 +3917,96 @@ mod tests {
         assert!(!rects_overlap(first, outside, 0.5));
         assert!(rect_inside(page, first, 0.0));
         assert!(!rect_inside(page, outside, 0.0));
+    }
+
+    /// The row-hit-target exemption is containment, not a blanket pass.
+    ///
+    /// A target may be exempt against views it contains (its own row's controls) and must not be
+    /// exempt against views it does not (an unrelated control that merely overlaps it). The first
+    /// version skipped the pair whenever either side carried the marker, which excused both.
+    ///
+    /// The cross-row case -- a target that spills into the row beneath it, and so *contains* that
+    /// row's controls -- cannot be decided from frames alone here, because this module does not know
+    /// what a row is. That half is pinned where the knowledge lives: `BINDING_HIT_TARGET_H` is
+    /// asserted to be exactly one row tall in `settings::bindings`.
+    #[test]
+    fn the_row_hit_target_exemption_is_containment_not_a_blanket_pass() {
+        let entry = |frame: NSRect, hit_target: bool| super::DebugLayoutEntry {
+            index: 0,
+            frame,
+            interactive: true,
+            row_hit_target: hit_target,
+            embedded_in_button: false,
+            text_required_height: None,
+            text_value: None,
+        };
+        // The target spans its own 52pt row and contains that row's switch: exempt.
+        let target = entry(
+            NSRect::new(NSPoint::new(12.0, 400.0), NSSize::new(512.0, 52.0)),
+            true,
+        );
+        let own_switch = entry(
+            NSRect::new(NSPoint::new(482.0, 415.0), NSSize::new(38.0, 22.0)),
+            false,
+        );
+        assert!(super::row_hit_target_covers(&target, &own_switch));
+        // Counter-example 1: a target one row too tall *does* contain the next row's switch, so
+        // containment alone would exempt it. The one-row height rule is what rejects it.
+        let oversized = entry(
+            NSRect::new(NSPoint::new(12.0, 452.0), NSSize::new(512.0, 104.0)),
+            true,
+        );
+        let next_row_switch = entry(
+            NSRect::new(NSPoint::new(482.0, 467.0), NSSize::new(38.0, 22.0)),
+            false,
+        );
+        assert!(
+            super::rect_inside(oversized.frame, next_row_switch.frame, -0.5),
+            "the oversized target really does contain the next row's switch"
+        );
+        assert!(
+            !super::row_hit_target_covers(&oversized, &next_row_switch),
+            "a target taller than one row must not be exempt, or a cross-row spill goes unreported"
+        );
+
+        // Counter-example 2 (the harder one): a target of the CORRECT height placed in the wrong row.
+        // Height is satisfied and containment holds -- it covers the next row's switch -- so only the
+        // fact that it collides with that row's own target reveals it. Without the two-target rule
+        // both comparisons below returned "exempt" and the misplacement passed the gate.
+        let misplaced = entry(
+            NSRect::new(NSPoint::new(12.0, 452.0), NSSize::new(512.0, 52.0)),
+            true,
+        );
+        let next_rows_target = entry(
+            NSRect::new(NSPoint::new(12.0, 452.0), NSSize::new(512.0, 52.0)),
+            true,
+        );
+        assert!(
+            misplaced.is_row_sized_hit_target(),
+            "the misplaced target satisfies the one-row height rule, so height alone cannot catch it"
+        );
+        assert!(
+            super::rect_inside(misplaced.frame, next_row_switch.frame, -0.5),
+            "and it contains the next row's switch, so containment alone cannot catch it either"
+        );
+        assert!(
+            !super::row_hit_target_covers(&misplaced, &next_rows_target),
+            "two row targets must never exempt each other, or a misplaced target goes unreported"
+        );
+
+        // A control that only clips the target's edge is NOT contained, so the pair still reports.
+        // (Before the fix this pair was skipped, because one side carried the marker.)
+        let probing_control = entry(
+            NSRect::new(NSPoint::new(500.0, 395.0), NSSize::new(38.0, 22.0)),
+            false,
+        );
+        assert!(rects_overlap(target.frame, probing_control.frame, 0.5));
+        assert!(
+            !super::row_hit_target_covers(&target, &probing_control),
+            "a target must not excuse a control it does not contain"
+        );
+        // And two ordinary controls are unaffected by the marker's existence.
+        assert!(!super::row_hit_target_covers(&own_switch, &probing_control));
     }
 
     #[test]

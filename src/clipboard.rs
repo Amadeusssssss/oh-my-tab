@@ -421,7 +421,6 @@ const FOOTER_LABEL_SLACK: f64 = 6.0;
 /// Fill alpha of a shortcut legend's key chip, applied over the footer surface. Deliberately
 /// lighter than `field_bg`: the chip exists to bind a key symbol to its label, not to look
 /// pressable. Paired with a zero border width, because the border is what reads as a control.
-const LEGEND_CHIP_ALPHA: u32 = 0x0E;
 /// Vertical slack a single-line footer label's frame adds on top of the font's line height. A
 /// frame of exactly the line height is one rounding step short of what the cell needs, and a
 /// single-line cell that is even fractionally short renders the tail truncation, so "Tab" drew
@@ -464,7 +463,7 @@ fn legend_chip_background() -> *mut c_void {
     } else {
         0x0000_0000
     };
-    crate::ffi::hex_to_cg_color((base & 0xFFFF_FF00) | LEGEND_CHIP_ALPHA)
+    crate::ffi::hex_to_cg_color((base & 0xFFFF_FF00) | crate::theme::LEGEND_CHIP_ALPHA)
 }
 /// visible custom scroll indicator width.
 const SCROLL_INDICATOR_W: f64 = 6.0;

@@ -145,6 +145,78 @@ pub fn note_app_terminated(pid: i32) {
     LAST_ACTIVATED.lock().unwrap().remove(&pid);
 }
 
+/// Activate the most recently activated still-running application that is neither this one nor the
+/// one already in front, for the `app.previous` binding. Returns whether anything was activated.
+///
+/// Candidates come from the activation notifications this process has observed, so an application
+/// activated before this launch is not a candidate and the binding does nothing rather than picking
+/// an arbitrary app. Accessory and background-only processes (menu-bar items, agents) are skipped:
+/// activating one would leave the user looking at the same screen.
+pub(crate) fn activate_previous_app() -> bool {
+    let own_pid = std::process::id() as i32;
+    let frontmost = unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+        if app.is_null() {
+            0
+        } else {
+            let pid: i32 = msg_send![app, processIdentifier];
+            pid
+        }
+    };
+    // Snapshot and sort while holding the lock, then release it: activation synchronously posts the
+    // notifications that write this same map.
+    let candidates: Vec<i32> = {
+        let Ok(map) = LAST_ACTIVATED.lock() else {
+            return false;
+        };
+        let mut entries: Vec<(i32, Instant)> = map.iter().map(|(pid, at)| (*pid, *at)).collect();
+        entries.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+        entries.into_iter().map(|(pid, _)| pid).collect()
+    };
+    let Some(pid) = previous_app_candidate(&candidates, own_pid, frontmost, is_regular_running_app)
+    else {
+        log_debug!("[keybind] previous app: no candidate");
+        return false;
+    };
+    if raise::activate_pid(pid) {
+        log_debug!("[keybind] activated previous app: pid={}", pid);
+        return true;
+    }
+    false
+}
+
+/// The first candidate that is worth activating: not this app, not the app already in front (the
+/// most recent activation almost always is, and activating it again would do nothing), and a
+/// regular application. Pure, so the ordering rules are testable.
+fn previous_app_candidate(
+    candidates: &[i32],
+    own_pid: i32,
+    frontmost_pid: i32,
+    is_regular: impl Fn(i32) -> bool,
+) -> Option<i32> {
+    candidates
+        .iter()
+        .copied()
+        .find(|pid| *pid != own_pid && *pid != frontmost_pid && is_regular(*pid))
+}
+
+/// Whether a pid is a Dock-visible ("regular") running application.
+fn is_regular_running_app(pid: i32) -> bool {
+    unsafe {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            return false;
+        }
+        let policy: isize = msg_send![app, activationPolicy];
+        // NSApplicationActivationPolicyRegular = 0.
+        policy == 0
+    }
+}
+
 /// Bump the MRU timestamp of a specific window to now. Called from three paths:
 /// 1. Window selected inside oh-my-tab (on_cmd_released / card_mouse_down / KEY_RETURN)
 /// 2. NSWorkspace activation notification → on_app_activated resolves the focused
@@ -946,6 +1018,36 @@ mod ax_identity_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The "previous app" candidate: never this app, never the app already in front (the most
+    /// recent activation is almost always that one), and only a regular application. A→B then the
+    /// binding from B must reach A; triggering it again from A must reach B.
+    #[test]
+    fn previous_app_skips_itself_and_the_frontmost_app() {
+        let regular = |_pid: i32| true;
+        // Recently activated: B (frontmost), then this app, then A.
+        let candidates = [200, 100, 300];
+        assert_eq!(
+            previous_app_candidate(&candidates, 100, 200, regular),
+            Some(300)
+        );
+        // The round trip: now A is frontmost and B is next.
+        let candidates = [300, 200, 100];
+        assert_eq!(
+            previous_app_candidate(&candidates, 100, 300, regular),
+            Some(200)
+        );
+        // Nothing else: no candidate at all, rather than activating the front app again.
+        assert_eq!(previous_app_candidate(&[200, 100], 100, 200, regular), None);
+        // Accessory/background processes are skipped in favour of the next regular one.
+        let only_regular = |pid: i32| pid != 400;
+        assert_eq!(
+            previous_app_candidate(&[400, 200, 100, 300], 100, 200, only_regular),
+            Some(300)
+        );
+    }
+
     use super::*;
 
     /// Smoke (GUI/ObjC runtime): verifies that objc2's exception boundary really contains an

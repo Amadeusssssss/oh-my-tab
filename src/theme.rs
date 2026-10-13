@@ -182,6 +182,18 @@ pub(crate) const RADIUS_FULL: f64 = 9999.0;
 /// pill on a small chip, so the chip derives its radius from its own height.
 /// See docs/design-style-en.md §6.
 pub(crate) const RADIUS_LEGEND_CHIP: f64 = 5.0;
+/// A shortcut legend's chip fill: a low-alpha wash applied *toward* the surface's opposite, so one
+/// value separates the chip in both modes (darkening a light surface, lightening a dark one) rather
+/// than a fixed gray that vanishes in one of them. The chip keeps no border -- a border is what makes
+/// a chip read as a pressable control (style doc §6.1).
+pub(crate) const LEGEND_CHIP_ALPHA: u32 = 0x0E;
+/// The wash behind a modal settings panel: it dims the page under the panel so the floating editor
+/// reads as modal. 25% black, the same value both settings panels use, so they match.
+/// See docs/design-style-en.md §7 (a panel floats; the scrim is what puts the page behind it).
+pub(crate) const MODAL_SCRIM: u32 = 0x00000040;
+/// A disabled control's fill opacity: the style document's §10 rule is "50% opacity on the
+/// control's fill", and `setEnabled:` alone does not dim a layer-filled button.
+pub(crate) const DISABLED_FILL_OPACITY: f64 = 0.5;
 pub(crate) const SETTINGS_WINDOW_RADIUS: f64 = 26.0;
 pub(crate) const OVERLAY_RING_INSET: f64 = 3.0;
 pub(crate) const THUMBNAIL_PREVIEW_RADIUS: f64 = 0.0;

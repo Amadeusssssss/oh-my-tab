@@ -67,15 +67,17 @@ const TEXT_SIZE_DEFAULT: i64 = 15;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
 const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
-pub(super) const SETTINGS_PAGE_COUNT: usize = 8;
-pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize = 6;
+pub(super) const SETTINGS_PAGE_COUNT: usize = 7;
+pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize = 5;
 /// The clipboard history page. `pub(crate)` because the clipboard module's smoke runner asserts that
 /// its header button navigates HERE -- the page is named once, and the assertion cannot drift from it.
 pub(crate) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = 3;
 /// The Mouse page. Its controls are the only ones that cost real time to fill (they resolve the selected
 /// device and its mappings), so they are filled on demand rather than on every settings open.
 pub(super) const SETTINGS_MOUSE_PAGE_INDEX: usize = 2;
-pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = 7;
+/// The merged Key Bindings page (window control + quick actions in one list).
+pub(super) const SETTINGS_KEY_BINDINGS_PAGE_INDEX: usize = 4;
+pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = 6;
 
 /// Fixed width of the settings navigation pane, shared by layout and transient feedback.
 pub(crate) const SETTINGS_SIDEBAR_WIDTH: f64 = 220.0;
@@ -86,6 +88,9 @@ enum RecStage {
     Idle,
     WaitingButton,
     WaitingCombo,
+    /// The chord was captured; the recording stays suspended until the keys are released, so the
+    /// binding engine does not act on a chord the user is still holding.
+    WaitingRelease,
     Completing,
 }
 
@@ -116,16 +121,28 @@ static REC_RUNLOOP: LazyLock<RecRunLoopMutex> = LazyLock::new(|| RecRunLoopMutex
 /// Modifiers accumulated live while recording (updated on flagsChanged during
 /// waiting-for-combo).
 static REC_MODS: Mutex<u32> = Mutex::new(0);
+/// The main key of the chord just captured, and whether it has been released since.
+static REC_CAPTURED_KEY: Mutex<Option<u16>> = Mutex::new(None);
+static REC_CAPTURED_KEY_UP: AtomicBool = AtomicBool::new(false);
 /// Recording mode: the panel records the side button (trigger) or the combo (Key Press).
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum RecMode {
+    /// No recording in flight. Also what a finished recording returns to, so a later permission
+    /// revocation cannot mistake a completed session for an active one.
+    Idle,
     PanelTrigger,
     PanelCombo,
     ClipboardShortcut,
+    /// Recording a chord for a new key binding on the Key Bindings page.
+    KeyBinding,
 }
 
 /// The current recording mode (main-thread; handle_recording_finished finishes per mode).
-static REC_MODE: Mutex<RecMode> = Mutex::new(RecMode::PanelTrigger);
+static REC_MODE: Mutex<RecMode> = Mutex::new(RecMode::Idle);
+
+/// The action a `RecMode::KeyBinding` recording is binding a chord to, held from the moment the
+/// add button is pressed until the recording finishes or is cancelled.
+static REC_PENDING_ACTION: Mutex<Option<crate::key_bindings::Action>> = Mutex::new(None);
 
 /// The button number being edited (while the panel is open; None for a new mapping until
 /// the side button is recorded).
@@ -166,17 +183,15 @@ pub(super) struct SettingsUi {
     sidebar_switcher: *mut AnyObject,           // App switcher overlay (tag=1)
     sidebar_mouse: *mut AnyObject,              // Mouse (tag=2)
     sidebar_clipboard: *mut AnyObject,          // Clipboard history (tag=3)
-    sidebar_window_control: *mut AnyObject,     // Window control (tag=4)
-    sidebar_quick_actions: *mut AnyObject,      // Quick actions (tag=5)
-    sidebar_keystroke_display: *mut AnyObject,  // Keystroke display (tag=6)
-    sidebar_about: *mut AnyObject,              // About (tag=7)
+    sidebar_key_bindings: *mut AnyObject,       // Key bindings (tag=4)
+    sidebar_keystroke_display: *mut AnyObject,  // Keystroke display (tag=5)
+    sidebar_about: *mut AnyObject,              // About (tag=6)
     sidebar_highlight: *mut AnyObject, // NSView: selected-row highlight background (layer-backed)
     general_view: *mut AnyObject,      // General page container
     switcher_view: *mut AnyObject,     // App switcher page container
     mouse_view: *mut AnyObject,        // Mouse page container
     clipboard_view: *mut AnyObject,    // Clipboard page container
-    window_control_view: *mut AnyObject, // Window-control page container
-    quick_actions_view: *mut AnyObject, // Quick-actions page container
+    key_bindings_view: *mut AnyObject, // Key-bindings page container
     keystroke_display_view: *mut AnyObject, // Keystroke-display page container
     about_view: *mut AnyObject,        // About page container
     about_subtitle: *mut AnyObject,    // About-page version label
@@ -260,25 +275,40 @@ pub(super) struct SettingsUi {
     clipboard_show_source_app: *mut AnyObject,                     // show the source app
     clipboard_pin_follow: *mut AnyObject,                          // selection after pin
     // (follow the pinned entry / keep current position)
-    window_control_enabled: *mut AnyObject, // enable window control
-    window_control_up: *mut AnyObject,      // enable Option+Up
-    window_control_down: *mut AnyObject,    // enable Option+Down
-    window_control_left: *mut AnyObject,    // enable Option+Left
-    window_control_right: *mut AnyObject,   // enable Option+Right
-    window_control_display_up: *mut AnyObject, // move to upper display
-    window_control_display_down: *mut AnyObject, // move to lower display
-    window_control_display_left: *mut AnyObject, // move to left display
-    window_control_display_right: *mut AnyObject, // move to right display
-    quick_actions_enabled: *mut AnyObject,  // enable quick actions
-    quick_actions_open_settings: *mut AnyObject, // open settings
-    quick_actions_open_finder: *mut AnyObject, // open Finder
-    quick_actions_show_desktop: *mut AnyObject, // show desktop
-    quick_actions_lock_screen: *mut AnyObject, // lock screen
-    quick_actions_locate_pointer: *mut AnyObject, // double-Control pointer locator
-    add_mapping_button: *mut AnyObject,     // add-mapping button
-    mapping_enabled: *mut AnyObject,        // mappings master switch (per-device)
-    mapping_empty: *mut AnyObject,          // empty-state hint (in-card)
-    device_indicator: *mut AnyObject,       // device indicator (opens picker)
+    // Key-bindings page. The rows themselves are dynamic (added, deleted, toggled), so only the
+    // fixed furniture lives here: the master switch, the flipped container the rows are rendered
+    // into, and its empty-state hint. Adding happens in the footer's panel, not in page controls.
+    key_bindings_enabled: *mut AnyObject,
+    key_bindings_doc: *mut AnyObject,
+    key_bindings_empty: *mut AnyObject,
+    /// The footer band: one container view holding the joined ＋ / − control and its caption, so a
+    /// rebuild removes and redraws the whole band instead of accumulating views.
+    key_bindings_footer: *mut AnyObject,
+    /// The footer's joined ＋ / − control. One native segmented control, so the master switch and the
+    /// selection both address its segments rather than two separate buttons.
+    key_bindings_footer_segments: *mut AnyObject,
+    /// The canvas row whose height the binding list owns (it grows and shrinks as rows come and go).
+    key_bindings_row: usize,
+    key_binding_rows: Vec<bindings::BindingRow>,
+    /// The `(action, trigger)` pairs the rendered rows were built from: a config change with the
+    /// same shape only needs its switch states synced, not a rebuild that would destroy the very
+    /// control whose action is running.
+    key_binding_items_rendered: Vec<(String, String)>,
+    /// The row the footer's − acts on, as an index into `key_bindings.items`.
+    ///
+    /// An index is safe only because every path that changes the list's *shape* clears it first:
+    /// `sync_from_config` drops the selection when `binding_list_shape` changed, and this page's own
+    /// edits go through `write_binding_config`, which rebuilds the rows. A config edit made behind the
+    /// page's back therefore drops the selection instead of re-aiming − at a different binding. A
+    /// switch-only change keeps it, which is what keeps − usable while the user flips rows.
+    key_binding_selected: Option<usize>,
+    /// The selection highlight drawn behind that row; null when nothing is selected (or the page has
+    /// never rendered). It lives outside `BindingRow` because only one row has it at a time.
+    key_binding_selection_bg: *mut AnyObject,
+    add_mapping_button: *mut AnyObject, // add-mapping button
+    mapping_enabled: *mut AnyObject,    // mappings master switch (per-device)
+    mapping_empty: *mut AnyObject,      // empty-state hint (in-card)
+    device_indicator: *mut AnyObject,   // device indicator (opens picker)
     device_info_caption: *mut AnyObject,
     restore_defaults: RestoreDefaultsControl, // restore-defaults control
     // One "Restore Page Defaults" control per page (embedded at the end of each page's
@@ -427,9 +457,6 @@ pub(super) fn settings_ui_borrowed() -> bool {
 }
 /// Whether a background update check found a version the user has not opened yet.
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
-/// Whether an editable settings text field currently owns keyboard input.
-static TEXT_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
-
 /// Update the About-tab marker and retain the state until the settings window is created.
 pub(crate) fn set_update_available(available: bool) {
     UPDATE_AVAILABLE.store(available, Ordering::SeqCst);
@@ -462,16 +489,6 @@ unsafe fn set_about_sidebar_indicator(ui: &SettingsUi) {
     );
 }
 
-/// Update the cross-thread text-input hint used by the quick-action event tap.
-pub(crate) fn set_text_input_active(active: bool) {
-    TEXT_INPUT_ACTIVE.store(active, Ordering::Release);
-}
-
-/// Read whether the settings window currently has an editable text input.
-pub(crate) fn is_text_input_active() -> bool {
-    TEXT_INPUT_ACTIVE.load(Ordering::Acquire)
-}
-
 /// A visible settings window cannot be rebuilt during an appearance notification without
 /// discarding unsaved edits; rebuild it immediately after the user closes it instead.
 static SYSTEM_APPEARANCE_REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
@@ -488,6 +505,7 @@ static SELECTED_DEVICE: Mutex<Option<Option<crate::mouse::device::DeviceKey>>> =
 #[allow(dead_code)]
 static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+pub(crate) mod bindings;
 pub(crate) mod components;
 mod dispatch;
 pub(crate) mod mapping;
@@ -501,10 +519,10 @@ pub(crate) mod widgets;
 mod window;
 
 use components::{
-    row_action_button, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard,
-    SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
-    SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H,
-    ROW_ACTION_BTN_W,
+    row_action_button, RestoreDefaultsControl, SegmentSpec, SettingsActionSegments, SettingsButton,
+    SettingsButtonRole, SettingsCard, SettingsControl, SettingsLayout, SettingsMappingActionIcon,
+    SettingsPage, SettingsPageHeader, SettingsRow, SettingsSection, SettingsSelect,
+    SettingsSidebar, ROW_ACTION_BTN_H, ROW_ACTION_BTN_W,
 };
 use dispatch::*;
 use mapping::*;
@@ -529,10 +547,10 @@ use window::*;
 // consumes them through use settings::*).
 pub(crate) use dispatch::{
     handle_clipboard_enabled_toggle, handle_device_changed, handle_enable_mouse_toggle,
-    handle_export_logs, handle_quick_actions_enabled_toggle, handle_window_control_enabled_toggle,
-    handle_windows_enabled_toggle, on_control_changed, on_control_text_did_change,
-    on_control_text_did_end_editing, on_sidebar_select, refresh_clipboard_unavailable_notice,
-    refresh_device_popup_if_open, refresh_service_controls_from_config,
+    handle_export_logs, handle_key_bindings_toggle, handle_windows_enabled_toggle,
+    on_control_changed, on_control_text_did_change, on_control_text_did_end_editing,
+    on_sidebar_select, refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
+    refresh_service_controls_from_config,
     refresh_switcher_keystroke_and_mouse_controls_from_config,
 };
 pub(crate) use window::{
@@ -714,20 +732,18 @@ pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
         "sidebar_1_switcher",
         "sidebar_2_mouse",
         "sidebar_3_clipboard",
-        "sidebar_4_window_control",
-        "sidebar_5_quick_actions",
-        "sidebar_6_keystroke_display",
-        "sidebar_7_about",
+        "sidebar_4_key_bindings",
+        "sidebar_5_keystroke_display",
+        "sidebar_6_about",
     ];
     const PAGE_NAMES: [&str; SETTINGS_PAGE_COUNT] = [
         "page_0_general",
         "page_1_switcher",
         "page_2_mouse",
         "page_3_clipboard",
-        "page_4_window_control",
-        "page_5_quick_actions",
-        "page_6_keystroke_display",
-        "page_7_about",
+        "page_4_key_bindings",
+        "page_5_keystroke_display",
+        "page_6_about",
     ];
     with_settings_ui(|ui| match ui {
         Some(ui) => {
@@ -738,8 +754,7 @@ pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
                 ui.sidebar_switcher,
                 ui.sidebar_mouse,
                 ui.sidebar_clipboard,
-                ui.sidebar_window_control,
-                ui.sidebar_quick_actions,
+                ui.sidebar_key_bindings,
                 ui.sidebar_keystroke_display,
                 ui.sidebar_about,
             ];
@@ -748,8 +763,7 @@ pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
                 ui.switcher_view,
                 ui.mouse_view,
                 ui.clipboard_view,
-                ui.window_control_view,
-                ui.quick_actions_view,
+                ui.key_bindings_view,
                 ui.keystroke_display_view,
                 ui.about_view,
             ];
@@ -1572,42 +1586,11 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 ui.clipboard_enabled,
                 setState: if cfg.clipboard.enabled { 1isize } else { 0isize }
             ];
-            // Window-control page: populate the master and direction switches.
+            // Key-bindings page: the master switch is static, the rows are rendered from the config
+            // by the bindings module (which also owns their enable state).
             let _: () = msg_send![
-                ui.window_control_enabled,
-                setState: if cfg.window_control.enabled { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_up,
-                setState: if cfg.window_control.up { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_down,
-                setState: if cfg.window_control.down { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_left,
-                setState: if cfg.window_control.left { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_right,
-                setState: if cfg.window_control.right { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_display_up,
-                setState: if cfg.window_control.display_up { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_display_down,
-                setState: if cfg.window_control.display_down { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_display_left,
-                setState: if cfg.window_control.display_left { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.window_control_display_right,
-                setState: if cfg.window_control.display_right { 1isize } else { 0isize }
+                ui.key_bindings_enabled,
+                setState: if cfg.key_bindings.enabled { 1isize } else { 0isize }
             ];
             let _: () = msg_send![
                 ui.clipboard_clear_on_quit,
@@ -1662,34 +1645,9 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 1
             };
             let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
-            // Quick-actions page: populate the master and four action switches.
-            let _: () = msg_send![
-                ui.quick_actions_enabled,
-                setState: if cfg.quick_actions.enabled { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.quick_actions_open_settings,
-                setState: if cfg.quick_actions.open_settings { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.quick_actions_open_finder,
-                setState: if cfg.quick_actions.open_finder { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.quick_actions_show_desktop,
-                setState: if cfg.quick_actions.show_desktop { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.quick_actions_lock_screen,
-                setState: if cfg.quick_actions.lock_screen { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.quick_actions_locate_pointer,
-                setState: if cfg.quick_actions.locate_pointer { 1isize } else { 0isize }
-            ];
             update_clipboard_controls_enabled(ui);
-            update_window_control_controls_enabled(ui);
-            update_quick_actions_controls_enabled(ui);
+            bindings::render_binding_rows(ui, cfg);
+            bindings::update_binding_controls_enabled(ui);
         });
     }
 }
@@ -1860,24 +1818,6 @@ const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 1 << 20;
 const KEYCODE_Q: u16 = 12;
 const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
 
-/// Refresh the cross-thread hint for the quick-action tap from the window's current responder.
-unsafe fn refresh_text_input_state(window: *mut AnyObject) {
-    let responder: *mut AnyObject = msg_send![window, firstResponder];
-    if responder.is_null() {
-        set_text_input_active(false);
-        return;
-    }
-    let is_text_field: bool = msg_send![responder, isKindOfClass: class!(NSTextField)];
-    let is_field_editor: bool = msg_send![responder, isKindOfClass: class!(NSTextView)];
-    let active = if is_text_field || is_field_editor {
-        let editable: bool = msg_send![responder, isEditable];
-        editable
-    } else {
-        false
-    };
-    set_text_input_active(active);
-}
-
 /// End inline text editing when the user clicks elsewhere in the settings window.
 ///
 /// The settings window uses a borderless collection of plain NSViews as its page background.
@@ -1925,9 +1865,6 @@ unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event:
             ),
             sendEvent: event
         ];
-        if !_self.is_null() {
-            refresh_text_input_state(_self as *mut AnyObject);
-        }
     }
 }
 
@@ -1989,8 +1926,7 @@ unsafe fn grow_short_page_documents() {
             ui.switcher_view,
             ui.mouse_view,
             ui.clipboard_view,
-            ui.window_control_view,
-            ui.quick_actions_view,
+            ui.key_bindings_view,
             ui.keystroke_display_view,
             ui.about_view,
         ];

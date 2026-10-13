@@ -9,7 +9,7 @@
 #   4. 页面文档高度是否等于"内容 + 上下内边距"(修:手写常量高估导致下方大片死空白)。
 #
 # **与 UI 语言无关**:本场景不用任何界面文案做锚点(旧版本硬编码简体中文,英文 locale 下必挂)。
-# 锚点全是结构性的:视图类名(root = page_7_about / sidebar_highlight / sidebar_N_*)、父子关系,
+# 锚点全是结构性的:视图类名(root = page_6_about / sidebar_highlight / sidebar_N_*)、父子关系,
 # 以及**布局步长约定**(0 = 同行标签+值,20 = 页头区块,43 = 分区标题→首行,62 = 行→行)。因此
 # 切系统语言、改文案都不会让本场景变红;但**结构或布局约定改动会让它明确失败**(这是设计意图:
 # 这种改动需要人工确认)。
@@ -94,7 +94,8 @@ while time.time() < deadline:
     # --open-settings=about first opens the ordinary General page, then parks on About. Wait for
     # the requested final page as well as a stable sequence so the initial General snapshot cannot
     # satisfy the settle check before the sidebar switch completes.
-    if candidate and candidate.get("views") and candidate.get("selected_sidebar") == 7:
+    # About is page 6 since the two shortcut pages merged into one.
+    if candidate and candidate.get("views") and candidate.get("selected_sidebar") == 6:
         if candidate.get("seq") == last_seq:
             stable_reads += 1
             if stable_reads >= SETTLE_READS:
@@ -132,13 +133,19 @@ def roots(name: str) -> list[dict]:
 
 # --- 1) 侧栏高亮跟着选中页 ------------------------------------------------
 check(
-    data["selected_sidebar"] == 7,
+    data["selected_sidebar"] == 6,
     "the selected sidebar page is About",
     f"selected_sidebar={data['selected_sidebar']}",
 )
 pill = roots("sidebar_highlight")
-about_row = roots("sidebar_7_about")
-keystroke_display_row = roots("sidebar_6_keystroke_display")
+about_row = roots("sidebar_6_about")
+keystroke_display_row = roots("sidebar_5_keystroke_display")
+key_bindings_row = roots("sidebar_4_key_bindings")
+check(
+    bool(key_bindings_row),
+    "the sidebar carries the merged Key Bindings entry",
+    f"key_bindings_row={key_bindings_row}",
+)
 general_row = roots("sidebar_0_general")
 check(
     bool(pill) and bool(about_row) and bool(keystroke_display_row) and bool(general_row),
@@ -168,7 +175,7 @@ if pill and about_row and general_row:
 # Regression source (fixed 2026-09-22): when the system switches to legacy scrollers, the clip loses
 # 17pt and a self-drawn switch was squeezed from 38pt to 21pt. The page now adapts to the measured
 # footprint, so this scenario accepts overlay or legacy and checks the footprint and switch geometry.
-page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_7_about"), None)
+page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_6_about"), None)
 check(page is not None, "the settings page's scroll geometry is in the snapshot")
 if page:
     footprint = round(page["self"][2] - page["clip"][2], 1)
@@ -186,7 +193,7 @@ if page:
     switches = [
         (round(n["frame"][2], 1), round(n["frame"][3], 1))
         for n in views
-        if n["root"] == "page_7_about" and n["class"] == "OhMyTabHtmlSwitch"
+        if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
     ]
     check(len(switches) >= 2, "found the self-drawn switches", f"found={len(switches)}")
     # 胶囊比例:被压扁时宽会掉到接近高度(21/22),正常约 1.7。用比例判定,不写死像素。
@@ -205,7 +212,7 @@ if page:
 buttons = [
     geom(views[n["parent"]])
     for n in views
-    if n["root"] == "page_7_about"
+    if n["root"] == "page_6_about"
     and n["class"] == "NSButtonTextField"
     and views[n["parent"]]["class"] == "OhMyTabHtmlActionButton"
     and views[n["parent"]]["frame"][2] <= 140.0
@@ -242,7 +249,7 @@ if buttons:
     print(f"  info action buttons widths={sorted(widths)} right_edges={sorted(right_edges)}")
 
 # --- 3) 行距与分隔线(结构性、与文案无关) --------------------------------
-labels = [n for n in views if n["root"] == "page_7_about" and n["class"] == "NSTextField"]
+labels = [n for n in views if n["root"] == "page_6_about" and n["class"] == "NSTextField"]
 if labels:
     # 行标签共用同一个父视图(且它是标签最多的那个父视图);按 y 从高到低排。
     # Row labels share one parent, which is the parent holding the most labels.
@@ -292,7 +299,7 @@ if labels:
     separators = sorted(
         round(n["frame"][1], 1)
         for n in views
-        if n["root"] == "page_7_about" and n["frame"][3] <= 1.5 and n["frame"][2] > 300
+        if n["root"] == "page_6_about" and n["frame"][3] <= 1.5 and n["frame"][2] > 300
     )
     missing = []
     for i, delta in enumerate(deltas):
@@ -328,18 +335,116 @@ expected_pages = {
     "page_1_switcher",
     "page_2_mouse",
     "page_3_clipboard",
-    "page_4_window_control",
-    "page_5_quick_actions",
-    "page_6_keystroke_display",
-    "page_7_about",
+    "page_4_key_bindings",
+    "page_5_keystroke_display",
+    "page_6_about",
 }
 page_entries = data.get("pages", [])
 page_roots = {page.get("root") for page in page_entries}
 check(
     page_roots == expected_pages,
-    "all eight settings pages have geometry snapshots",
+    "all seven settings pages have geometry snapshots",
     f"missing={sorted(expected_pages - page_roots)} extra={sorted(page_roots - expected_pages)}",
 )
+
+# --- 键绑定页:字段存在性与「总开关就是运行时闸门」 ---------------------
+# 必须先确认快照真的带了这些字段:用 data.get(k, 0) 取值时,字段整体缺失也会满足
+# 「live <= entries」和「总开关关闭则 live == 0」,那这个门禁就成了假通过。
+# The fields must be present and typed before any comparison: defaulting a missing field to 0 makes
+# both invariants below pass on a snapshot that carries no binding state at all, which is a gate
+# that cannot decide. `binding_state_problem` returns None only when it can.
+def binding_state_problem(state: dict) -> str | None:
+    required = {
+        "key_bindings_live": int,
+        "key_bindings_entries": int,
+        "key_bindings_enabled": bool,
+        # The footer's - target. `null` is legal (nothing selected); a number must be a row that
+        # exists, or the delete button would be aimed past the end of the list.
+        "key_bindings_selected": (int, type(None)),
+    }
+    missing = [key for key in required if key not in state]
+    if missing:
+        return f"missing fields: {missing}"
+    # bool is an int subclass in Python, so an `int` field must reject True/False explicitly, and
+    # the selection's `None` alternative must not be confused with a missing value.
+    def field_is_typed(key, kind) -> bool:
+        value = state[key]
+        if kind is int:
+            return isinstance(value, int) and not isinstance(value, bool)
+        return isinstance(value, kind)
+
+    wrong = [key for key, kind in required.items() if not field_is_typed(key, kind)]
+    if wrong:
+        return f"wrong field types: {wrong}"
+    if state["key_bindings_live"] > state["key_bindings_entries"]:
+        return (
+            f"live={state['key_bindings_live']} exceeds entries={state['key_bindings_entries']}"
+        )
+    if not state["key_bindings_enabled"] and state["key_bindings_live"] != 0:
+        return (
+            "the master switch is off but "
+            f"live={state['key_bindings_live']}"
+        )
+    selected = state["key_bindings_selected"]
+    if selected is not None and not 0 <= selected < state["key_bindings_entries"]:
+        return (
+            f"selected={selected} is not a row of {state['key_bindings_entries']} entries"
+        )
+    return None
+
+
+# 反例:同一检查必须拒绝缺字段与自相矛盾的快照,否则它测不出任何东西。
+# Counter-examples: the check has to reject a snapshot without the fields, and one that claims live
+# bindings while the master switch is off. Without these the assertion above cannot be trusted.
+assert binding_state_problem({}) is not None, "an empty snapshot must not pass"
+assert binding_state_problem(
+    {
+        "key_bindings_live": 5,
+        "key_bindings_entries": 13,
+        "key_bindings_enabled": False,
+        "key_bindings_selected": None,
+    }
+) is not None, "live bindings with the master switch off must not pass"
+assert binding_state_problem(
+    {
+        "key_bindings_live": 5,
+        "key_bindings_entries": 13,
+        "key_bindings_enabled": True,
+        "key_bindings_selected": None,
+    }
+) is None, "a consistent snapshot must pass"
+assert binding_state_problem(
+    {
+        "key_bindings_live": 5,
+        "key_bindings_entries": 13,
+        "key_bindings_enabled": True,
+        "key_bindings_selected": 2,
+    }
+) is None, "an in-range selection must pass"
+assert binding_state_problem(
+    {
+        "key_bindings_live": 5,
+        "key_bindings_entries": 13,
+        "key_bindings_enabled": True,
+        "key_bindings_selected": 13,
+    }
+) is not None, "a selection past the last row must not pass"
+assert binding_state_problem(
+    {
+        "key_bindings_live": 5,
+        "key_bindings_entries": 0,
+        "key_bindings_enabled": True,
+        "key_bindings_selected": 0,
+    }
+) is not None, "a selection in an empty list must not pass"
+
+problem = binding_state_problem(data)
+check(
+    problem is None,
+    "the live binding count follows the master switch, and the state fields are present",
+    f"{problem} live={data.get('key_bindings_live')} entries={data.get('key_bindings_entries')}",
+)
+
 for root in sorted(expected_pages):
     page = next((entry for entry in page_entries if entry.get("root") == root), None)
     if page is None:

@@ -453,6 +453,38 @@ number = 42
         }
     }
 
+    /// Every bindable action's label key must resolve to real copy in every locale.
+    ///
+    /// The same failure as the clipboard-notice regression above, reached from the binding registry:
+    /// four system actions (`Show Desktop`, `Mission Control`, `App Exposé`, `Launchpad`) borrow the
+    /// mouse mapping panel's keys, and those live under `[settings]`, so the key has to be spelled
+    /// `settings.mapping_action_*`. Without the prefix `t()` falls back to returning the key itself
+    /// and the row, the picker and the tooltip printed `mapping_action_showdesktop` on screen.
+    ///
+    /// This walks `Action::ALL`, so a new action whose label key is wrong fails here instead of
+    /// reaching a screenshot.
+    #[test]
+    fn every_binding_action_label_resolves_in_every_locale() {
+        for (locale, raw) in [
+            ("en", EN_TOML),
+            ("zh-Hans", ZH_TOML),
+            ("zh-Hant", ZH_HANT_TOML),
+        ] {
+            let parsed: toml::Value = toml::from_str(raw).unwrap();
+            let mut map = HashMap::new();
+            flatten(&parsed, "", &mut map);
+            for action in crate::key_bindings::ALL {
+                let key = action.label_key();
+                let value = map.get(key);
+                assert!(
+                    value.is_some_and(|v| !v.trim().is_empty() && v != key),
+                    "{locale}: {} label key {key} must resolve to real copy",
+                    action.config_id()
+                );
+            }
+        }
+    }
+
     #[test]
     fn all_locales_share_identical_key_sets() {
         // All locale files must expose the exact same key set (no missing/extra keys).

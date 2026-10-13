@@ -1567,11 +1567,16 @@ pub(super) unsafe fn build_clipboard_page(
     content_bottom
 }
 
-/// Build the Window Control page and return its shortcuts-card bottom.
-pub(super) unsafe fn build_window_control_page(
+/// Build the Key Bindings page: one card holding the master switch, the editable binding list and
+/// the add row. Returns the add card's bottom.
+///
+/// The rows themselves are rendered by `settings::bindings` from the config; this builder creates
+/// only the furniture around them and hands the canvas one block whose height the renderer owns (it
+/// re-flows the page as rows come and go).
+pub(super) unsafe fn build_key_bindings_page(
     context: &SettingsPageBuildContext,
-    window_control_view: *mut AnyObject,
-    window_control_doc_h: f64,
+    key_bindings_view: *mut AnyObject,
+    key_bindings_doc_h: f64,
     ui: &mut SettingsUi,
 ) -> f64 {
     let content_w = context.content_w;
@@ -1582,266 +1587,101 @@ pub(super) unsafe fn build_window_control_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
-    // The page's layout owner: rows, cards, the title and the document height all follow from it.
     let mut canvas = PageCanvas::new(
-        window_control_view,
+        key_bindings_view,
         content_w,
         layout,
-        &t("settings.sidebar_window_control"),
-        window_control_doc_h,
+        &t("settings.sidebar_key_bindings"),
+        key_bindings_doc_h,
         context.page_frame.size.height,
     );
-    let wy = canvas.next_row(described_row_h);
-    // Enable window control (master switch): the global Option+arrow interception is off
-    // by default and must be explicitly opted in.
-    ui.window_control_enabled = SettingsRow::described(
-        window_control_view,
+
+    // ---- Master switch: its own card, like the mouse page's "Enable button mappings" ----
+    let y = canvas.next_row(described_row_h);
+    ui.key_bindings_enabled = SettingsRow::described(
+        key_bindings_view,
         label_x,
-        wy,
+        y,
         ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
-        &t("settings.row_window_control_enabled"),
-        &t("settings.desc_window_control_enabled"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
+        &t("settings.row_key_bindings_enabled"),
+        &t("settings.desc_key_bindings_enabled"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y, row_h, false),
     );
-    let _: () = msg_send![ui.window_control_enabled, setTarget: target];
+    let _: () = msg_send![ui.key_bindings_enabled, setTarget: target];
     let _: () = msg_send![
-        ui.window_control_enabled,
-        setAction: sel!(handleWindowControlEnabledToggle:)
+        ui.key_bindings_enabled,
+        setAction: sel!(handleKeyBindingsToggle:)
     ];
-    canvas.card(&t("settings.header_window_control"));
+    // The card closes over the rows registered *before* it, so the switch's card is closed here and
+    // the list gets a card of its own below — the same split the mouse page's mappings use.
+    canvas.card(&t("settings.header_key_bindings"));
 
-    // Put the direction shortcuts in their own card so the master switch is separate from
-    // the per-direction settings.
+    // ---- The binding list: its own section, with its own header like every other card ----
     canvas.next_section();
-    let wy = canvas.next_row(described_row_h);
-    ui.window_control_up = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_up"),
-        &t("settings.desc_window_control_up"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_up);
-    let wy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
-    ui.window_control_down = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_down"),
-        &t("settings.desc_window_control_down"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_down);
-    let wy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
-    ui.window_control_left = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_left"),
-        &t("settings.desc_window_control_left"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_left);
-    let wy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
-    ui.window_control_right = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_right"),
-        &t("settings.desc_window_control_right"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_right);
-    let wy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
-    ui.window_control_display_up = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_display_up"),
-        &t("settings.desc_window_control_display_up"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_display_up);
-    let wy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
-    ui.window_control_display_down = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_display_down"),
-        &t("settings.desc_window_control_display_down"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_display_down);
-    let wy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
-    ui.window_control_display_left = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_display_left"),
-        &t("settings.desc_window_control_display_left"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_display_left);
-    let wy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(window_control_view, wy, described_row_h, content_w);
-    ui.window_control_display_right = SettingsRow::described(
-        window_control_view,
-        label_x,
-        wy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_window_control_display_right"),
-        &t("settings.desc_window_control_display_right"),
-        SettingsControl::switch(ctrl_x + ctrl_w, wy, row_h, false),
-    );
-    bind_control(target, ui.window_control_display_right);
-    canvas.card(&t("settings.header_window_control_shortcuts"));
+    // The list is a block the canvas owns: its height is provisional here and replaced by the
+    // renderer through `set_row_consume`. The canvas then wraps it in a card, which is what draws
+    // the section header above it and the surface behind it.
+    let origin_y = canvas.next_block(BINDINGS_BLOCK_H);
+    ui.key_bindings_row = canvas.last_row();
+    let (doc, empty) = build_bindings_block(key_bindings_view, content_w, origin_y);
+    ui.key_bindings_doc = doc;
+    ui.key_bindings_empty = empty;
+    canvas.card(&t("settings.header_key_binding_list"));
 
+    // Adding happens in the floating panel the card's footer ＋ opens, so the page is one list and
+    // nothing else: choosing the action, recording the chord and agreeing to it all live in the
+    // panel, where the user is already looking.
     let content_bottom = canvas.finish();
-    ui.page_canvases[4] = canvas;
+    ui.page_canvases[super::SETTINGS_KEY_BINDINGS_PAGE_INDEX] = canvas;
     content_bottom
 }
 
-/// Build the Quick Actions page and return its shortcuts-card bottom.
-pub(super) unsafe fn build_quick_actions_page(
-    context: &SettingsPageBuildContext,
-    quick_actions_view: *mut AnyObject,
-    quick_actions_doc_h: f64,
-    ui: &mut SettingsUi,
-) -> f64 {
-    let content_w = context.content_w;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
-    // Independent layout cursor (unrelated to the window-control page).
-    // The page's layout owner: rows, cards, the title and the document height all follow from it.
-    let mut canvas = PageCanvas::new(
-        quick_actions_view,
-        content_w,
-        layout,
-        &t("settings.sidebar_quick_actions"),
-        quick_actions_doc_h,
-        context.page_frame.size.height,
-    );
-    let qy = canvas.next_row(described_row_h);
-    // Enable quick actions (master switch): the global Option+I/E/D/L interception is off
-    // by default and must be explicitly opted in.
-    ui.quick_actions_enabled = SettingsRow::described(
-        quick_actions_view,
-        label_x,
-        qy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_quick_actions_enabled"),
-        &t("settings.desc_quick_actions_enabled"),
-        SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
-    );
-    let _: () = msg_send![ui.quick_actions_enabled, setTarget: target];
-    let _: () = msg_send![
-        ui.quick_actions_enabled,
-        setAction: sel!(handleQuickActionsEnabledToggle:)
-    ];
-    canvas.card(&t("settings.header_quick_actions"));
+/// The card the binding rows are rendered into, plus its empty-state hint.
+///
+/// It is a flipped settings card (surface, border and radius from the shared palette) so it reads
+/// like the other cards; the renderer grows it from the top edge and hands the height to the page
+/// canvas.
+unsafe fn build_bindings_block(
+    parent: *mut AnyObject,
+    content_w: f64,
+    origin_y: f64,
+) -> (*mut AnyObject, *mut AnyObject) {
+    // A transparent, flipped host for the rows. The canvas card that wraps this block draws the
+    // surface, the border and the section header, so the block must not draw a second one.
+    let doc: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let doc: *mut AnyObject = msg_send![doc, initWithFrame: NSRect::new(NSPoint::new(0.0, origin_y), NSSize::new(content_w, BINDINGS_BLOCK_H))];
+    let _: () = msg_send![doc, setFlipped: true];
+    let _: () = msg_send![parent, addSubview: doc];
+    release_obj(doc);
 
-    // Put the four action switches in their own card so the master switch stays separate
-    // from the per-action settings (matching the window-control page).
-    canvas.next_section();
-    let qy = canvas.next_row(described_row_h);
-    ui.quick_actions_open_settings = SettingsRow::described(
-        quick_actions_view,
-        label_x,
-        qy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_quick_action_open_settings"),
-        &t("settings.desc_quick_action_open_settings"),
-        SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
-    );
-    bind_control(target, ui.quick_actions_open_settings);
-    let qy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
-    ui.quick_actions_open_finder = SettingsRow::described(
-        quick_actions_view,
-        label_x,
-        qy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_quick_action_open_finder"),
-        &t("settings.desc_quick_action_open_finder"),
-        SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
-    );
-    bind_control(target, ui.quick_actions_open_finder);
-    let qy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
-    ui.quick_actions_show_desktop = SettingsRow::described(
-        quick_actions_view,
-        label_x,
-        qy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_quick_action_show_desktop"),
-        &t("settings.desc_quick_action_show_desktop"),
-        SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
-    );
-    bind_control(target, ui.quick_actions_show_desktop);
-    let qy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
-    ui.quick_actions_lock_screen = SettingsRow::described(
-        quick_actions_view,
-        label_x,
-        qy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_quick_action_lock_screen"),
-        &t("settings.desc_quick_action_lock_screen"),
-        SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
-    );
-    bind_control(target, ui.quick_actions_lock_screen);
-    let qy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(quick_actions_view, qy, described_row_h, content_w);
-    ui.quick_actions_locate_pointer = SettingsRow::described(
-        quick_actions_view,
-        label_x,
-        qy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_quick_action_locate_pointer"),
-        &t("settings.desc_quick_action_locate_pointer"),
-        SettingsControl::switch(ctrl_x + ctrl_w, qy, row_h, false),
-    );
-    bind_control(target, ui.quick_actions_locate_pointer);
-    canvas.card(&t("settings.header_quick_actions_shortcuts"));
-
-    let content_bottom = canvas.finish();
-    ui.page_canvases[5] = canvas;
-    content_bottom
+    let empty: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let empty: *mut AnyObject = msg_send![empty, initWithFrame: NSRect::new(
+        NSPoint::new(
+            bindings::BINDING_PAD_X,
+            bindings::BINDING_PAD_Y + (bindings::BINDING_ROW_H - 18.0) / 2.0
+        ),
+        NSSize::new(
+            (content_w - bindings::BINDING_PAD_X * 2.0).max(1.0),
+            18.0
+        )
+    )];
+    set_field(empty, t("settings.binding_empty_group"));
+    let _: () = msg_send![empty, setBezeled: false];
+    let _: () = msg_send![empty, setDrawsBackground: false];
+    let _: () = msg_send![empty, setEditable: false];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let _: () = msg_send![empty, setFont: font];
+    apply_settings_text_role(empty, SettingsTextRole::Disabled);
+    let _: () = msg_send![doc, addSubview: empty];
+    release_obj(empty);
+    (doc, empty)
 }
+
+/// The provisional height of one group's binding block: the renderer replaces it with the real
+/// height as soon as the rows are rendered.
+const BINDINGS_BLOCK_H: f64 = 200.0;
 
 /// Build the About page and return its compact update-card bottom.
 pub(super) unsafe fn build_about_page(
@@ -2271,8 +2111,7 @@ pub(super) unsafe fn finalize_settings_pages(
         "switcher",
         "mouse",
         "clipboard",
-        "window_control",
-        "quick_actions",
+        "key_bindings",
         "keystroke_display",
         "about",
     ];
