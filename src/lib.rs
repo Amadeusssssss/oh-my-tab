@@ -2022,17 +2022,21 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
-                sel!(handleBindingSelect:),
-                bindings::handle_binding_select as *mut c_void,
+                sel!(handleBindingEdit:),
+                bindings::handle_binding_edit as *mut c_void,
                 types.as_ptr(),
             );
-            // The footer's joined ＋ / − control reports which segment was clicked, so it is one
-            // selector: mapping the index inside the handler keeps the two halves from drifting into
-            // separate target/action pairs for what is a single control.
             class_addMethod(
                 cls,
-                sel!(handleBindingFooterAction:),
-                bindings::handle_binding_footer_action as *mut c_void,
+                sel!(handleBindingDelete:),
+                bindings::handle_binding_delete as *mut c_void,
+                types.as_ptr(),
+            );
+            // The footer's single "Add binding" button.
+            class_addMethod(
+                cls,
+                sel!(handleBindingAdd:),
+                bindings::handle_binding_add as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(

@@ -578,6 +578,10 @@ impl SettingsRow {
     /// radius reads as a pill on a small chip. The caller positions the run horizontally; the
     /// vertical centering is derived here from the shared row height so a chip lines up with the
     /// label and the trailing control without the caller doing arithmetic.
+    ///
+    /// `size` is the chip's **minimum** square. A label longer than one glyph ("Page Down") widens
+    /// its chip to fit rather than being drawn a character per chip, which is what used to let a
+    /// legal chord's legend run into the row's buttons. The height stays `size`.
     pub(super) unsafe fn legend_chip(
         parent: *mut AnyObject,
         x: f64,
@@ -586,10 +590,15 @@ impl SettingsRow {
         size: f64,
         symbol: &str,
     ) -> *mut AnyObject {
+        let measured = widgets::measure_control_text_width(symbol);
+        // The widest a single chip may grow: past this, the chip has eaten the whole keycap column
+        // and the row would overlap its buttons regardless of how the run is positioned.
+        let chip_w =
+            (measured.ceil() + crate::theme::LEGEND_CHIP_TEXT_PAD_X * 2.0).clamp(size, size * 8.0);
         let chip: *mut AnyObject = objc2::msg_send![objc2::class!(NSTextField), alloc];
         let chip: *mut AnyObject = objc2::msg_send![chip, initWithFrame: NSRect::new(
             NSPoint::new(x, row_y + (row_h - size) / 2.0),
-            NSSize::new(size, size)
+            NSSize::new(chip_w, size)
         )];
         widgets::set_field(chip, symbol);
         let _: () = objc2::msg_send![chip, setBezeled: false];
@@ -632,9 +641,16 @@ impl SettingsRow {
     /// knows how many cells the chord needs. Everything else — the label build, vertical centering
     /// against the shared row height, the accessibility label and the control registration — is the
     /// shared row behaviour, so a chord row is the same row as any other with a legend in front.
+    ///
+    /// `label_right` is where the label's box must stop. A row whose only control is the trailing one
+    /// can let `add_row_with_label` derive that from the control's leading edge, but a row with
+    /// controls on *both* sides of the text — the key bindings rows put Edit and Delete beside the
+    /// switch — would otherwise run its label under them, which the layout validator reports as an
+    /// overlap. The caller passes the left edge of the first trailing control instead.
     pub(super) unsafe fn with_leading_keycaps(
         parent: *mut AnyObject,
         label_x: f64,
+        label_right: f64,
         y: f64,
         h: f64,
         label_text: &str,
@@ -642,100 +658,17 @@ impl SettingsRow {
     ) -> (*mut AnyObject, *mut AnyObject) {
         let (label, control) =
             widgets::add_row_with_label(parent, label_x, y, 0.0, h, label_text, control);
+        // Clip the label to the bound the caller gave, keeping the height centering below intact.
+        if !label.is_null() && label_right > label_x {
+            let mut frame: NSRect = objc2::msg_send![label, frame];
+            frame.size.width = (label_right - label_x).max(1.0);
+            let _: () = objc2::msg_send![label, setFrame: frame];
+        }
         Self::center_label(label, y, h);
         Self::center_readonly_text_control(control, y, h);
         Self::center_control(control, y, h);
         Self::register_label(label, control);
         (label, control)
-    }
-}
-
-/// A joined two-glyph action control (the System-Settings ＋ / − cluster).
-///
-/// One native `NSSegmentedControl` rather than two adjacent buttons: the AppKit control draws a
-/// single outer border with one divider between the cells and a shared corner radius, which is what
-/// makes the pair read as one control. Two independent buttons each carry their own border and
-/// radius, so they read as two buttons no matter how closely they are placed.
-///
-/// The caller supplies the per-segment symbols and their spoken names; this component owns the
-/// geometry, the momentary tracking mode and the target/action wiring.
-pub(super) struct SettingsActionSegments;
-
-/// One segment of a [`SettingsActionSegments`] control: the symbol it shows and the name VoiceOver
-/// reads for it.
-pub(super) struct SegmentSpec<'a> {
-    pub(super) symbol: &'a str,
-    pub(super) description: &'a str,
-}
-
-impl SettingsActionSegments {
-    /// The control's height. It is the documented minimum hit target (§10), which is also what makes
-    /// the two glyph cells comfortable without a separate hit-area override.
-    pub(super) const HEIGHT: f64 = 28.0;
-    /// One cell's width. Two of these plus the shared divider is the whole control, so a caller can
-    /// compute where the caption after it starts.
-    pub(super) const CELL_W: f64 = 34.0;
-    pub(super) const WIDTH: f64 = Self::CELL_W * 2.0;
-    /// The glyph size inside a cell.
-    pub(super) const GLYPH: f64 = 13.0;
-
-    pub(super) unsafe fn create(
-        x: f64,
-        y: f64,
-        segments: &[SegmentSpec],
-        target: *mut AnyObject,
-        action: Sel,
-    ) -> *mut AnyObject {
-        let control: *mut AnyObject = objc2::msg_send![objc2::class!(NSSegmentedControl), alloc];
-        let control: *mut AnyObject = objc2::msg_send![
-            control,
-            initWithFrame: NSRect::new(
-                NSPoint::new(x, y),
-                NSSize::new(Self::CELL_W * segments.len() as f64, Self::HEIGHT)
-            )
-        ];
-        let _: () = objc2::msg_send![control, setSegmentCount: segments.len() as isize];
-        // Momentary: these are two actions, not a two-way switch, so nothing stays "selected".
-        let _: () = objc2::msg_send![control, setTrackingMode: 2isize];
-        let _: () = objc2::msg_send![control, setSegmentStyle: 1isize]; // NSSegmentStyleRounded
-        for (index, segment) in segments.iter().enumerate() {
-            let image = widgets::make_symbol_image_described(
-                segment.symbol,
-                NSSize::new(Self::GLYPH, Self::GLYPH),
-                segment.description,
-            );
-            if !image.is_null() {
-                let _: () = objc2::msg_send![control, setImage: image, forSegment: index as isize];
-            }
-            let _: () =
-                objc2::msg_send![control, setWidth: Self::CELL_W, forSegment: index as isize];
-        }
-        let _: () = objc2::msg_send![control, setTarget: target];
-        let _: () = objc2::msg_send![control, setAction: action];
-        control
-    }
-
-    /// Which segment the sender reports, or `None` when the control reports no selection.
-    ///
-    /// `selectedSegment` is `-1` for "no segment selected", which is a defined AppKit state and not
-    /// segment 0. Clamping it to 0 would turn an unknown click into the first segment's action -- for
-    /// the footer's `+ / −` pair that means a stray deletion path is never reached, but an
-    /// unrecognised sender could open the add panel. Callers match on the value instead.
-    pub(super) unsafe fn selected_segment(sender: *mut AnyObject) -> Option<usize> {
-        if sender.is_null() {
-            return None;
-        }
-        let index: isize = objc2::msg_send![sender, selectedSegment];
-        usize::try_from(index).ok()
-    }
-
-    /// Enable or disable one cell. `−` is armed by a selection and frozen by the master switch, so
-    /// the two halves have different availability and a whole-control `setEnabled:` would be wrong.
-    pub(super) unsafe fn set_segment_enabled(control: *mut AnyObject, index: usize, enabled: bool) {
-        if control.is_null() {
-            return;
-        }
-        let _: () = objc2::msg_send![control, setEnabled: enabled, forSegment: index as isize];
     }
 }
 
@@ -934,10 +867,6 @@ pub(crate) enum SettingsButtonRole {
     Footer,
     Primary,
     Destructive,
-    /// A full-row hit target with no chrome of its own: no fill, no border, no hover wash. Used where
-    /// a row is made selectable and the selection highlight is drawn by the owner, so the surface must
-    /// not add a second visual state on top of it.
-    Transparent,
 }
 
 impl SettingsButtonRole {
@@ -950,16 +879,7 @@ impl SettingsButtonRole {
             Self::Footer => (palette.footer_button_bg, palette.button_text, -1),
             Self::Primary => (palette.accent, palette.accent_text, -2),
             Self::Destructive => (palette.destructive, palette.accent_text, -4),
-            // Tag -5 is the transparent role's own palette slot: its normal and hover fills are both
-            // fully transparent, so the row's selection wash stays the only thing drawn.
-            Self::Transparent => (0x0000_0000, palette.primary_text, -5),
         }
-    }
-
-    /// Whether the role draws any chrome at all. A borderless role must skip the border/fill pass
-    /// entirely, or the hairline and the hover wash would reappear over the owner's own highlight.
-    pub(super) fn borderless(self) -> bool {
-        matches!(self, Self::Transparent)
     }
 }
 
@@ -976,15 +896,9 @@ impl SettingsButton {
         role: SettingsButtonRole,
     ) -> *mut AnyObject {
         let (background, text, hover_tag) = role.style(crate::theme::ui_palette());
-        let button = widgets::make_settings_styled_button(
+        widgets::make_settings_styled_button(
             frame, title, target, action, background, text, hover_tag,
-        );
-        if role.borderless() {
-            // The styled builder installs the fill and the hairline; strip both so the row's own
-            // selection highlight is the only thing drawn behind the label.
-            widgets::make_button_borderless(button);
-        }
-        button
+        )
     }
 
     /// Re-apply a role's palette to an existing button. The warning banner's button carries different

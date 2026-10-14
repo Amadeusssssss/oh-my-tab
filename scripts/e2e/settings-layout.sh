@@ -358,8 +358,9 @@ def binding_state_problem(state: dict) -> str | None:
         "key_bindings_live": int,
         "key_bindings_entries": int,
         "key_bindings_enabled": bool,
-        # The footer's - target. `null` is legal (nothing selected); a number must be a row that
-        # exists, or the delete button would be aimed past the end of the list.
+        # The page's former selection, now always `null`: Delete moved into each row and carries its
+        # own item index, so no page-level control is aimed at a row any more. The field stays in the
+        # contract (and is still range-checked) so a stale publisher cannot go unnoticed.
         "key_bindings_selected": (int, type(None)),
     }
     missing = [key for key in required if key not in state]

@@ -73,6 +73,37 @@ impl Trigger {
         }
     }
 
+    /// The chord as one chip per **logical key**: one chip per modifier symbol, then one chip for
+    /// the key itself.
+    ///
+    /// This is what the settings list draws, and it is deliberately not `keycap().chars()`: a key
+    /// whose display name is more than one character ("Page Down", "Space", "Return") would become
+    /// one chip per character, so a four-modifier chord on such a key would draw a long run of chips
+    /// and run into the row's buttons. The gesture form is two chips of the same symbol.
+    pub(crate) fn keycap_chips(&self) -> Vec<String> {
+        match self {
+            Self::Chord(chord) => {
+                let mut chips: Vec<String> = shortcut::modifier_display(chord.flags)
+                    .chars()
+                    .map(|symbol| symbol.to_string())
+                    .collect();
+                // The key name without its modifier prefix: `display_shortcut` is modifiers + key,
+                // and the modifiers are already their own chips.
+                let full = shortcut::display_shortcut(&self.describe());
+                let modifiers = shortcut::modifier_display(chord.flags);
+                let key = full.strip_prefix(&modifiers).unwrap_or(&full).to_string();
+                if !key.is_empty() {
+                    chips.push(key);
+                }
+                chips
+            }
+            Self::DoubleModifier(flag) => {
+                let symbol = shortcut::modifier_display(*flag).to_string();
+                vec![symbol.clone(), symbol]
+            }
+        }
+    }
+
     /// Whether this trigger is a chord for the engine's (keycode, modifier set) lookup.
     pub(crate) fn chord(&self) -> Option<Shortcut> {
         match self {
@@ -160,6 +191,42 @@ mod tests {
         // the clipboard row and the mouse mapping rows.
         assert_eq!(Trigger::parse("option+shift+up").unwrap().keycap(), "⇧⌥↑");
         assert_eq!(Trigger::parse("double-control").unwrap().keycap(), "⌃⌃");
+    }
+
+    /// A chip per logical key, not per character. The defect this prevents: drawing
+    /// `keycap().chars()` made "⌥Page Down" one 20pt chip per character -- ten of them -- which
+    /// overran the row's Edit and Delete buttons, and the layout smoke reported it as an overlap for
+    /// those legal bindings.
+    #[test]
+    fn keycap_chips_are_one_per_logical_key() {
+        let chips = |desc: &str| Trigger::parse(desc).unwrap().keycap_chips();
+        // Modifiers are their own chips; the key is exactly one, whatever its name's length.
+        assert_eq!(chips("option+e"), vec!["⌥", "E"]);
+        assert_eq!(chips("option+space"), vec!["⌥", "Space"]);
+        assert_eq!(chips("option+pagedown"), vec!["⌥", "Page Down"]);
+        assert_eq!(chips("cmd+shift+alt+ctrl+e"), vec!["⌘", "⇧", "⌥", "⌃", "E"]);
+        // The widest chord the picker can build: four modifiers plus a long-named key.
+        assert_eq!(
+            chips("cmd+shift+alt+ctrl+pagedown"),
+            vec!["⌘", "⇧", "⌥", "⌃", "Page Down"]
+        );
+        // The gesture form stays two chips of the same symbol.
+        assert_eq!(chips("double-control"), vec!["⌃", "⌃"]);
+        // Concatenating the chips gives back the single-string form, so the two views agree.
+        for desc in [
+            "option+e",
+            "option+space",
+            "option+pagedown",
+            "cmd+shift+alt+ctrl+e",
+            "double-command",
+        ] {
+            let trigger = Trigger::parse(desc).unwrap();
+            assert_eq!(
+                trigger.keycap_chips().concat(),
+                trigger.keycap(),
+                "{desc}: the chips must spell the keycap label"
+            );
+        }
     }
 
     #[test]

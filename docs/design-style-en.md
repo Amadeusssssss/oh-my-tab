@@ -475,6 +475,7 @@ density and the larger one to separate sections; never mix `12` and `14` for the
 | --- | --- | --- |
 | `radius-control` | 8 | Buttons, text fields, selects, tiles, list-item highlight, switch track inner geometry |
 | `radius-legend-chip` | 5 | The chip behind a key symbol in a read-only shortcut legend |
+| `legend-chip-text-pad-x` | 2 | Inline padding either side of a legend chip's label; a long key name widens its own chip rather than becoming one chip per character |
 | `radius-card` | 12 | Cards, grouped row containers, list tiles, popover items |
 | `radius-panel` | 16 | Tooltips, dropdown panels, HUDs, notification cards |
 | `radius-full` | 9999 | Pills: badges, status dots, switch, scrollbar knob |
@@ -516,6 +517,14 @@ which is a live state, and the keystroke display is where a live state belongs.
 So a legend keeps only what it needs to be read: a fill subtle enough not to imply interaction,
 whose sole job is binding the symbol to its label so a row of legends stays scannable. What it
 must **not** do is borrow the border, the radius scale, or the pointer states of a control.
+
+**A legend chip is keyed to a key, not to a character.** One chip means one key: a modifier symbol,
+or the key itself, whatever the key is called. A key whose name is longer than one glyph
+(`Page Down`, `Space`, `Return`) widens **its own** chip by `legend-chip-text-pad-x` on each side of
+the measured label; it is never split into one chip per character. Chips in a run share the
+`--spacing-0-5` (2pt) gap. Two consequences follow, and both are requirements rather than advice:
+the run must fit the space its column leaves (a run that does not fit moves as a unit instead of
+overlapping a neighbouring control), and the text beside it is what yields when space runs short.
 
 "As subtle as possible" is bounded from below, not free: the fill must still be distinguishable
 from the surface it sits on, in both modes. It is applied as a wash (darkening a light surface,

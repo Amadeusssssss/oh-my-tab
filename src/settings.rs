@@ -281,12 +281,11 @@ pub(super) struct SettingsUi {
     key_bindings_enabled: *mut AnyObject,
     key_bindings_doc: *mut AnyObject,
     key_bindings_empty: *mut AnyObject,
-    /// The footer band: one container view holding the joined ＋ / − control and its caption, so a
-    /// rebuild removes and redraws the whole band instead of accumulating views.
+    /// The footer band: one container view holding the full-width "Add binding" button, so a rebuild
+    /// removes and redraws the whole band instead of accumulating views.
     key_bindings_footer: *mut AnyObject,
-    /// The footer's joined ＋ / − control. One native segmented control, so the master switch and the
-    /// selection both address its segments rather than two separate buttons.
-    key_bindings_footer_segments: *mut AnyObject,
+    /// The footer's single "Add binding" button, so the master switch can freeze it.
+    key_bindings_footer_button: *mut AnyObject,
     /// The canvas row whose height the binding list owns (it grows and shrinks as rows come and go).
     key_bindings_row: usize,
     key_binding_rows: Vec<bindings::BindingRow>,
@@ -294,17 +293,6 @@ pub(super) struct SettingsUi {
     /// same shape only needs its switch states synced, not a rebuild that would destroy the very
     /// control whose action is running.
     key_binding_items_rendered: Vec<(String, String)>,
-    /// The row the footer's − acts on, as an index into `key_bindings.items`.
-    ///
-    /// An index is safe only because every path that changes the list's *shape* clears it first:
-    /// `sync_from_config` drops the selection when `binding_list_shape` changed, and this page's own
-    /// edits go through `write_binding_config`, which rebuilds the rows. A config edit made behind the
-    /// page's back therefore drops the selection instead of re-aiming − at a different binding. A
-    /// switch-only change keeps it, which is what keeps − usable while the user flips rows.
-    key_binding_selected: Option<usize>,
-    /// The selection highlight drawn behind that row; null when nothing is selected (or the page has
-    /// never rendered). It lives outside `BindingRow` because only one row has it at a time.
-    key_binding_selection_bg: *mut AnyObject,
     add_mapping_button: *mut AnyObject, // add-mapping button
     mapping_enabled: *mut AnyObject,    // mappings master switch (per-device)
     mapping_empty: *mut AnyObject,      // empty-state hint (in-card)
@@ -519,10 +507,10 @@ pub(crate) mod widgets;
 mod window;
 
 use components::{
-    row_action_button, RestoreDefaultsControl, SegmentSpec, SettingsActionSegments, SettingsButton,
-    SettingsButtonRole, SettingsCard, SettingsControl, SettingsLayout, SettingsMappingActionIcon,
-    SettingsPage, SettingsPageHeader, SettingsRow, SettingsSection, SettingsSelect,
-    SettingsSidebar, ROW_ACTION_BTN_H, ROW_ACTION_BTN_W,
+    row_action_button, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard,
+    SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
+    SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H,
+    ROW_ACTION_BTN_W,
 };
 use dispatch::*;
 use mapping::*;

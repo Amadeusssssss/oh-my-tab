@@ -1309,9 +1309,9 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             .map(|cfg| cfg.key_bindings.items.as_ref().map(Vec::len).unwrap_or(0))
             .unwrap_or(0)
     ));
-    // The row the footer's − would delete (`null` when nothing is selected). A scenario asserts the
-    // selection follows a click, survives a switch flip, and is dropped when the list's shape changes
-    // behind the page's back -- which is what keeps − aimed at the row the user picked.
+    // Always `null` now, and kept because the A2 scenario's schema requires the field to be present
+    // and typed: the footer's − it once named is gone, replaced by a per-row Delete button that
+    // carries its own item index, so the page has no selection left to publish.
     json.push_str(&format!(
         "  \"key_bindings_selected\": {},\n",
         match crate::settings::bindings::selected_binding_index() {

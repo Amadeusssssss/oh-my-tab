@@ -1855,29 +1855,26 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // enable pass and then asserting both flags is what catches a missing per-segment call.
         select_sidebar(SETTINGS_KEY_BINDINGS_PAGE_INDEX);
         let _: () = msg_send![window, layoutIfNeeded];
-        // Clear the selection, then drive the SAME function the master switch drives. Calling it (and
-        // nothing after it) is what makes this a check of the production path: a helper that only
-        // inspected the current state would read whatever the last repaint happened to leave, and
-        // `clear_selection` runs the per-segment arm itself, which would mask a mis-ordered pass.
-        // The row's own controls have to keep their clicks: the whole-row selection surface is a
-        // transparent overlay, and `addSubview:` puts a view on top, which is how it once swallowed
-        // the switch.
-        if !bindings::debug_validate_row_overlay_is_below_controls() {
-            hide_settings();
-            return false;
-        }
-        log_info!("[smoke-settings-layout] the row overlay sits below the row's controls");
-        bindings::clear_selection();
+        // Drive the SAME function the master switch drives, so this checks the production path: a
+        // helper that only inspected the current state would read whatever the last repaint happened
+        // to leave. Both the row actions and the footer button have to follow the switch, so the two
+        // checks run against one enable pass.
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
                 bindings::update_binding_controls_enabled(ui);
             }
         });
-        if !bindings::debug_validate_footer_segment_gating() {
+        if !bindings::debug_validate_row_actions_follow_master_switch() {
             hide_settings();
             return false;
         }
-        log_info!("[smoke-settings-layout] footer segments are gated correctly");
+        if !bindings::debug_validate_footer_button_gating() {
+            hide_settings();
+            return false;
+        }
+        log_info!(
+            "[smoke-settings-layout] row actions and the add button follow the master switch"
+        );
         log_info!("[smoke-settings-layout] all pages passed");
         // Inline update content (release notes) expands the About page's Updates card. The page
         // document must grow with the card, otherwise the bottom of the notes is cut off and cannot
@@ -2848,12 +2845,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             key_bindings_doc: std::ptr::null_mut(),
             key_bindings_empty: std::ptr::null_mut(),
             key_bindings_footer: std::ptr::null_mut(),
-            key_bindings_footer_segments: std::ptr::null_mut(),
+            key_bindings_footer_button: std::ptr::null_mut(),
             key_bindings_row: 0,
             key_binding_rows: Vec::new(),
             key_binding_items_rendered: Vec::new(),
-            key_binding_selected: None,
-            key_binding_selection_bg: std::ptr::null_mut(),
             clipboard_clear_on_quit: std::ptr::null_mut(),
             clipboard_separate_clear_all: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),

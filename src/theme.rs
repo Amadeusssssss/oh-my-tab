@@ -187,6 +187,12 @@ pub(crate) const RADIUS_LEGEND_CHIP: f64 = 5.0;
 /// than a fixed gray that vanishes in one of them. The chip keeps no border -- a border is what makes
 /// a chip read as a pressable control (style doc §6.1).
 pub(crate) const LEGEND_CHIP_ALPHA: u32 = 0x0E;
+/// Horizontal padding on each side of a legend chip's label. A chip is keyed to a *key*, not to a
+/// character, so a long name ("Page Down") widens its own chip and needs breathing room around its
+/// text. It is half the 4pt grid's smallest step: a single-glyph chip is already a 20pt square, and
+/// this only keeps the glyph from touching the wash's edge.
+/// See docs/design-style-en.md §6.1.
+pub(crate) const LEGEND_CHIP_TEXT_PAD_X: f64 = 2.0;
 /// The wash behind a modal settings panel: it dims the page under the panel so the floating editor
 /// reads as modal. 25% black, the same value both settings panels use, so they match.
 /// See docs/design-style-en.md §7 (a panel floats; the scrim is what puts the page behind it).

@@ -361,27 +361,32 @@ holds `action` / `trigger` / `enabled`.
   its own, keeping its siblings.
 - **One page, one switch.** The settings page is a single card: the master switch, then every binding
   in config order (window control and quick actions are no longer shown as separate cards), and a
-  footer band carrying a ＋ / − segmented control. Turning the master switch off freezes the rows,
-  the footer and the panel rather than hiding them, so the user can see what is installed before
-  enabling it. The status-bar menu carries one Key Bindings item over the master switch: an item can
-  only express one state, so two group items could not be merged into it.
-- **Row selection and the footer.** A row is chosen by clicking it; the selection is drawn as a
-  `selection_bg` wash behind the row and is what the footer's − acts on (with nothing selected it is
-  disabled). ＋ opens the add panel; − deletes the selected row **without a confirmation step** (the
-  user's explicit choice), and the selection then moves to the row that took the deleted one's place
-  — the new last row when the deleted one was last, and cleared outright when the list empties.
-  The selection is an index, and it is only safe because every path that changes the list's *shape*
-  drops it first: `sync_from_config` clears it when the shape changed, and the − handler re-reads the
-  config and refuses an index past the end. A switch-only change keeps it, so − stays usable while
-  the user flips rows. It is published as `key_bindings_selected` for A2.
-- **The whole-row hit target is registered as a layout exception.** Row selection is a transparent
-  `NSButton` covering the entire row, with the keycaps, label and switch drawn on top of it. It is the
-  only interactive view `--smoke-settings-layout` allows to intersect its own row's content: that
-  validator treats "an interactive view covering a label or another control" as a defect, which is
-  right for a normal control and wrong for this one. It therefore carries
-  `ROW_HIT_TARGET_IDENTIFIER`, and the validator skips it on **both** sides of the overlap comparison
-  (`collect_debug_layout`). Missing that step does not produce a visual bug -- it makes the validator
-  **panic on the key-bindings page**, so every page after it goes unvalidated.
+  footer band carrying one full-width "Add binding" button. Turning the master switch off freezes the
+  rows, the footer button and the panel rather than hiding them, so the user can see what is installed
+  before enabling it. The status-bar menu carries one Key Bindings item over the master switch: an item
+  can only express one state, so two group items could not be merged into it.
+- **Every row owns its actions.** A binding is edited and deleted from the row itself: "Edit" opens the
+  panel prefilled with that binding, "Delete" removes it **without a confirmation step** (the user's
+  explicit choice). There is no page-level selection any more -- the +/− segmented control and the
+  `selection_bg` wash behind a chosen row are gone -- because each row's buttons carry the item index
+  they act on in the address-keyed registry. That registry covers the *click*: a rebuild unregisters
+  every old address and re-registers the new ones, so a button cannot fire against a binding the list
+  no longer holds. It does **not** make the index safe to *write* against, because a click is not the
+  only way the list changes: a config reload can remove an entry while the panel is open, and an index
+  that still resolves then points at a different binding -- editing `B` in `[A, B, C]`, having `B`
+  dropped externally and reloading to `[A, C]` would overwrite `C`. The write path therefore compares
+  **identity**, not position: `EditTarget` captures the action and chord the panel was opened on, and
+  `resolve_edit_target` refuses the write with `errors.key_binding_edit_stale` unless that same binding
+  is still at that index. Delete re-reads the config length for the same reason. An index thus never
+  has to be invalidated the way the old selection did, and `key_bindings_selected` is published as
+  `null` -- kept only because the A2 schema requires the field to be present and typed.
+- **Edit and add share one panel.** The panel is the same surface in both modes: `BINDING_EDITING` holds
+  the item being edited or `None` to append, and it decides only what confirm writes and what the
+  fields start on. Prefill goes through pure helpers (`picker_index_for`, `chord_text_for`) so the rules
+  are testable without a window. Two details matter: the entry being edited is **excluded from its own
+  duplicate check** (recording a binding's own chord is the commonest edit, and counting that row
+  against itself would refuse it), and a write whose index no longer exists is refused with its own
+  message rather than overwriting whichever binding moved into that slot.
 - **Adding happens in a panel.** ＋ opens a floating `NSPanel` (the model the Mouse page's mapping
   panel established) holding the action popup, the chord row and Cancel/OK; the page itself stays a
   plain list. The panel owns the draft until OK, so nothing is written before the user agrees. Two
@@ -393,7 +398,8 @@ holds `action` / `trigger` / `enabled`.
   its content view's subtree, so a slot left filled would dangle.
 - **e2e state.** `--e2e-state` publishes `key_bindings_entries`, `key_bindings_live` and
   `key_bindings_enabled`, so a scenario can assert the migration and that nothing is live while the
-  master switch is off.
+  master switch is off. It also still publishes `key_bindings_selected`, always `null` now, because
+  the A2 schema requires the field to be present and typed.
 
 ## Building and testing
 
