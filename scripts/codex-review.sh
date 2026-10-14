@@ -26,7 +26,13 @@
 # one working tree still put both tasks' changes in front of the reviewer — a tree per task is what
 # makes two reviews independent.
 #
-# The reviewer runs on gpt-6.1-sol; set OMT_REVIEW_MODEL to review with another model.
+# The reviewer runs on the model and the speed named by codex-review.toml at the repository root
+# ([review] model / fast); with that file absent the defaults are gpt-6.1-sol and no Fast mode.
+# OMT_REVIEW_MODEL and OMT_REVIEW_FAST override one setting each, for a harness that wants to try
+# another model or speed without editing a tracked file. `fast = true` asks Codex for Fast mode,
+# which it spells service_tier "priority"; `fast = false` sends service_tier "default" explicitly, so
+# a Fast mode configured in ~/.codex/config.toml or .codex/config.toml cannot leak into a review. The
+# tier is chosen per turn and does not stick, so a resumed round is told again.
 #
 # The reviewer is asked to write its findings in Chinese, with the severity tokens left in English.
 #
@@ -48,6 +54,9 @@
 #   .agent-review/round-counter      the round number the archive names carry
 #   .agent-review/session-log.tsv    every session's beginning, resumption, loss and deliberate end
 #   .agent-review/rounds/            every attempt's events, message, stderr and outcome
+#
+# Each round's outcome names the model, the requested service tier and where each setting came from, so
+# the configuration an old round ran under survives the next round overwriting last-status.txt.
 #
 # Those are the paths of the keyless task. A named task holds the same set under
 # .agent-review/tasks/<key>/, so its session, lock, counter and archive are its own and a listing of
@@ -74,8 +83,19 @@ if ! ROOT="$(git rev-parse --show-toplevel 2>&1)"; then
 fi
 cd "$ROOT"
 
-# The reviewer's model. OMT_REVIEW_MODEL is for trying another one without editing this script.
-MODEL="${OMT_REVIEW_MODEL:-gpt-6.1-sol}"
+# The reviewer's model and speed are resolved further down, from codex-review.toml and the environment
+# overrides. They are deliberately not read here: --help, --tasks and --finish must keep working when
+# that file is broken, and those three return before the resolver runs. The values below are the
+# built-in defaults, and they are also what a signal arriving before the resolver sees, so that the
+# archive of an interrupted round never reads an unset variable.
+DEFAULT_MODEL="gpt-6.1-sol"
+MODEL="$DEFAULT_MODEL"
+MODEL_SOURCE="the built-in default"
+FAST=0
+FAST_SOURCE="the built-in default"
+SERVICE_TIER="default"
+SERVICE_TIER_REJECTED="no"
+CONFIG_FILE="$ROOT/codex-review.toml"
 
 BASE_DIR="$ROOT/.agent-review"
 TASKS_DIR="$BASE_DIR/tasks"
@@ -192,13 +212,18 @@ usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [-
   --timeout <sec>     bound a run that has not finished in this long (default 1800, 0 = none)
   --finish            clear this task's reviewer session: the user's call, not the agent's
 
+The model and the speed are read from codex-review.toml at the repository root ([review] model / fast).
+That file is optional: without it the reviewer runs on gpt-6.1-sol with Fast mode off. With it, a bad
+value, an unknown key or an unreadable file refuses the round instead of being ignored, because a review
+that silently ran on another model or another speed is not the review its settings describe. --tasks and
+--finish never read it, so a broken file cannot make a session unclearable. OMT_REVIEW_MODEL and
+OMT_REVIEW_FAST override one setting each and take precedence over the file.
+
 The session is kept until the user says the task is done, so that the reviewer remembers its own
 findings across the rounds of one task. --finish is the agent's only way to end it early and it is
 therefore run on the user's word, never on the agent's judgement; an agent that clears it on its own
 loses the reviewer's memory of findings that are still open. Running past the task's three-round
 budget makes every round more expensive, so the round that starts over budget says so.
-
-The model is gpt-6.1-sol; OMT_REVIEW_MODEL overrides it.
 EOF
 }
 
@@ -469,6 +494,156 @@ trap release_lock EXIT
 
 announce_task
 
+# The reviewer's model and speed, resolved here: after --tasks and --finish have returned (so a broken
+# file cannot make a session unclearable), and before --fresh drops a session or this round's status
+# and evidence files are truncated (so a refused configuration leaves the previous round intact).
+#
+# An unknown key, a wrong type, an unreadable file or a missing TOML reader refuses the round rather
+# than falling back: "the reviewer ran on gpt-6.1-sol" is a claim about the review that a silent
+# fallback would make false. Every message names the file and the offending key.
+#
+# A path that is *present* but is not a readable regular file -- a directory, a dangling or looping
+# symlink -- is refused for the same reason. Treating it as "no configuration" is the silent fallback
+# this function exists to prevent: a config delivered by symlink would stop applying, without a word,
+# the moment its target went away.
+MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+
+resolve_settings() {
+    if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+        # -e is false for a dangling symlink, so -L is asked as well: either way the path exists as
+        # *something*, and anything that is not a readable regular file is an error rather than a default.
+        if [[ ! -f "$CONFIG_FILE" || ! -r "$CONFIG_FILE" ]]; then
+            echo "$CONFIG_FILE exists but is not a readable regular file (a directory, a dangling or" >&2
+            echo "looping symlink, or a file this user cannot read), so its settings cannot be applied." >&2
+            echo "Fix or remove it: a review must not silently run on defaults its configuration did not ask for." >&2
+            exit 64
+        fi
+        local parsed status=0
+        # The parser is a separate program because bash cannot read TOML. `2>&1` deliberately folds a
+        # parser error into the captured text: it is printed verbatim below and never parsed as settings.
+        parsed="$(python3 - "$CONFIG_FILE" "$DEFAULT_MODEL" <<'PY' 2>&1
+import re
+import sys
+
+path, default_model = sys.argv[1], sys.argv[2]
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    print(
+        "python3 %d.%d has no tomllib, so %s cannot be read; Python 3.11 or newer is needed for that "
+        "file. Runs without it need no TOML reader." % (sys.version_info[0], sys.version_info[1], path)
+    )
+    raise SystemExit(1)
+
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except (OSError, tomllib.TOMLDecodeError) as exc:
+    print("cannot read %s: %s" % (path, exc))
+    raise SystemExit(1)
+
+# Only the two documented keys are accepted, at the top level and inside [review]: a typo here would
+# otherwise change which model or which speed the review runs at, silently.
+allowed_top = {"review"}
+allowed_review = {"model", "fast"}
+unknown = sorted(set(data) - allowed_top)
+if unknown:
+    print("unknown key %s in %s (only [review] is read)" % (", ".join(repr(k) for k in unknown), path))
+    raise SystemExit(1)
+
+review = data.get("review", {})
+if not isinstance(review, dict):
+    print("[review] in %s must be a table" % path)
+    raise SystemExit(1)
+unknown = sorted(set(review) - allowed_review)
+if unknown:
+    print(
+        "unknown key %s in [review] of %s (only model and fast are read)"
+        % (", ".join(repr(k) for k in unknown), path)
+    )
+    raise SystemExit(1)
+
+model, model_from_file = default_model, False
+if "model" in review:
+    model = review["model"]
+    model_from_file = True
+    if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
+        print(
+            "model in %s must be a model name of letters, digits, '.', '_', ':' and '-', at most 128 "
+            "characters; got %r" % (path, model)
+        )
+        raise SystemExit(1)
+
+fast, fast_from_file = False, False
+if "fast" in review:
+    fast = review["fast"]
+    fast_from_file = True
+    if not isinstance(fast, bool):
+        print("fast in %s must be true or false; got %r" % (path, fast))
+        raise SystemExit(1)
+
+print("model\t%s\t%s" % (model, "file" if model_from_file else "default"))
+print("fast\t%s\t%s" % ("1" if fast else "0", "file" if fast_from_file else "default"))
+PY
+)" || status=$?
+        if [[ "$status" -ne 0 ]]; then
+            printf '%s\n' "$parsed" >&2
+            echo "Refusing to review with settings that cannot be read; fix $CONFIG_FILE or remove it." >&2
+            exit 64
+        fi
+        local key value origin
+        while IFS=$'\t' read -r key value origin; do
+            case "$key" in
+                model)
+                    MODEL="$value"
+                    [[ "$origin" == file ]] && MODEL_SOURCE="codex-review.toml" || MODEL_SOURCE="the built-in default"
+                    ;;
+                fast)
+                    [[ "$value" == 1 ]] && FAST=1 || FAST=0
+                    [[ "$origin" == file ]] && FAST_SOURCE="codex-review.toml" || FAST_SOURCE="the built-in default"
+                    ;;
+            esac
+        done <<< "$parsed"
+    fi
+
+    # The environment overrides one setting each and wins over the file, which is what makes the selftest
+    # and a one-off comparison possible without editing a tracked file. They are validated like any other
+    # value: an override that silently does nothing would be a lie about the review that ran.
+    if [[ -n "${OMT_REVIEW_MODEL:-}" ]]; then
+        if [[ ! "$OMT_REVIEW_MODEL" =~ $MODEL_RE ]]; then
+            echo "OMT_REVIEW_MODEL is not a model name: '$OMT_REVIEW_MODEL'" >&2
+            exit 64
+        fi
+        MODEL="$OMT_REVIEW_MODEL"
+        MODEL_SOURCE="OMT_REVIEW_MODEL"
+    fi
+    if [[ -n "${OMT_REVIEW_FAST:-}" ]]; then
+        case "$OMT_REVIEW_FAST" in
+            1|true|yes|on)   FAST=1 ;;
+            0|false|no|off)  FAST=0 ;;
+            *)
+                echo "OMT_REVIEW_FAST takes 1/0, true/false or yes/no; got '$OMT_REVIEW_FAST'." >&2
+                exit 64
+                ;;
+        esac
+        FAST_SOURCE="OMT_REVIEW_FAST"
+    fi
+
+    # Fast mode is codex's service_tier "priority". Off is sent as an explicit "default" rather than
+    # omitted, because an omitted setting inherits a Fast mode configured in ~/.codex/config.toml or in
+    # the project's .codex/config.toml -- measured on codex-cli 0.162.1, where a global
+    # `service_tier = "priority"` reaches the request with no -c flag given.
+    if [[ "$FAST" == 1 ]]; then
+        SERVICE_TIER="priority"
+    else
+        SERVICE_TIER="default"
+    fi
+}
+
+resolve_settings
+echo "reviewer: model=$MODEL ($MODEL_SOURCE), fast=$([[ "$FAST" == 1 ]] && echo on || echo off) ($FAST_SOURCE)"
+
 # A retry resumes *that* round, so it keeps that round's kind: the one thing a retry must never do is
 # turn a design consultation that was never answered into a code review verdict. Read under the lock,
 # next to the session it is about, and never guessed: a missing record is a refusal, not a default,
@@ -714,6 +889,16 @@ archive_round() {
         echo "exit=$code"
         echo "kind=$ROUND_KIND"
         echo "session=$(cat "$SESSION_FILE" 2>/dev/null || echo none)"
+        # The configuration this round ran under, with each setting's origin: last-status.txt is
+        # overwritten by the next round, so without this the model and the speed of a past round would
+        # be unknowable. Read from the variables resolved for this round, never re-read from the file,
+        # which may have changed in between.
+        echo "model=$MODEL"
+        echo "model_source=$MODEL_SOURCE"
+        echo "fast=$([[ "$FAST" == 1 ]] && echo on || echo off)"
+        echo "fast_source=$FAST_SOURCE"
+        echo "service_tier=$SERVICE_TIER"
+        echo "service_tier_rejected=${SERVICE_TIER_REJECTED:-no}"
     } > "$ROUNDS_DIR/$stamp-outcome.txt"
     echo "$stamp"
 }
@@ -1103,7 +1288,7 @@ fi
 if [[ ! -f "$SESSION_FILE" ]]; then
     echo "Starting new Codex reviewer session..."
     status=0
-    run_codex exec --model "$MODEL" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT" || status=$?
+    run_codex exec --model "$MODEL" -c service_tier="$SERVICE_TIER" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT" || status=$?
     # Logged after the CLI ran, because only then does the new session have an id: the record has to
     # name the session it began, or a later reader cannot follow it to its rollout. A round whose CLI
     # never created one is recorded with no id, which is the honest description of that attempt.
@@ -1126,7 +1311,10 @@ else
     # not end up recorded twice, once here and once by the handler.
     log_round_session
     status=0
-    run_codex exec resume "$SESSION_ID" --model "$MODEL" --json -o "$MESSAGE_FILE" "$PROMPT" || status=$?
+    # The service tier is sent again here because it does not stick: codex resolves it per turn, and a
+    # resumed turn with no -c flag on this machine comes back at the default speed even when the first
+    # round asked for Fast mode.
+    run_codex exec resume "$SESSION_ID" --model "$MODEL" -c service_tier="$SERVICE_TIER" --json -o "$MESSAGE_FILE" "$PROMPT" || status=$?
     # A resume against a thread the CLI no longer holds fails before any turn: the session is gone, and
     # the log has to say `lost` rather than `resumed`, or the memory gap stays invisible. The wording is
     # the CLI's own; it is matched because it is the only signal that separates "this session is gone"
@@ -1156,6 +1344,10 @@ thread_id = ""
 completed = False
 errors = []
 stream_message = ""
+# codex does not fail a run whose service tier it will not use; it reports an `error` item and answers
+# at the default speed. That message is the only signal that the requested speed was dropped, so it is
+# matched on its stable part. It is recorded, not treated as a failed round: the review itself is valid.
+tier_rejected = False
 
 try:
     with open(events_path, "r", encoding="utf-8") as f:
@@ -1177,6 +1369,14 @@ try:
                 item = event.get("item") or {}
                 if item.get("type") == "agent_message" and item.get("text"):
                     stream_message = item["text"]
+                if item.get("type") == "error":
+                    # Both halves are required: the generic tail alone ("not advertised as supported
+                    # for model") could belong to another setting, and attributing that to the service
+                    # tier would archive a rejection that never happened. codex's own wording for this
+                    # case is "Configured service tier `X` is not advertised as supported for model `Y`".
+                    detail = str(item.get("message") or "")
+                    if "service tier" in detail and "not advertised as supported for model" in detail:
+                        tier_rejected = True
 except FileNotFoundError:
     pass
 
@@ -1233,6 +1433,7 @@ with open(status_path, "w", encoding="utf-8") as f:
     f.write("thread_id=%s\n" % thread_id)
     f.write("completed=%s\n" % ("yes" if completed else "no"))
     f.write("error=%s\n" % (errors[0] if errors else ""))
+    f.write("service_tier_rejected=%s\n" % ("yes" if tier_rejected else "no"))
     f.write("message_chars=%d\n" % len(message))
     f.write("looks_like_verdict=%s\n" % ("yes" if looks_like_verdict else "no"))
     f.write("round_status=%s\n" % round_status)
@@ -1252,6 +1453,9 @@ completed="$(status_field completed)"
 message_chars="$(status_field message_chars)"
 looks_like_verdict="$(status_field looks_like_verdict)"
 cli_error="$(status_field error)"
+# Whether codex declined the requested speed. It does not fail such a run, so this is the only evidence
+# that "fast = on" did not actually take effect. Read before archive_round so the outcome carries it.
+SERVICE_TIER_REJECTED="$(status_field service_tier_rejected)"
 # The classification above reports the *shape* of the message. A verdict-shaped message still does not make a
 # round: the turn has to have completed, the CLI has to have exited cleanly and the run must not have been
 # killed. A retry resumes a round that reached none of that, so it tests this field, not the shape.
@@ -1283,6 +1487,20 @@ fi
 set_concluded "$([[ "$CODE" -eq 0 ]] && echo yes || echo no)"
 
 stamp="$(archive_round "${REASON:-none}" "$CODE")"
+
+# The speed was requested, not delivered. The review is still valid -- codex answered at its default
+# speed -- so the round keeps its verdict and its exit code, but the mismatch is never left silent.
+if [[ "$SERVICE_TIER_REJECTED" == "yes" ]]; then
+    echo >&2
+    if [[ "$FAST" == 1 ]]; then
+        echo "Note: codex did not accept the requested service tier '$SERVICE_TIER' for model '$MODEL' and" >&2
+        echo "ran this round at its default speed. Fast mode (fast = true in codex-review.toml, from" >&2
+        echo "$FAST_SOURCE) is therefore NOT confirmed for this round; the catalogue of tiers a model" >&2
+        echo "supports is \`codex debug models\`." >&2
+    else
+        echo "Note: codex did not accept the requested service tier '$SERVICE_TIER'." >&2
+    fi
+fi
 
 if [[ "$CODE" -eq 0 ]]; then
     cp "$MESSAGE_FILE" "$OUTPUT_FILE"

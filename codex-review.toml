@@ -1,0 +1,18 @@
+# Settings for the independent Codex reviewer (scripts/codex-review.sh). See AGENTS.md,
+# "Independent reviewer".
+#
+# model — the Codex model that reviews. Environment override: OMT_REVIEW_MODEL.
+# fast  — request Fast mode, which codex spells as service_tier "priority": the model catalogue
+#         describes the tier as "2x speed, increased usage" (`codex debug models`). That figure is the
+#         catalogue's own product claim about the model, not a measurement of a review round. The tier
+#         is picked per turn, so the script sends it on every round, including a resumed one.
+#
+# `fast = false` sends service_tier "default" explicitly rather than leaving the setting out, so a Fast
+# mode enabled in ~/.codex/config.toml or in the project's .codex/config.toml cannot leak into a review.
+#
+# Only the two settings above are read. An unknown key here is refused instead of ignored: a typo would
+# otherwise change how the review runs without saying so, and a review's own settings should never be
+# silently different from the file that states them.
+[review]
+model = "gpt-6.1-sol"
+fast = false

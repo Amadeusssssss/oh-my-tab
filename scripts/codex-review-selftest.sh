@@ -28,9 +28,9 @@ helper="$script_dir/codex-review.sh"
 # The instrument controls its own environment. A task key the caller exported — a harness that says it once,
 # as the helper's documentation suggests — would move every keyless case's state into that task's directory
 # while the assertions still read the top-level paths, and the gate would fail for a reason that belongs to
-# the caller's shell. The same holds for a model override. The cases that test either variable set it on the
-# call itself.
-unset OMT_REVIEW_TASK OMT_REVIEW_MODEL
+# the caller's shell. The same holds for a model or speed override. The cases that test any of those
+# variables set it on the call itself.
+unset OMT_REVIEW_TASK OMT_REVIEW_MODEL OMT_REVIEW_FAST
 
 tmp="$(mktemp -d)"
 # The pre-check below asks whether the tree is clean, so the runs that test it must keep the harness's
@@ -59,15 +59,19 @@ task_key="$(printf '%s' "$prompt" | sed -n "s/.*belongs to task '\\([a-z0-9._-]*
 echo called >> "$STUB_DIR/calls.txt"
 if read -t 1 _; then echo "data" > "$STUB_DIR/stdin.txt"; else echo "rc=$?" > "$STUB_DIR/stdin.txt"; fi
 
-out=""; prev=""; is_resume=0; model=""; resume_id=""
+out=""; prev=""; is_resume=0; model=""; resume_id=""; tier=""
 for a in "$@"; do
     [[ "$prev" == "-o" ]] && out="$a"
     [[ "$prev" == "--model" || "$prev" == "-m" ]] && model="$a"
     [[ "$a" == "resume" ]] && is_resume=1
     [[ "$prev" == "resume" ]] && resume_id="$a"
+    # The helper passes the speed as `-c service_tier=<tier>`; recorded so a case can assert that the
+    # requested tier reaches the CLI on the first round *and* on a resume, which is where it used to be lost.
+    [[ "$prev" == "-c" && "$a" == service_tier=* ]] && tier="${a#service_tier=}"
     prev="$a"
 done
 printf '%s' "$model" > "$STUB_DIR/last-model.txt"
+printf '%s' "$tier" > "$STUB_DIR/last-tier.txt"
 printf '%s' "$is_resume" > "$STUB_DIR/last-resume.txt"
 # The id it was actually told to resume, not only that it was a resume: the thread id below is built from
 # the prompt, so a round that resumed another task's session would otherwise look like the right one.
@@ -80,6 +84,22 @@ start() {
         echo '{"type":"thread.started","thread_id":"stub-session"}'
     fi
     echo '{"type":"turn.started"}'
+}
+# The real CLI's wording, verbatim, when it will not use the requested service tier: it reports an error
+# item and answers at the default speed rather than failing the run. The helper keys its warning and its
+# archived `service_tier_rejected` off this sentence. The tier named is the one actually requested, so a
+# detection that matched a hard-coded value instead of the round's own would not be flattered by it.
+tier_rejected_item() {
+    python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured service tier `%s` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests." % (sys.argv[1] or "none")}}, ensure_ascii=False))' "${tier:-}"
+}
+# An unrelated error item: the tier warning must not fire on every error the CLI prints.
+unrelated_error_item() {
+    python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"stream disconnected before completion"}}, ensure_ascii=False))'
+}
+# The sharper counter-example: the *same* generic phrase, about a different setting. A match that only
+# looked for "not advertised as supported for model" would archive a service-tier rejection here.
+other_setting_rejected_item() {
+    python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured reasoning effort `ultra` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests."}}, ensure_ascii=False))'
 }
 msg() {
     [[ -n "$out" ]] && printf '%s\n' "$1" > "$out"
@@ -126,6 +146,14 @@ case "$mode" in
     # A CLI that dies before it reports a thread.started: the attempt produces events and even a
     # verdict, but no session. Nothing about the round may be recorded as a session existing.
     no-session)   echo '{"type":"turn.started"}'; msg "$(passing)"; turn_done ;;
+    # A completed, valid review whose requested speed codex declined: the round still passes, and the
+    # warning plus the archived flag are the only evidence that fast mode did not take effect.
+    tier-rejected) start; tier_rejected_item; msg "$(passing)"; turn_done ;;
+    # The counter-example for that warning: an error item that is not about the service tier.
+    error-item)   start; unrelated_error_item; msg "$(passing)"; turn_done ;;
+    # The sharper counter-example: the same generic phrase about a *different* setting, which must not be
+    # archived as a service-tier rejection.
+    other-setting) start; other_setting_rejected_item; msg "$(passing)"; turn_done ;;
 esac
 exit 0
 STUB
@@ -223,7 +251,10 @@ check "the CLI cannot read stdin" 0 "rc=1" "$tmp/stdin.txt"
 
 echo "the model the reviewer runs on"
 expect_value "the first review asks for gpt-6.1-sol" "gpt-6.1-sol" "$tmp/last-model.txt"
+# Read here, where that round really was the first one: later in the harness the same file holds the
+# id of a resume, so asserting it there would be asserting the wrong round.
 expect_value "and it really was a first review" "0" "$tmp/last-resume.txt"
+expect_value "with Fast mode off by default" "default" "$tmp/last-tier.txt"
 echo "a run that exited 0 without finishing its turn"
 run no-completed
 check "it is refused" 1 "turn.completed" "$tmp/err.txt"
@@ -922,10 +953,222 @@ else
     failures=$((failures + 1))
 fi
 
-echo "the model override"
+echo "the model and speed the reviewer runs on, on every round"
+# The default case is the file absent, which is the state of this harness: the built-in default model
+# with Fast mode off. Both halves are asserted, because "off" is a value the helper sends
+# (service_tier=default) rather than the absence of an argument.
+expect_value "the reviewer runs on gpt-6.1-sol" "gpt-6.1-sol" "$tmp/last-model.txt"
+expect_value "with Fast mode off" "default" "$tmp/last-tier.txt"
+expect "the round says which settings it used" "reviewer: model=gpt-6.1-sol (the built-in default), fast=off (the built-in default)" "$tmp/out.txt"
+
+# A resume has to repeat the tier: codex resolves it per turn, so a resumed round that omits it runs at
+# the default speed even when the first round asked for Fast (measured on codex-cli 0.162.1).
+run ok
+expect_value "a re-review is a resume" "1" "$tmp/last-resume.txt"
+expect_value "and it carries the tier again" "default" "$tmp/last-tier.txt"
+
+echo "OMT_REVIEW_MODEL names another model, OMT_REVIEW_FAST another speed"
 OMT_REVIEW_MODEL=another-model run ok
 check "the run with another model is produced" 0 - "$tmp/out.txt"
 expect_value "OMT_REVIEW_MODEL is passed through" "another-model" "$tmp/last-model.txt"
+expect "the round says where the model came from" "model=another-model (OMT_REVIEW_MODEL)" "$tmp/out.txt"
+expect_value "and the speed is untouched" "default" "$tmp/last-tier.txt"
+OMT_REVIEW_FAST=1 run ok
+check "the run with Fast mode is produced" 0 - "$tmp/out.txt"
+expect_value "OMT_REVIEW_FAST=1 asks for codex's priority tier" "priority" "$tmp/last-tier.txt"
+expect "the round says where the speed came from" "fast=on (OMT_REVIEW_FAST)" "$tmp/out.txt"
+OMT_REVIEW_FAST=false run ok
+expect_value "OMT_REVIEW_FAST=false is off" "default" "$tmp/last-tier.txt"
+for bad in maybe 2 yes-please; do
+    OMT_REVIEW_FAST="$bad" run ok
+    check "OMT_REVIEW_FAST='$bad' is refused" 64 "OMT_REVIEW_FAST" "$tmp/err.txt"
+done
+OMT_REVIEW_MODEL=$'bad\nmodel' run ok
+check "a model with a newline is refused" 64 "OMT_REVIEW_MODEL" "$tmp/err.txt"
+OMT_REVIEW_MODEL='a b' run ok
+check "a model with a space is refused" 64 "OMT_REVIEW_MODEL" "$tmp/err.txt"
+
+echo "codex-review.toml configures the model and the speed"
+# The file is read from the repository root, which is this throwaway repo. Each case rewrites it; the
+# last one removes it so the remaining cases run on the built-in defaults.
+write_config() { printf '%s\n' "$@" > codex-review.toml; }
+# A fast flag whose value cannot be confused with the file's: every case below that asserts a "default"
+# tier would also pass if the flag were dropped.
+write_config '[review]' 'model = "file-model"' 'fast = true'
+run ok
+check "a configured round runs" 0 - "$tmp/out.txt"
+expect_value "the file's model is used" "file-model" "$tmp/last-model.txt"
+expect_value "the file's fast = true asks for priority" "priority" "$tmp/last-tier.txt"
+expect "the round names the file as the source" "model=file-model (codex-review.toml), fast=on (codex-review.toml)" "$tmp/out.txt"
+write_config '[review]' 'fast = true'
+run ok
+expect_value "a missing model falls back on its own" "gpt-6.1-sol" "$tmp/last-model.txt"
+expect_value "while the file's fast still applies" "priority" "$tmp/last-tier.txt"
+expect "each setting's source is reported separately" "model=gpt-6.1-sol (the built-in default), fast=on (codex-review.toml)" "$tmp/out.txt"
+write_config '[review]' 'model = "file-model"' 'fast = false'
+run ok
+expect_value "fast = false is off" "default" "$tmp/last-tier.txt"
+# The file must not be able to leave the tier unset: an omitted service_tier inherits a Fast mode
+# configured in ~/.codex/config.toml or .codex/config.toml, so "off" has to be sent as "default".
+OMT_REVIEW_FAST=1 run ok
+expect_value "a one-off override wins over the file" "priority" "$tmp/last-tier.txt"
+OMT_REVIEW_MODEL=env-model run ok
+expect_value "and the model override wins over the file" "env-model" "$tmp/last-model.txt"
+
+echo "a configuration that cannot be read refuses the round"
+calls_before_config="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
+for bad_config in 'model = [' 'fast = "yes"' 'model = 12' 'model = ""' '[review]
+unknown = 1' '[other]
+model = "x"' '[review]
+model = "has
+newline"' 'review = 1' '[review]
+fast = 1'; do
+    printf '%s\n' "$bad_config" > codex-review.toml
+    run ok
+    check "it is refused: $(printf '%s' "$bad_config" | tr '\n' ' ' | head -c 40)" 64 "codex-review.toml" "$tmp/err.txt"
+done
+# The missing TOML reader has to be refused in the same way: a bare `python3` is not necessarily 3.11+.
+printf '%s\n' '[review]' 'model = "file-model"' > codex-review.toml
+rm -rf "$tmp/nolib"; mkdir -p "$tmp/nolib"
+cat > "$tmp/nolib/python3" <<'NOPY'
+#!/bin/bash
+# A python3 without tomllib (macOS ships 3.9 at /usr/bin/python3), for the version check.
+if [[ "${1:-}" == "-" ]]; then
+    echo "python3 3.9.6 has no tomllib, so $2 cannot be read; Python 3.11 or newer is needed for that file. Runs without it need no TOML reader." >&2
+    exit 1
+fi
+exec /usr/bin/env python3 "$@"
+NOPY
+chmod +x "$tmp/nolib/python3"
+set +e
+STUB_MODE=ok PATH="$tmp/nolib:$tmp/bin:$PATH" ./scripts/codex-review.sh >"$tmp/out.txt" 2>"$tmp/err.txt"
+echo $? > "$tmp/exit.txt"
+set -e
+check "a python3 without tomllib is refused, with the reason" 64 "no tomllib" "$tmp/err.txt"
+# The counter-example that makes "the reviewer was not called" mean something: an accepted config does
+# call it. Without this, a harness that never calls the stub at all would pass the check below.
+write_config '[review]' 'model = "file-model"'
+run ok
+check "a readable configuration still runs" 0 - "$tmp/out.txt"
+calls_after_control="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
+if [[ "$calls_after_control" -gt "$calls_before_config" ]]; then
+    echo "  ok   an accepted configuration does call the reviewer"
+else
+    echo "  FAIL the reviewer was never called, so 'not called' proves nothing"
+    failures=$((failures + 1))
+fi
+# Every refused case above must have left the CLI alone.
+calls_before_bad="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
+printf '%s\n' '[review]' 'fast = "yes"' > codex-review.toml
+run ok
+check "a bad value is refused" 64 "must be true or false" "$tmp/err.txt"
+run ok --task alpha
+check "a bad value refuses a named task too" 64 "must be true or false" "$tmp/err.txt"
+calls_after_bad="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
+if [[ "$calls_before_bad" == "$calls_after_bad" ]]; then
+    echo "  ok   a refused configuration never reaches the reviewer"
+else
+    echo "  FAIL the reviewer was called $((calls_after_bad - calls_before_bad)) time(s) with a broken configuration"
+    failures=$((failures + 1))
+fi
+# A refused configuration must leave the previous round's evidence where it was.
+: > .agent-review/last-status.txt; printf 'concluded=yes\n' > .agent-review/last-status.txt
+: > .agent-review/last-round-kind; printf 'review\n' > .agent-review/last-round-kind
+run ok
+check "the round is refused" 64 "codex-review.toml" "$tmp/err.txt"
+expect "the previous status record survives" "concluded=yes" .agent-review/last-status.txt
+expect_value "and the recorded kind is untouched" "review" .agent-review/last-round-kind
+# A broken configuration must not be able to make a session unclearable.
+write_config '[review]' 'model = ['
+run ok --tasks
+check "--tasks works with a broken configuration" 0 "task" "$tmp/out.txt"
+run ok --finish
+check "--finish works with a broken configuration" 0 "session cleared" "$tmp/out.txt"
+run ok --help
+check "--help works with a broken configuration" 0 "usage:" "$tmp/err.txt"
+rm -f codex-review.toml
+
+echo "a configuration path that exists but cannot be read is refused, not treated as absent"
+# "No configuration file" and "a configuration that cannot be read" are different states, and only the
+# first may fall back on the defaults. Treating the second as absent is the silent fallback this
+# function exists to prevent: a config reached through a symlink would stop applying, without a word,
+# the moment its target went away, and the reviewer would run on a model nobody chose.
+config_calls_before="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
+rm -f codex-review.toml
+mkdir codex-review.toml
+run ok
+check "a directory where the configuration should be is refused" 64 "not a readable regular file" "$tmp/err.txt"
+rmdir codex-review.toml
+ln -s "$tmp/no-such-target.toml" codex-review.toml
+run ok
+check "a dangling symlink is refused" 64 "not a readable regular file" "$tmp/err.txt"
+rm -f codex-review.toml
+# The absent case is asserted straight after, so "refused" cannot be passing because every state is
+# refused: with the path gone the built-in defaults are used and the reviewer does run.
+run ok
+check "a genuinely absent configuration still uses the defaults" 0 - "$tmp/out.txt"
+expect_value "on the default model" "gpt-6.1-sol" "$tmp/last-model.txt"
+# Unreadable to this user, which is not the same as absent either.
+printf '%s\n' '[review]' 'model = "file-model"' > codex-review.toml
+chmod 000 codex-review.toml
+if [[ ! -r codex-review.toml ]]; then
+    run ok
+    check "an unreadable file is refused" 64 "not a readable regular file" "$tmp/err.txt"
+else
+    echo "  ok   (skipped the chmod-000 case: this user can still read the file)"
+fi
+chmod 644 codex-review.toml 2>/dev/null || true
+rm -f codex-review.toml
+config_calls_after="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
+# The single call in the absent-configuration control above is the only one that may have happened here.
+if [[ "$((config_calls_after - config_calls_before))" -le 1 ]]; then
+    echo "  ok   only the absent-configuration control reached the reviewer"
+else
+    echo "  FAIL $((config_calls_after - config_calls_before)) calls happened; a broken path reached the reviewer"
+    failures=$((failures + 1))
+fi
+
+echo "the requested speed is archived with every round"
+run ok
+last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
+expect "the outcome names the model" "model=gpt-6.1-sol" "$last_outcome"
+expect "and its source" "model_source=the built-in default" "$last_outcome"
+expect "and the speed" "fast=off" "$last_outcome"
+expect "and the tier actually requested" "service_tier=default" "$last_outcome"
+expect "and that nothing was rejected" "service_tier_rejected=no" "$last_outcome"
+
+echo "a speed codex declines is reported and archived, not treated as a failed round"
+STUB_MODE=tier-rejected run tier-rejected
+check "the review still counts" 0 - "$tmp/out.txt"
+# A specific field inside a multi-field file, so grep rather than expect_value (which reads the whole file).
+if grep -q '^service_tier_rejected=yes$' .agent-review/last-status.txt; then
+    echo "  ok   the status records the rejected tier"
+else
+    echo "  FAIL the status did not record the rejected tier"
+    failures=$((failures + 1))
+fi
+last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
+expect "the outcome carries the rejection" "service_tier_rejected=yes" "$last_outcome"
+expect "and the round still produced its review" "reason=none" "$last_outcome"
+STUB_MODE=error-item run error-item
+check "an unrelated error item does not fail the round" 0 - "$tmp/out.txt"
+# The fixture is asserted to have emitted its error: without this, a call that silently ran the happy
+# path would satisfy every "no tier rejection" assertion below it.
+expect "the fixture really emitted an error item" "stream disconnected before completion" .agent-review/last-review.jsonl
+expect_absent "and it is not reported as a tier rejection" "did not accept the requested service tier" "$tmp/err.txt"
+last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
+expect "with no rejection in the archive" "service_tier_rejected=no" "$last_outcome"
+# The same generic phrase about a different setting: matching it alone would archive a tier rejection
+# that never happened, so this is the case that gives the tier-specific match its teeth. `run` takes the
+# mode as its *first* argument, so the mode is passed there and not only as a prefix: a prefix naming a
+# mode that the call then overrides runs the happy path, and the counter-example proves nothing.
+STUB_MODE=other-setting run other-setting
+check "a rejection of another setting is not a failed round" 0 - "$tmp/out.txt"
+expect "the fixture really emitted the other setting's rejection" "reasoning effort" .agent-review/last-review.jsonl
+expect "and the generic phrase really was in it" "not advertised as supported for model" .agent-review/last-review.jsonl
+expect_absent "and it is not reported as a tier rejection either" "did not accept the requested service tier" "$tmp/err.txt"
+last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
+expect "with no tier rejection in the archive either" "service_tier_rejected=no" "$last_outcome"
 
 echo "the handshake helper's own failure paths"
 rm -f "$tmp/nope-ready" "$tmp/bad.pid"

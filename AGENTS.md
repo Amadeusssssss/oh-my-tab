@@ -179,7 +179,13 @@ scripts/codex-review-selftest.sh            # check the helper itself, against a
   in `--note` so the next round reads it.
 
 The reviewer prompt carries a repository checklist (the patch-side view of the next four rules) and the prompt
-and model live in the script; `OMT_REVIEW_MODEL` selects another model.
+lives in the script. The model and the speed come from `codex-review.toml` at the repository root
+(`[review] model` / `fast`); the file is optional, and without it the reviewer runs on `gpt-6.1-sol` with Fast
+mode off. `OMT_REVIEW_MODEL` and `OMT_REVIEW_FAST` override one setting each. `fast = true` asks Codex for
+Fast mode (`service_tier = "priority"`), which is billed at a higher rate; `false` sends `service_tier
+= "default"` explicitly so a Fast mode configured in `~/.codex/config.toml` cannot leak into a review. A
+configuration that cannot be read refuses the round rather than being ignored, and each round's outcome records
+the settings it ran under.
 
 ### What the reviewer is asked to weigh here
 
