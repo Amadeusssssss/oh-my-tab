@@ -597,6 +597,113 @@ pub(crate) fn status_h() -> f64 {
     status_bar_height_for_text_size(status_bar_text_size()) - THUMB_BOTTOM_INSET
 }
 
+/// The corner-safe inset for a control in the footer band's trailing corner.
+///
+/// The gear sits in the panel's bottom-right rounded corner, so the button's own bottom-right corner
+/// must stay inside the corner arc. The model this follows: a rounded-rect path clamps its radius
+/// PER AXIS to that axis's half-extent, i.e. `rx = min(r, panel_w / 2)` and
+/// `ry = min(r, panel_h / 2)`, so the corner centre is at `(W - rx, ry)` and the button's
+/// bottom-right corner at `(W - X, m)` is inside the corner when
+/// `((rx - X) / rx)^2 + ((ry - m) / ry)^2 <= 1`, i.e.
+/// `X_min = rx * (1 - sqrt(1 - ((ry - m) / ry)^2))` for `m < ry` (and 0 otherwise).
+///
+/// EVIDENCE BOUNDARY. The per-axis clamp and the formula are what this function implements, and the
+/// unit tests below pin THAT. What no test here observes is the shipped panels' actual clipped
+/// shape: the frost path draws a template then stretches it through cap insets, the glass path uses
+/// `setCornerRadius:`, and reading a view's `cornerRadius`/mask back does not say what was
+/// clipped. Until an assertion measures a real panel's corner (and a deliberately overshooting
+/// counter-example), treat this as the model the layout is computed against, not as a verified
+/// statement about every material. Note also that `rx` and `ry` clamp independently: with a panel
+/// wider than it is tall, `ry` caps while `rx` keeps growing, so "a radius above half the height
+/// behaves like one equal to it" is NOT true in general -- only each axis on its own.
+///
+/// The control is vertically CENTRED in the band, so `m = (band_h - control_h) / 2`. Centring is
+/// load-bearing: `ry - m` then grows with the band, so raising the band lowers `X_min`. A fixed `m`
+/// would raise `X_min` as the panel grows, inverting the fallback.
+///
+/// The `inset` clamps to `[0, panel_w / 2]`: a caller cannot be told to reserve more than half the
+/// panel, which is what keeps the reserve symmetric and the footer text's centre on the panel's.
+pub(crate) fn footer_control_inset(
+    corner_radius: f64,
+    panel_w: f64,
+    panel_h: f64,
+    control_h: f64,
+    band_h: f64,
+) -> f64 {
+    let rx = effective_corner_extent(corner_radius, panel_w);
+    let ry = effective_corner_extent(corner_radius, panel_h);
+    if rx <= 0.0 || ry <= 0.0 {
+        return 0.0;
+    }
+    let m = ((band_h - control_h) / 2.0).max(0.0);
+    if m >= ry {
+        return 0.0;
+    }
+    let ratio = (ry - m) / ry;
+    let x = rx * (1.0 - (1.0 - ratio * ratio).max(0.0).sqrt());
+    if x.is_finite() {
+        x.max(0.0).min(panel_w / 2.0)
+    } else {
+        0.0
+    }
+}
+
+/// One axis's effective corner extent: AppKit clamps a rounded rect's radius to half that axis.
+fn effective_corner_extent(corner_radius: f64, axis: f64) -> f64 {
+    if !corner_radius.is_finite() || !axis.is_finite() || axis <= 0.0 {
+        return 0.0;
+    }
+    corner_radius.max(0.0).min(axis / 2.0)
+}
+
+/// Minimum footer band height that holds the trailing settings control with its vertical margin.
+/// The band otherwise follows the footer text size, which bottoms out at a 28pt band (13pt footer)
+/// where a 28pt control has no margin at all; the floor gives it the 4pt grid's breathing room.
+pub(crate) const FOOTER_CONTROL_MIN_H: f64 = 36.0;
+/// Side of the footer's square settings control.
+pub(crate) const FOOTER_CONTROL_SIZE: f64 = 28.0;
+/// Gap between the settings control and the footer text's reserved area.
+pub(crate) const FOOTER_CONTROL_GAP: f64 = 8.0;
+
+/// The footer band's height, with the floor the settings control needs. Every consumer of the band
+/// (the card viewport, the document, the scroller, the footer text and the control) must use THIS,
+/// or the control and the viewport disagree about where the band starts.
+pub(crate) fn footer_band_h() -> f64 {
+    status_h().max(FOOTER_CONTROL_MIN_H)
+}
+
+/// The trailing horizontal inset reserved for the footer's settings control: the corner-safe inset
+/// plus the control's own width and its gap to the text. The footer text keeps the SAME reserve on
+/// both sides, so its centre stays the panel's centre.
+pub(crate) fn footer_text_reserve(panel_w: f64, panel_h: f64) -> f64 {
+    let corner_radius = CONFIG.read().unwrap().appearance.corner_radius;
+    let inset = footer_control_inset(
+        corner_radius,
+        panel_w,
+        panel_h,
+        FOOTER_CONTROL_SIZE,
+        footer_band_h(),
+    )
+    .max(H_PADDING);
+    inset + FOOTER_CONTROL_SIZE + FOOTER_CONTROL_GAP
+}
+
+/// The footer text's frame: symmetric about the panel centre.
+///
+/// KNOWN LIMIT: at an extreme configured `appearance.corner_radius` the symmetric reserve can
+/// consume the panel, and the `max(1.0)` floor then keeps a 1pt frame that cannot render a title.
+/// The button stays inside the corner in that case, but the footer text is effectively unreadable.
+/// That configuration has no agreed fallback yet (the choice between a taller band, a narrower text
+/// area and hiding the entry is the user's); see `docs/review-backlog.md`. This function does NOT
+/// claim a readable minimum -- the clamp only keeps the rect valid.
+pub(crate) fn footer_text_frame(panel_w: f64, panel_h: f64, line_h: f64) -> (f64, f64, f64) {
+    let reserve = footer_text_reserve(panel_w, panel_h);
+    let width = (panel_w - reserve * 2.0).max(1.0);
+    let x = ((panel_w - width) / 2.0).max(0.0);
+    let y = (footer_band_h() - line_h) / 2.0;
+    (x, y, width)
+}
+
 pub(crate) fn status_bar_height_for_text_size(size: f64) -> f64 {
     let size = if size.is_finite() {
         size.clamp(13.0, 20.0)
@@ -1061,7 +1168,8 @@ fn thumb_widths_with_max_card_w(
 }
 
 fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
-    let available = (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - status_h()).max(card_h);
+    let available =
+        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h()).max(card_h);
     ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
 }
 
@@ -1072,7 +1180,8 @@ fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
 fn thumb_viewport_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
     let teaser_h = gap + card_h * THUMB_SCROLL_TEASER_RATIO;
     let available =
-        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - status_h() - teaser_h).max(card_h);
+        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h() - teaser_h)
+            .max(card_h);
     ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
 }
 
@@ -1176,7 +1285,7 @@ fn build_thumb_layout(
                 + THUMB_BOTTOM_INSET
                 + max_rows as f64 * card_h
                 + max_rows.saturating_sub(1) as f64 * gap
-                + status_h(),
+                + footer_band_h(),
         )
     } else {
         (
@@ -1185,7 +1294,7 @@ fn build_thumb_layout(
                 + THUMB_BOTTOM_INSET
                 + n_rows as f64 * card_h
                 + n_rows.saturating_sub(1) as f64 * gap
-                + status_h(),
+                + footer_band_h(),
         )
     };
     let mut placements = Vec::with_capacity(visible.len());
@@ -1217,7 +1326,7 @@ fn build_thumb_layout(
         panel_h,
         card_h,
         document_placements: placements.clone(),
-        document_h: (panel_h - status_h()).max(1.0),
+        document_h: (panel_h - footer_band_h()).max(1.0),
         scale,
         visible,
         placements,
@@ -1327,7 +1436,7 @@ fn build_thumb_scroll_layout(
         + THUMB_BOTTOM_INSET
         + all_rows.len() as f64 * constraints.card_h
         + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
-    let document_panel_h = document_h + status_h();
+    let document_panel_h = document_h + footer_band_h();
     let mut document_placements = Vec::new();
     for (row_index, row) in all_rows.iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
@@ -1508,7 +1617,7 @@ pub(crate) fn thumb_panel_metrics(
         + rows as f64 * card_h
         + rows.saturating_sub(1) as f64 * gap
         + teaser_h
-        + status_h();
+        + footer_band_h();
     // Step selection and the viewport row count already keep the content inside the budget (see
     // thumb_max_rows / thumb_viewport_rows). Clamping again is a backstop that only kicks in when the
     // budget is too small for even one row plus the teaser (max_rows floors at 1); showing a little
@@ -1563,7 +1672,7 @@ pub(crate) fn thumb_panel_height_for_rows(
         + visible_rows as f64 * card_h
         + visible_rows.saturating_sub(1) as f64 * gap
         + teaser_h
-        + status_h()
+        + footer_band_h()
 }
 
 /// Reconcile max/current scroll offsets and the coordinate delta after resizing the document.
@@ -1743,7 +1852,8 @@ pub(crate) fn plan_icon_scroll_layout(
     } else {
         count.div_ceil(max_columns)
     };
-    let max_rows = ((max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - status_h()).max(card_h)
+    let max_rows = ((max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h())
+        .max(card_h)
         / (card_h + gap))
         .floor()
         .max(1.0) as usize;
@@ -1827,9 +1937,9 @@ pub(crate) fn plan_icon_scroll_layout(
         + viewport_rows as f64 * card_h
         + viewport_rows.saturating_sub(1) as f64 * gap
         + teaser_h
-        + status_h();
+        + footer_band_h();
     let document_h = total_content_h;
-    let document_panel_h = document_h + status_h();
+    let document_panel_h = document_h + footer_band_h();
     let mut document_placements = Vec::with_capacity(count);
     for (row_index, row) in row_ranges.iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
@@ -1887,7 +1997,7 @@ pub(crate) fn plan_icon_scroll_layout(
 /// testable). Used only for the initial window placeholder; summon-time layout recalculates it.
 fn compute_window_height(count: usize, cards_per_row: usize, card_h: f64) -> f64 {
     let rows = count.max(1).div_ceil(cards_per_row);
-    THUMB_TOP_INSET + THUMB_BOTTOM_INSET + rows as f64 * card_h + status_h()
+    THUMB_TOP_INSET + THUMB_BOTTOM_INSET + rows as f64 * card_h + footer_band_h()
 }
 
 /// Initial icon-only overlay height; the live layout computes columns from screen width.
@@ -1912,6 +2022,106 @@ pub(crate) fn window_width(cards_in_row: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The footer settings control must stay inside the panel's bottom-right corner arc at every
+    /// shipped radius, and the assertion must be able to FAIL: the counter-example below repeats the
+    /// containment test with an inset one grid step too small and requires it to be outside.
+    #[test]
+    fn footer_control_inset_keeps_the_gear_inside_the_panel_corner() {
+        // Containment of the button's bottom-right corner in the clamped ellipse-corner.
+        fn inside(inset: f64, r: f64, w: f64, h: f64, control_h: f64, band_h: f64) -> bool {
+            let rx = r.min(w / 2.0);
+            let ry = r.min(h / 2.0);
+            if rx <= 0.0 || ry <= 0.0 {
+                return true;
+            }
+            let m = (band_h - control_h) / 2.0;
+            (((rx - inset) / rx).powi(2) + ((ry - m) / ry).powi(2)) <= 1.0 + 1e-9
+        }
+
+        let band = FOOTER_CONTROL_MIN_H;
+        // Card-area heights for 1..4 rows at the default card height, plus the real band.
+        let card_area = |rows: f64| 32.0 + 8.0 + rows * 180.0;
+        for radius in [0.0, 16.0, 32.0, 48.0, 60.0, 100.0, 200.0, 400.0] {
+            for width in [484.0, 560.0, 900.0] {
+                for rows in [1.0, 2.0, 3.0, 4.0] {
+                    let height = card_area(rows) + band;
+                    let inset =
+                        footer_control_inset(radius, width, height, FOOTER_CONTROL_SIZE, band);
+                    assert!(
+                        inside(inset, radius, width, height, FOOTER_CONTROL_SIZE, band),
+                        "radius={radius} width={width} rows={rows}: inset {inset} is outside the corner"
+                    );
+                    // The counter-example: one 4pt step tighter must be OUTSIDE, or this test is
+                    // asserting nothing about the corner (it would pass for any inset).
+                    if inset > 4.0 {
+                        assert!(
+                            !inside(inset - 4.0, radius, width, height, FOOTER_CONTROL_SIZE, band)
+                                || inset - 4.0 <= 0.0,
+                            "radius={radius} width={width} rows={rows}: the containment test passes \
+                             even one grid step inside {inset}, so it does not bound the corner"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Raising the band must not raise the required inset: the control is centred, so \`ry - m\`
+    /// grows with the band. This is the property that makes the bounded fallback work, and it is
+    /// false for a fixed vertical margin.
+    #[test]
+    fn raising_the_footer_band_never_increases_the_required_inset() {
+        let radius = 400.0;
+        let (width, rows) = (560.0, 1.0);
+        let card_area = 32.0 + 8.0 + rows * 180.0;
+        let mut previous = f64::INFINITY;
+        for step in 0..20 {
+            let band = FOOTER_CONTROL_MIN_H + step as f64 * 32.0;
+            let height = card_area + band;
+            let inset = footer_control_inset(radius, width, height, FOOTER_CONTROL_SIZE, band);
+            assert!(
+                inset <= previous + 1e-9,
+                "a taller band (band={band}) required a larger inset ({inset} > {previous})"
+            );
+            previous = inset;
+        }
+        // And the counter-example: with the margin pinned at 4pt instead of centred, the same sweep
+        // must INCREASE the requirement -- that is the model this design rejects.
+        let fixed_margin_inset = |band: f64| {
+            let height = card_area + band;
+            let rx = radius.min(width / 2.0);
+            let ry = radius.min(height / 2.0);
+            let m = 4.0;
+            if m >= ry {
+                return 0.0;
+            }
+            rx * (1.0 - (1.0 - ((ry - m) / ry).powi(2)).max(0.0).sqrt())
+        };
+        assert!(
+            fixed_margin_inset(FOOTER_CONTROL_MIN_H + 20.0 * 32.0)
+                > fixed_margin_inset(FOOTER_CONTROL_MIN_H),
+            "the fixed-margin counter-example did not behave as documented"
+        );
+    }
+
+    /// The footer text stays centred on the panel at every reserve, and the reserve never exceeds
+    /// half the panel (so the text can never be squeezed out of existence by the reserve itself).
+    #[test]
+    fn footer_text_stays_centred_under_the_symmetric_reserve() {
+        for width in [484.0, 560.0, 900.0] {
+            for rows in [1.0, 2.0] {
+                let height = 32.0 + 8.0 + rows * 180.0 + FOOTER_CONTROL_MIN_H;
+                let (x, _y, w) = footer_text_frame(width, height, 20.0);
+                assert!(
+                    (x + w / 2.0 - width / 2.0).abs() < 1e-9,
+                    "width={width} is off-centre"
+                );
+                assert!(w >= 1.0);
+                assert!(footer_text_reserve(width, height) <= width / 2.0 + 1e-9);
+            }
+        }
+    }
 
     /// The style document states the elevation table; these are its numbers, so a re-tuned blur radius
     /// cannot drift away from the document silently. `med` had no assertion at all before this.
@@ -2413,11 +2623,11 @@ mod tests {
         // Zero windows: at least one row as the floor.
         assert_eq!(
             compute_window_height(0, 5, 100.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + footer_band_h()
         );
         assert_eq!(
             compute_window_height(1, 5, 100.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + footer_band_h()
         );
     }
 
@@ -2426,15 +2636,15 @@ mod tests {
         // Four per row: five windows -> two rows.
         assert_eq!(
             compute_window_height(5, 4, 120.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + footer_band_h()
         );
         assert_eq!(
             compute_window_height(8, 4, 120.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + footer_band_h()
         );
         assert_eq!(
             compute_window_height(9, 4, 120.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 3.0 * 120.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 3.0 * 120.0 + footer_band_h()
         );
     }
 
@@ -2841,7 +3051,7 @@ mod flow_tests {
                 + rendered_rows as f64 * card_h
                 + rendered_rows.saturating_sub(1) as f64 * gap
                 + teaser_h
-                + status_h();
+                + footer_band_h();
             assert!(
                 content_h <= budget + 1e-9,
                 "{remaining} left: content {content_h:.1} does not fit the budget {budget:.1} (teaser/row rule bypassed)"
@@ -2863,7 +3073,7 @@ mod flow_tests {
     #[test]
     fn the_bottom_row_clears_the_footer_for_the_selection_ring() {
         // The card frame's own y in document coordinates is what the clip view compares against:
-        // placements carry panel coordinates (the footer included), so subtracting `status_h()` gives
+        // placements carry panel coordinates (the footer included), so subtracting `footer_band_h()` gives
         // the offset above the viewport's bottom edge. The requirement comes from the ring's geometry,
         // not from the inset constant, or shrinking the constant would satisfy the assertion.
         let drawn_outside_the_card = crate::overlay::SELECTION_DECORATION_INSET;
@@ -2872,7 +3082,7 @@ mod flow_tests {
                 .iter()
                 .map(|placement| placement.y)
                 .fold(f64::INFINITY, f64::min)
-                - status_h()
+                - footer_band_h()
         };
 
         // Icon-only, everything fits: the document's bottom-most card is on screen and no scrolling
@@ -3085,7 +3295,7 @@ mod flow_tests {
             + THUMB_BOTTOM_INSET
             + card_h * 3.0
             + THUMB_ROW_GAP * 2.0
-            + status_h()
+            + footer_band_h()
             + 0.1;
         // Budgets derive from the *current* card width: the narrow one holds three columns (twelve
         // cards need four rows -> overflow) and the wide one holds four (twelve cards fit three rows ->
@@ -3163,7 +3373,7 @@ mod flow_tests {
                         + THUMB_BOTTOM_INSET
                         + constraints.max_rows as f64 * card_h
                         + THUMB_ROW_GAP
-                        + status_h()
+                        + footer_band_h()
                         + 1.0,
                     THUMB_ROW_GAP,
                 );
@@ -3483,7 +3693,7 @@ mod flow_tests {
         assert!(overflowing > fitting);
         assert_eq!(
             fitting,
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 80.0 + 10.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 80.0 + 10.0 + footer_band_h()
         );
     }
 

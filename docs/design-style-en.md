@@ -758,15 +758,41 @@ Every custom-drawn control needs all six states, and each uses the token above, 
 Hit targets are at least 28×28; a text-only affordance needs padding to reach that. Hover and
 selection never change the layout (no size, no weight change) — only color.
 
-**Corner glyph buttons on a floating panel (exception).** The clipboard picker's two top-right glyph
-buttons — the close × and Clipboard Settings — carry no border and no focus ring, and have only
-normal/hover/pressed: that panel is a nonactivating floating panel whose keyboard focus never leaves
-the search field, so there is no keyboard focus ring and no selected/open state to express, and
-hover and pressed share one faint wash. (The close button still turns destructive red on hover;
-that is its semantic colour, not part of this exception.) The reason is grouping: the two buttons
-share one 28pt corner and are each other's neighbours, so giving one of them a border and fill would
-make it read as a different component family than the one beside it. Every other control keeps all
-six states of this section.
+**Corner glyph buttons on a floating panel (exception).** Two groups of glyph buttons on these
+nonactivating panels carry no border and no focus ring, and have only normal/hover/pressed, with
+hover and pressed sharing one faint wash. Both groups share the same cause: the panel is
+nonactivating, its keyboard focus belongs to something else (the picker's search field, the
+switcher's card container), and the button has no selected or open state to express — so there is no
+keyboard focus ring to draw. Every other control keeps all six states of this section.
+
+- *The clipboard picker's top-right pair* — the close × and Clipboard Settings. Here the reason is
+  also grouping: the two buttons share one 28pt corner and are each other's neighbours, so giving
+  one of them a border and fill would make it read as a different component family than the one
+  beside it. (The close button still turns destructive red on hover; that is its semantic colour,
+  not part of this exception.)
+- *The three settings gears* — the clipboard picker's, the switcher overlay's footer gear, and the
+  keystroke display's trailing gear. Each one is the panel's only settings entry and none of them has
+  a neighbouring glyph control to group with, so adjacency is **not** their justification: they are
+  a borderless glyph because a bordered 28pt control in these panels would read as primary chrome
+  competing with the content the panel exists to show. All three open a settings page, keep a neutral
+  (never destructive) ink, and carry an accessibility label plus a tooltip naming their target page.
+
+A gear's corner inset is computed, not fixed: the panel's rounded corner bounds the button's own
+bottom corner. `theme::footer_control_inset` models the corner arc with the radius clamped per axis
+to that axis's half-extent (`rx = min(r, w/2)`, `ry = min(r, h/2)`, each independently), and returns
+the smallest inset that keeps the button inside it. The footer's text reserves that inset **plus the
+button's width and gap on both sides**, so the button cannot be drawn over the title and the title's
+centre stays the panel's centre. The switcher footer band keeps a floor height
+(`theme::FOOTER_CONTROL_MIN_H`) so the control always has its vertical margin: the band otherwise
+follows the footer text size, which bottoms out below the 28pt control.
+
+Two limits are recorded rather than glossed. (1) The arc model is what the layout is computed
+against; the tests pin the model, not the shipped panels' actual clipped shape (frost stretches a
+cap-inset template, glass uses `setCornerRadius:`), so a material whose real clipping differed would
+need its own measurement before this could be called verified. (2) At an extreme configured
+`appearance.corner_radius` the symmetric reserve can consume the panel; the button then stays inside
+the corner but the footer title is squeezed to an unreadable width. That configuration has no agreed
+fallback yet, and it is recorded in `docs/review-backlog.md` as an open, user-visible behaviour.
 
 ## 11. Accessibility and localization
 

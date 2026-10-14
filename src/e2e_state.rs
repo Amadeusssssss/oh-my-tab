@@ -935,6 +935,29 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"clipboard_picker_configured_screen\": {},\n",
         configured_screen_json
     ));
+    // The switcher overlay's panel rect and its footer settings gear, in screen points with a
+    // TOP-LEFT origin (the same convention `clipboard_picker` uses): an A2 scenario addresses the
+    // real button in desktop pixels, and deriving its position from the panel would bake this
+    // module's geometry into the test. AX cannot express a subview's frame, so the app states it.
+    json.push_str(&format!(
+        "  \"switcher_panel\": {},\n",
+        match crate::overlay::panel_rect_for_e2e() {
+            Some((x, y, w, h)) => format!(
+                "{{\"visible\": {}, \"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}",
+                crate::overlay::panel_is_visible_for_e2e()
+            ),
+            None => "null".to_string(),
+        }
+    ));
+    json.push_str(&format!(
+        "  \"switcher_footer_settings\": {},\n",
+        match crate::overlay::footer_settings_rect_for_e2e() {
+            Some((x, y, w, h, clear)) => format!(
+                "{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}, \"clears_text\": {clear}}}"
+            ),
+            None => "null".to_string(),
+        }
+    ));
     json.push_str(&format!(
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {
@@ -956,6 +979,18 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     // padded rect the shadow needs. An A2 scenario that measures the shadow's outer tail needs the window's
     // edge, and one that measures the outline or the panel's interior needs the panel's -- reporting both is
     // what keeps the two measurements from being taken against the wrong rect.
+    // The switcher footer's settings gear: its rect in the panel's own points (AppKit bottom-left
+    // origin) plus whether it clears the status text. AX cannot express a subview's frame, so the
+    // app states it; the A2 scenario asserts the click target really is where the panel says.
+    json.push_str(&format!(
+        "  \"switcher_footer_settings\": {},\n",
+        match crate::overlay::footer_settings_rect_for_e2e() {
+            Some((x, y, w, h, clear)) => format!(
+                "{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}, \"clears_text\": {clear}}}"
+            ),
+            None => "null".to_string(),
+        }
+    ));
     json.push_str(&format!(
         "  \"clipboard_picker_window\": {},\n",
         match crate::clipboard::picker_window_frame_top_left() {
@@ -1488,9 +1523,16 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         ));
     }
     json.push_str(&format!(
-        "], \"secure_paused\": {}, \"tap_level\": {}}}\n}}\n",
+        "], \"secure_paused\": {}, \"tap_level\": {}, \"geometry\": {}}}\n}}\n",
         keystroke.secure_paused,
-        json_string(&keystroke.tap_level)
+        json_string(&keystroke.tap_level),
+        match crate::keystroke_display::e2e_geometry() {
+            Some(g) => format!(
+                "{{\"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"settings\": {{\"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}}}}}",
+                g.panel_x, g.panel_y, g.panel_w, g.panel_h, g.gear_x, g.gear_y, g.gear_w, g.gear_h
+            ),
+            None => "null".to_string(),
+        }
     ));
 
     write_atomically(path, &json);

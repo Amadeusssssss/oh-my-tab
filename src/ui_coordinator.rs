@@ -16,11 +16,17 @@ pub(crate) fn apply_theme_and_locale_refresh() {
     crate::overlay::apply_theme();
     crate::overlay::refresh_highlight();
     crate::overlay::update_status_label();
+    // The footer gear's window is cached across a locale switch: its tooltip and accessibility
+    // label would otherwise keep the previous language (same reason the picker's gear is refreshed).
+    crate::overlay::refresh_footer_settings_strings();
     // The keystroke panel's surface (frost wash, glass tint, opaque background) is written from the
     // palette, while its keycaps re-read the palette on every render. Without this the surface keeps
     // the previous theme's color and the panel shows light keycaps on a dark shell (or the reverse).
     unsafe {
         crate::keystroke_display::apply_glass_properties();
+        // The key panel's own controls are cached with the panel: refresh their tint and strings,
+        // or the gear keeps the previous language and palette after a switch.
+        crate::keystroke_display::refresh_cached_controls();
     }
     // The guide re-renders its current step with the new palette and re-asserts the
     // window appearance; a no-op when the guide is not on screen.

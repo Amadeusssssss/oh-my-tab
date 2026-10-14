@@ -460,6 +460,13 @@ impl StateMachine {
         }
     }
 
+    /// Development only: stop the idle deadline from ever passing, so a `--show-keystroke-display`
+    /// launch keeps the panel standing for a scenario's pointer gesture. A normal launch never sets
+    /// the flag, so shipped behaviour is unchanged.
+    pub(crate) fn freeze_idle_deadline(&mut self) {
+        self.deadline = None;
+    }
+
     pub(crate) fn secure_paused(&self) -> bool {
         self.secure
     }

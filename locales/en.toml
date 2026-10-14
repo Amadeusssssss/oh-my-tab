@@ -80,8 +80,10 @@ quit = "Quit"
 
 [overlay]
 no_windows = "No windows to switch"
+open_settings = "App Switcher Settings"
 
 [keystroke_display]
+open_settings = "Keystroke Display Settings"
 paused = "Paused · Secure Input"
 key_space = "Space"
 key_clear = "Clear"

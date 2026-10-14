@@ -81,8 +81,10 @@ quit = "結束"
 
 [overlay]
 no_windows = "沒有可切換的視窗"
+open_settings = "應用切換浮窗設定"
 
 [keystroke_display]
+open_settings = "按鍵顯示設定"
 paused = "已暫停 · 安全輸入"
 key_space = "空白鍵"
 key_clear = "清除"

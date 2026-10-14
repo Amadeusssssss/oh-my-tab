@@ -31,6 +31,62 @@ pub(crate) unsafe fn apply_backdrop_material() {
     panel::apply_backdrop_material();
 }
 
+/// Repaint and retranslate the key panel's cached controls (the settings gear) after a theme or
+/// locale change. The panel window is reused, so without this the gear keeps the old language and a
+/// stale tint.
+pub(crate) unsafe fn refresh_cached_controls() {
+    panel::refresh_cached_controls();
+}
+
+/// A2 geometry for the key panel: the panel rect and its trailing settings gear, both in screen
+/// points with a top-left origin. A named struct rather than an 8-tuple: two of the fields are the
+/// same width/height pair, which a tuple lets a caller transpose silently.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct E2ePanelGeometry {
+    pub(crate) panel_x: f64,
+    pub(crate) panel_y: f64,
+    pub(crate) panel_w: f64,
+    pub(crate) panel_h: f64,
+    pub(crate) gear_x: f64,
+    pub(crate) gear_y: f64,
+    pub(crate) gear_w: f64,
+    pub(crate) gear_h: f64,
+}
+
+/// A2: the key panel's rect and its trailing settings gear, in screen points with a top-left origin
+/// (the convention the clipboard picker's A2 state uses). AX cannot express a floating panel's
+/// subview frame, so the app states the geometry instead of a scenario deriving it.
+pub(crate) fn e2e_geometry() -> Option<E2ePanelGeometry> {
+    crate::debug_assert_main_thread();
+    panel::e2e_geometry()
+}
+
+/// Development helper (--show-keystroke-display): seed a visible key panel without a real keystroke,
+/// so an A2 scenario can deliver a pointer gesture to its trailing settings gear. The panel
+/// otherwise only appears from a key event, which a script cannot produce without stealing focus.
+/// start() honours --keystroke-display-force-on, which the scenario passes.
+pub(crate) fn show_for_development() {
+    crate::debug_assert_main_thread();
+    start();
+    let now = Instant::now();
+    let mode =
+        DisplayMode::from_config(&crate::config::CONFIG.read().unwrap().keystroke_display.mode);
+    STATE.with(|state| {
+        state.borrow_mut().apply(
+            Input::KeyDown {
+                keycode: crate::event_tap::keyboard::VK_SPACE,
+                flags: 0,
+                autorepeat: false,
+                unicode: " ".to_string(),
+                glyph: state::KeyGlyph::EventUnicode,
+            },
+            mode,
+            now,
+        );
+    });
+    panel::start_timer();
+}
+
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -201,9 +257,18 @@ fn process_tick() -> bool {
         }
         if visible {
             let orientation = state::Orientation::from_initial_position(&config.initial_position);
-            let max_extent =
-                panel::target_screen_extent(&display_position, config.position, orientation) * 0.5;
-            changed |= state.trim_to_extent(max_extent, orientation);
+            // The same budget the renderer uses: it already has the drag handle and the trailing
+            // settings button reserved, so the state never keeps a keycap the panel cannot show.
+            let budget =
+                panel::stream_budget_for_panel(&display_position, config.position, orientation);
+            changed |= state.trim_to_extent(budget, orientation);
+            // Development only (--show-keystroke-display): hold the panel open so an A2 scenario can
+            // click its settings gear. Without this the panel fades 1.8s after the seeded key, which
+            // is correct behaviour but removes the control under test. A normal launch never sets
+            // the flag, so shipped behaviour is unchanged.
+            if crate::dev_flags::present("show-keystroke-display") {
+                state.freeze_idle_deadline();
+            }
         }
         (
             state.badges().to_vec(),

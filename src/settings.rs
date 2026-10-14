@@ -69,6 +69,9 @@ const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
 pub(super) const SETTINGS_PAGE_COUNT: usize = 7;
 pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize = 5;
+/// The App Switcher page. The switcher overlay's own footer control opens HERE; the index stays
+/// private to this module so the overlay asks for "the switcher settings", not a sidebar position.
+pub(super) const SETTINGS_SWITCHER_PAGE_INDEX: usize = 1;
 /// The clipboard history page. `pub(crate)` because the clipboard module's smoke runner asserts that
 /// its header button navigates HERE -- the page is named once, and the assertion cannot drift from it.
 pub(crate) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = 3;
@@ -846,6 +849,16 @@ pub(crate) fn e2e_last_open_ms() -> u64 {
 /// module; callers that mean "the clipboard settings" name that, not a number.
 pub(crate) fn show_clipboard_page() {
     show_settings_page(SETTINGS_CLIPBOARD_PAGE_INDEX);
+}
+
+/// Open the settings window on the App Switcher page -- the switcher overlay's own settings entry.
+pub(crate) fn show_switcher_page() {
+    show_settings_page(SETTINGS_SWITCHER_PAGE_INDEX);
+}
+
+/// Open the settings window on the Keystroke Display page -- the floating key panel's settings entry.
+pub(crate) fn show_keystroke_display_page() {
+    show_settings_page(SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX);
 }
 
 pub(crate) fn open_about_updates() {

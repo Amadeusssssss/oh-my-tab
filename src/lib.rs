@@ -1188,7 +1188,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         let screen_frame: NSRect = msg_send![screen, frame];
         let h = window_height(6); // initial reasonable default
-        let footer_h = status_h();
+        let footer_h = footer_band_h();
         let w = window_width(3); // initial three-card baseline; summon recalculates the live width
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
@@ -1448,6 +1448,18 @@ fn create_overlay_window() -> *mut AnyObject {
         let _: () = msg_send![content_parent, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr::new(status_label));
 
+        // The footer's settings gear: the trailing corner of the footer band, same control family as
+        // the clipboard picker's corner gear. Its frame is recomputed on every summon (the panel
+        // resizes) and on a corner-radius change, so it is never left on a stale geometry.
+        let settings_button =
+            crate::overlay::make_footer_settings_button(crate::overlay::footer_settings_frame(
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)).size,
+            ));
+        let _: () = msg_send![content_parent, addSubview: settings_button];
+        release_obj(settings_button);
+        *crate::overlay::FOOTER_SETTINGS_BUTTON.lock().unwrap() =
+            Some(ObjPtr::new(settings_button));
+
         // Keep the indicator above the card container; rebuilding cards cannot change its z-order
         // or interrupt explicit dragging.
         let scroller: *mut AnyObject = msg_send![scroller_cls, alloc];
@@ -1521,6 +1533,7 @@ fn create_controller() -> *mut AnyObject {
             on_cmd_release_diagnostic as *mut c_void,
             types_v_obj.as_ptr(),
         );
+
         class_addMethod(
             cls,
             sel!(closeCard:),
@@ -2465,6 +2478,16 @@ fn show_clipboard_request() -> bool {
     crate::dev_flags::present("show-clipboard")
 }
 
+/// Whether the development switch `--show-overlay` was forwarded by `scripts/dev-restart.sh`.
+///
+/// The switcher only appears through the global hotkey, which a script cannot press without stealing
+/// focus, so this is the only way to reach its laid-out UI (the footer's settings gear) from a real
+/// pointer gesture. Unlike `--smoke-overlay`, which drives its assertions and exits, this leaves the
+/// panel standing so an A2 scenario can click it.
+fn show_overlay_request() -> bool {
+    crate::dev_flags::present("show-overlay")
+}
+
 /// `--show-clipboard=after:N` opens the picker N seconds after launch instead of immediately. The
 /// storage load runs off the main thread and can take seconds (a keychain read may block), so this
 /// is how the "load finished first, picker opened later" ordering is reached without a hotkey.
@@ -3218,6 +3241,37 @@ pub fn run() {
                     std::process::exit(1);
                 }
             }
+            // The footer's settings gear must sit inside the band and clear of the status text. A
+            // title long enough to reach the gear, or a corner inset that pushed the gear out of the
+            // band, is exactly the layout defect this asserts on the real view tree.
+            match crate::overlay::smoke_footer_settings_button_fits() {
+                Ok(()) => {
+                    log_info!("[smoke-overlay] the footer settings gear fits inside the band")
+                }
+                Err(reason) => {
+                    eprintln!("[smoke-overlay] footer settings gear layout failed: {reason}");
+                    std::process::exit(1);
+                }
+            }
+            // The click path: action/target wiring, then a real mouse-down. The second probe is what
+            // catches a mouseDown: override that forgot to call super -- the defect that shipped a
+            // gear which looked right and did nothing.
+            match crate::overlay::smoke_footer_settings_click_wiring() {
+                Ok(()) => {
+                    log_info!("[smoke-overlay] the footer settings gear is wired to its action")
+                }
+                Err(reason) => {
+                    eprintln!("[smoke-overlay] footer settings gear click wiring failed: {reason}");
+                    std::process::exit(1);
+                }
+            }
+            match crate::overlay::smoke_footer_settings_mouse_down_arms() {
+                Ok(()) => log_info!("[smoke-overlay] the footer settings gear receives mouse-down"),
+                Err(reason) => {
+                    eprintln!("[smoke-overlay] footer settings gear click failed: {reason}");
+                    std::process::exit(1);
+                }
+            }
             // The selection must have been scrolled fully into the viewport: the rendered range
             // includes the teaser row below the viewport's bottom edge.
             match crate::overlay::smoke_selected_card_is_fully_visible() {
@@ -3437,6 +3491,17 @@ pub fn run() {
             {
                 schedule_dev_blank_text(std::time::Duration::from_secs_f64(seconds));
             }
+        }
+        // Development switch: summon the switcher and leave it standing, so an A2 scenario can
+        // deliver a real pointer gesture to the footer (which the global hotkey path cannot reach
+        // unattended). The panel is nonactivating, so this does not steal focus.
+        if show_overlay_request() {
+            crate::overlay::show_overlay_for_development();
+        }
+        // Development switch: seed a visible key panel so an A2 scenario can click its trailing
+        // settings gear (the panel otherwise only appears from a real keystroke).
+        if crate::dev_flags::present("show-keystroke-display") {
+            crate::keystroke_display::show_for_development();
         }
         // Warm the settings window before the run loop takes over (see `schedule_settings_prewarm`).
         // Smoke processes assert launch-time state and exit through their runner, so they skip it.

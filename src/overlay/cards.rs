@@ -878,7 +878,7 @@ unsafe fn reconcile_card_views(
         };
         let key = (window.pid, window.window_id);
         let desired_frame = NSRect::new(
-            NSPoint::new(card_x, card_y - status_h()),
+            NSPoint::new(card_x, card_y - footer_band_h()),
             NSSize::new(card_w, card_height),
         );
         let desired_signature =
@@ -1177,8 +1177,8 @@ pub(crate) fn show_overlay() {
         let _: () = msg_send![
             container,
             setFrame: NSRect::new(
-                NSPoint::new(0.0, status_h()),
-                NSSize::new(w, (h - status_h()).max(1.0))
+                NSPoint::new(0.0, footer_band_h()),
+                NSSize::new(w, (h - footer_band_h()).max(1.0))
             )
         ];
         let _: () = msg_send![
@@ -1200,6 +1200,8 @@ pub(crate) fn show_overlay() {
         // update_status_label computes x from the container's current width; if called before
         // the resize it uses the stale width (the initial max width at launch, or the previous
         // summon's width), leaving the text off-center once the container shrinks.
+        // Re-centres the footer text AND re-lays the gear against the panel's new size (one place,
+        // so the two can never disagree about the band).
         update_status_label();
 
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];

@@ -15,4 +15,4 @@
 # silently different from the file that states them.
 [review]
 model = "gpt-6.1-sol"
-fast = false
+fast = true

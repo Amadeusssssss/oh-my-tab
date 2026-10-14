@@ -343,12 +343,18 @@ mod callbacks;
 mod cancel;
 mod card_close;
 mod cards;
+mod footer_settings;
 pub(crate) mod hover;
 mod panel_keys;
+pub(crate) use callbacks::show_overlay_for_development;
 use callbacks::*;
 use cancel::*;
 use cards::*;
 pub(crate) use cards::{smoke_card_badges, smoke_selection_ring};
+pub(crate) use footer_settings::{
+    footer_settings_frame, make_footer_settings_button,
+    refresh_localized_strings as refresh_footer_settings_strings, FOOTER_SETTINGS_BUTTON,
+};
 pub(crate) use panel_keys::smoke_panel_key_equivalent;
 pub(crate) use panel_keys::{
     clear_sticky, is_sticky, on_panel_action_refresh, overlay_window_perform_key_equivalent,
@@ -403,6 +409,221 @@ unsafe fn card_views(document: *mut AnyObject) -> Vec<*mut AnyObject> {
         .map(|i| msg_send![subviews, objectAtIndex: i])
         .filter(|view| get_card_index(*view).is_some())
         .collect()
+}
+
+/// A2: the switcher panel's rect in screen points, top-left origin -- the convention the clipboard
+/// picker's A2 state uses, so a scenario addresses the panel the same way on every surface.
+pub(crate) fn panel_rect_for_e2e() -> Option<(f64, f64, f64, f64)> {
+    let window = overlay_window_ptr()?;
+    unsafe {
+        let frame = crate::glass::panel_frame_of(window);
+        let screen_frame = hover::primary_screen_frame()?;
+        Some((
+            frame.origin.x,
+            screen_frame.size.height - (frame.origin.y + frame.size.height),
+            frame.size.width,
+            frame.size.height,
+        ))
+    }
+}
+
+/// Whether the switcher panel is really on screen (AppKit's answer, not our own intent flag).
+pub(crate) fn panel_is_visible_for_e2e() -> bool {
+    overlay_window_ptr().is_some_and(|window| unsafe {
+        let visible: bool = msg_send![window, isVisible];
+        visible
+    })
+}
+
+/// A2: the footer gear's rect in SCREEN points, top-left origin, plus whether it clears the status
+/// text. AX cannot express a subview's frame, so the app states the fact instead of a scenario
+/// guessing -- and in the same coordinate space the picker's own gear is reported in.
+pub(crate) fn footer_settings_rect_for_e2e() -> Option<(f64, f64, f64, f64, bool)> {
+    let button = *FOOTER_SETTINGS_BUTTON.lock().unwrap();
+    let label = *STATUS_LABEL.lock().unwrap();
+    let button = button?;
+    let label = label?;
+    let panel = panel_rect_for_e2e()?;
+    unsafe {
+        let button_frame: NSRect = msg_send![button.0, frame];
+        let label_frame: NSRect = msg_send![label.0, frame];
+        Some((
+            panel.0 + button_frame.origin.x,
+            // The panel rect's y is already top-left; the button's y is measured up from the
+            // panel's bottom edge, so flip it within the panel before adding.
+            panel.1 + (panel.3 - (button_frame.origin.y + button_frame.size.height)),
+            button_frame.size.width,
+            button_frame.size.height,
+            !rects_overlap(button_frame, label_frame),
+        ))
+    }
+}
+
+/// A1: whether two rectangles overlap (touching edges do not count).
+pub(crate) fn rects_overlap(a: NSRect, b: NSRect) -> bool {
+    a.origin.x < b.origin.x + b.size.width
+        && b.origin.x < a.origin.x + a.size.width
+        && a.origin.y < b.origin.y + b.size.height
+        && b.origin.y < a.origin.y + a.size.height
+}
+
+/// A1 smoke: a real mouse-down on the footer gear ARMS the press.
+///
+/// Why this probe and not performClick:: performClick: sends the action directly and never calls
+/// mouseDown:, so it cannot see a widget whose mouseDown: override is broken. This feeds the same
+/// NSEvent type the window server delivers and checks the override ran (the press was armed).
+///
+/// Evidence boundary: AppKit clears the cell's highlighted state when the tracking loop ends, so
+/// isHighlighted cannot witness "super ran" here. That the press then dispatches an action is
+/// verified by the A2 click scenario against the running app -- this probe does not claim it.
+pub(crate) unsafe fn smoke_footer_settings_mouse_down_arms() -> Result<(), String> {
+    let button = FOOTER_SETTINGS_BUTTON
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|b| b.0)
+        .ok_or_else(|| "the footer settings button was never created".to_string())?;
+    footer_settings::disarm();
+    let event: *mut AnyObject = msg_send![
+        class!(NSEvent),
+        mouseEventWithType: 1isize, // NSEventTypeLeftMouseDown
+        location: NSPoint::new(1.0, 1.0),
+        modifierFlags: 0u64,
+        timestamp: 0.0f64,
+        windowNumber: 0isize,
+        context: std::ptr::null_mut::<AnyObject>(),
+        eventNumber: 0isize,
+        clickCount: 1isize,
+        pressure: 1.0f32
+    ];
+    if event.is_null() {
+        return Err("could not build a synthetic mouse-down event".to_string());
+    }
+    let _: () = msg_send![button, mouseDown: event];
+    if !footer_settings::is_armed() {
+        return Err("the gear's mouseDown: never ran (the press was not armed)".to_string());
+    }
+    // AppKit clears the highlighted state when its tracking loop ends, so isHighlighted is
+    // NOT a reliable "super ran" witness here. This probe honestly reports only that the
+    // override ran and armed the press; that the press then dispatches an action is what the
+    // A2 click scenario against the running app covers, not claimed here.
+    // Leave no press behind.
+    let up: *mut AnyObject = msg_send![
+        class!(NSEvent),
+        mouseEventWithType: 2isize, // NSEventTypeLeftMouseUp
+        location: NSPoint::new(1.0, 1.0),
+        modifierFlags: 0u64,
+        timestamp: 0.0f64,
+        windowNumber: 0isize,
+        context: std::ptr::null_mut::<AnyObject>(),
+        eventNumber: 0isize,
+        clickCount: 1isize,
+        pressure: 0.0f32
+    ];
+    if !up.is_null() {
+        let _: () = msg_send![button, mouseUp: up];
+    }
+    footer_settings::disarm();
+    Ok(())
+}
+
+/// A1 smoke: the footer gear's click wiring is real -- action, target, and a target that actually
+/// answers the selector.
+///
+/// This is the cheap half of the check. It catches an unregistered selector and a missing target,
+/// but it deliberately does NOT claim to prove the button dispatches on a real press: performClick:
+/// sends the action directly and never runs mouseDown:, so a probe built on it passes even for a
+/// button whose mouseDown: override forgot to call super. That defect is covered by
+/// smoke_footer_settings_button_fits (geometry) plus the A2 click scenario, and this comment says so
+/// rather than implying a guarantee this cannot give.
+pub(crate) unsafe fn smoke_footer_settings_click_wiring() -> Result<(), String> {
+    let button = FOOTER_SETTINGS_BUTTON
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|b| b.0)
+        .ok_or_else(|| "the footer settings button was never created".to_string())?;
+    let action: Sel = msg_send![button, action];
+    if action != sel!(openSwitcherSettings:) {
+        return Err("the footer gear's action is not openSwitcherSettings:".to_string());
+    }
+    let target: *mut AnyObject = msg_send![button, target];
+    if target.is_null() {
+        return Err("the footer gear has no target".to_string());
+    }
+    let responds: bool = msg_send![
+        target,
+        respondsToSelector: sel!(openSwitcherSettings:)
+    ];
+    if !responds {
+        // Without this the first real click raises doesNotRecognizeSelector and aborts the process.
+        return Err(
+            "the footer gear's target does not implement openSwitcherSettings:".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// A1 smoke: the footer gear lies inside the footer band and never overlaps the status text.
+///
+/// Reads the REAL view tree (the button's and the label's own frames), because the defect this
+/// guards is a layout one: a title long enough to reach the gear, or a gear whose corner inset
+/// pushed it out of the band.
+pub(crate) unsafe fn smoke_footer_settings_button_fits() -> Result<(), String> {
+    let button = FOOTER_SETTINGS_BUTTON
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|b| b.0)
+        .ok_or_else(|| "the footer settings button was never created".to_string())?;
+    let label = STATUS_LABEL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|l| l.0)
+        .ok_or_else(|| "the status label was never created".to_string())?;
+    let window =
+        overlay_window_ptr().ok_or_else(|| "the overlay window was never created".to_string())?;
+    let band = footer_band_h();
+    let button_frame: NSRect = msg_send![button, frame];
+    let label_frame: NSRect = msg_send![label, frame];
+    if button_frame.size.width < crate::theme::FOOTER_CONTROL_SIZE - 0.5
+        || button_frame.size.height < crate::theme::FOOTER_CONTROL_SIZE - 0.5
+    {
+        return Err(format!(
+            "the gear is {}x{}, smaller than the {}pt control",
+            button_frame.size.width,
+            button_frame.size.height,
+            crate::theme::FOOTER_CONTROL_SIZE
+        ));
+    }
+    if button_frame.origin.y < -0.5 || button_frame.origin.y + button_frame.size.height > band + 0.5
+    {
+        return Err(format!(
+            "the gear at y={:.1}..{:.1} is outside the {:.1}pt footer band",
+            button_frame.origin.y,
+            button_frame.origin.y + button_frame.size.height,
+            band
+        ));
+    }
+    let window_frame: NSRect = msg_send![window, frame];
+    if button_frame.origin.x + button_frame.size.width > window_frame.size.width + 0.5 {
+        return Err(format!(
+            "the gear's trailing edge {:.1} exceeds the {:.1}pt panel",
+            button_frame.origin.x + button_frame.size.width,
+            window_frame.size.width
+        ));
+    }
+    if rects_overlap(button_frame, label_frame) {
+        return Err(format!(
+            "the footer text and the gear overlap: text {:.1}..{:.1}, gear {:.1}..{:.1}",
+            label_frame.origin.x,
+            label_frame.origin.x + label_frame.size.width,
+            button_frame.origin.x,
+            button_frame.origin.x + button_frame.size.width
+        ));
+    }
+    Ok(())
 }
 
 /// Smoke assertion over the real view tree: the document's bottom-most card keeps the room outside
@@ -1597,7 +1818,7 @@ pub(crate) fn update_status_label() {
         };
 
         let colors = current_colors();
-        let footer_h = status_h();
+        let footer_h = footer_band_h();
         let status_font: *mut AnyObject = {
             let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
             msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
@@ -1608,26 +1829,36 @@ pub(crate) fn update_status_label() {
         CFRelease(ns_stat as *const c_void);
         let _: () = msg_send![status_label, setFont: status_font];
         let _: () = msg_send![status_label, setTextColor: status_color];
-        let container_w = {
+        // The panel's own rect: the window is the padded (elevation) rect, so its frame is NOT the
+        // panel size the corner geometry must be computed against. The clip view sits directly above
+        // the footer band and carries the panel's width, so panel height = viewport height + band.
+        let (container_w, panel_h) = {
             let container = CONTAINER.lock().unwrap();
             let c = container.unwrap().0;
             let f: NSRect = msg_send![c, frame];
-            f.size.width
+            (f.size.width, f.size.height + footer_band_h())
         };
         // Keep a fixed visual frame so native tail truncation is based on the actual font and
         // available width. Manual ASCII/CJK width estimates made long titles overflow or cut
         // Unicode grapheme clusters.
         let _: () = msg_send![status_label, setUsesSingleLineMode: true];
         let _: () = msg_send![status_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-        let stat_w = (container_w - H_PADDING * 2.0).max(1.0);
-        let stat_x = H_PADDING;
         let ascender: f64 = msg_send![status_font, ascender];
         let descender: f64 = msg_send![status_font, descender];
         let line_h = (ascender - descender + 1.0).clamp(11.0, footer_h);
+        // The footer text keeps the SAME reserve on both sides, so the settings gear can never
+        // overlap it while its centre stays the panel's centre. The reserve includes the gear's own
+        // width and gap -- reserving only the corner inset would let a long title draw under it.
+        let (stat_x, stat_y, stat_w) = footer_text_frame(container_w, panel_h, line_h);
         let _: () = msg_send![status_label, setFrame: NSRect::new(
-            NSPoint::new(stat_x, (footer_h - line_h) / 2.0),
+            NSPoint::new(stat_x, stat_y),
             NSSize::new(stat_w, line_h)
         )];
+        // The gear is laid out HERE, with the text it must clear. Every path that re-centres the
+        // footer (summon, card-close reflow, theme apply, corner-radius change) already calls this,
+        // so the button can never be left at a stale frame while the text moves -- which is how a
+        // shrunk panel would otherwise clip it.
+        footer_settings::layout_and_repaint(NSSize::new(container_w, panel_h));
     }
 }
 
@@ -1636,6 +1867,9 @@ pub(crate) fn hide_overlay() {
     // starts clean. The physical held record survives (see clear_sticky): a key the user is still
     // holding must keep its ownership until its release.
     clear_sticky();
+    // Any in-flight gear press belongs to the summon that is ending; a later mouseUp must not act on
+    // a session summoned in between.
+    footer_settings::disarm();
     publish_panel_snapshot(false);
     // The A2 layer asserts "the panel ended" by reading the snapshot, and this transition is what
     // it waits for; without a frame here the script keeps reading the previous visible=true.

@@ -30,6 +30,12 @@ pub(crate) fn install_click_to_cancel() {
     }
 }
 
+/// The observer instance other overlay controls use as their target, so the overlay owns its own
+/// selectors instead of reaching into another module's private target.
+pub(super) fn overlay_observer_target() -> *mut AnyObject {
+    unsafe { overlay_observer() }
+}
+
 /// Singleton notification observer for the overlay (carries the resign-key callback only).
 unsafe fn overlay_observer() -> *mut AnyObject {
     static OBSERVER: OnceLock<CallbackTarget> = OnceLock::new();
@@ -45,11 +51,88 @@ unsafe fn overlay_observer() -> *mut AnyObject {
                 overlay_window_resigned as *mut c_void,
                 types.as_ptr(),
             );
+            // The footer gear's action. It lives on this observer so the overlay owns its own
+            // target, rather than reaching into another module's private selector.
+            class_addMethod(
+                cls,
+                sel!(openSwitcherSettings:),
+                on_open_switcher_settings as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             let inst: *mut AnyObject = msg_send![cls as *const AnyObject, new];
             CallbackTarget::new(inst)
         })
         .0
+}
+
+/// The footer gear's click: retire this summon, then open the App Switcher settings page.
+///
+/// Order is load-bearing. show_settings_page activates the app and can synchronously resign this
+/// panel's key status, so the session must already be over by the time it runs -- otherwise the
+/// resign path could hide the panel mid-click or a trigger release could commit the highlighted
+/// card. Each step therefore holds no borrow across the next:
+///
+///   1. retire the session logically (short borrow), clearing sticky and the published claim;
+///   2. present the settings window (no borrow held);
+///   3. perform the visual hide and schedule the deferred order-out.
+///
+/// A trigger release arriving after step 1 finds state.visible == false, so it neither commits a
+/// card nor opens settings a second time.
+extern "C" fn on_open_switcher_settings(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    crate::callback_guard::void("on_open_switcher_settings", open_switcher_settings_inner);
+}
+
+fn open_switcher_settings_inner() {
+    crate::debug_assert_main_thread();
+    // Two entry paths reach this action, and they need different guards:
+    //
+    //   * A real mouse press arms on mouseDown. The arm flag is what separates THIS press from a
+    //     stale mouseUp belonging to a previous session (the session ended and a new one was
+    //     summoned in between), so a mouse-sourced action without the arm is ignored.
+    //   * An Accessibility press (VoiceOver's AXPress) has no mouseDown at all, so requiring the arm
+    //     would reject it outright. It is identified by the absence of a current mouse event and is
+    //     allowed through; the live-session check below still applies to it.
+    let from_mouse = unsafe {
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let event: *mut AnyObject = msg_send![nsapp, currentEvent];
+        !event.is_null() && {
+            let kind: isize = msg_send![event, type];
+            kind == 1 /* NSEventTypeLeftMouseDown */ || kind == 2 /* NSEventTypeLeftMouseUp */
+        }
+    };
+    if from_mouse && !footer_settings::is_armed() {
+        log_debug!("[overlay] stale footer-settings click ignored");
+        return;
+    }
+    footer_settings::disarm();
+    let live = with_tab_state(|state_opt| {
+        let state = state_opt.as_mut()?;
+        if !state.visible {
+            return None;
+        }
+        // Step 1: end the session LOGICALLY. No AppKit call happens under this borrow.
+        state.visible = false;
+        state.pending_first_show = false;
+        state.pending_first_release = false;
+        Some(())
+    });
+    if live.is_none() {
+        log_debug!("[overlay] footer-settings click ignored: the session already ended");
+        return;
+    }
+    // Retire the session's published claim and sticky flag before any focus-changing call, so a
+    // re-summon cannot inherit them and a release cannot commit.
+    clear_sticky();
+    publish_panel_snapshot(false);
+    // Step 2: present settings. This may synchronously resign this panel's key status; the session
+    // is already over, so the dismiss path re-entering here finds nothing to do.
+    crate::settings::show_switcher_page();
+    // Step 3: the visual hide, deferred like every other commit so the settings window is composed
+    // before this panel disappears.
+    vanish_overlay();
+    schedule_delayed_order_out();
+    crate::performance::end_switcher_activity();
 }
 
 /// The overlay lost key -> cancel the switch.

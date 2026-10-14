@@ -281,7 +281,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             gap,
             final_content_inset,
         );
-        let final_viewport_h = (final_panel_h - status_h()).max(1.0);
+        let final_viewport_h = (final_panel_h - footer_band_h()).max(1.0);
         let final_document_h = content_h.max(final_viewport_h).max(1.0);
         let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
         let (final_document_h, final_scroll_max_offset, final_scroll_offset, _) =
@@ -317,7 +317,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             NSSize::new(final_panel_w, final_panel_h),
         );
         let final_container_frame = NSRect::new(
-            NSPoint::new(original_container_frame.origin.x, status_h()),
+            NSPoint::new(original_container_frame.origin.x, footer_band_h()),
             NSSize::new(final_panel_w, final_viewport_h),
         );
         let final_document_frame = NSRect::new(

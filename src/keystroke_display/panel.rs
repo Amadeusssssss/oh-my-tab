@@ -23,7 +23,7 @@ use crate::ffi::{
     AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetType, AXValueGetValue, CFRelease,
     CFStringCreateWithCString, CGRect,
 };
-use crate::ffi::{MainThreadSlot, StaticClass};
+use crate::ffi::{objc_msgSendSuper, MainThreadSlot, ObjcSuper, StaticClass};
 
 /// Panel extent across the stream: one badge plus this padding on each side (34 + 2*10).
 const PANEL_H: f64 = 54.0;
@@ -80,6 +80,11 @@ struct PanelState {
     /// A column's latched width (0 while unset): the panel only grows while shown and never
     /// shrinks, mirroring `latched` on the cross axis. A row resets it.
     panel_cross_latched: f64,
+    /// The trailing settings button, created with the panel and laid out on every render.
+    settings_view: Option<*mut AnyObject>,
+    /// Whether a press on the settings button is in flight. Keeps the window receiving input until
+    /// the press finishes or is cancelled, like `drag` does for the handle.
+    settings_armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -104,6 +109,8 @@ enum GripCursor {
     None,
     Open,
     Closed,
+    /// The pointer is over the settings button, which is a control, not a drag handle.
+    Pointing,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -181,6 +188,19 @@ pub(super) fn fade_pending() -> bool {
 
 /// The target screen's extent along the panel's stream axis: the width the cap is measured
 /// against when keys run in a row, the height when they stack in a column.
+/// The stream-axis budget the keycap state machine may fill: half the target screen's extent along
+/// the stream axis, minus what the panel's own controls reserve. The state machine trims to this
+/// BEFORE render runs, so both layers must use the identical number -- otherwise the state keeps a
+/// keycap the renderer must drop, or drops one the renderer had room for.
+pub(super) fn stream_budget_for_panel(
+    display_position: &str,
+    position: Option<KeystrokeDisplayPosition>,
+    orientation: Orientation,
+) -> f64 {
+    (target_screen_extent(display_position, position, orientation) * 0.5 - STREAM_BUDGET_DEDUCTION)
+        .max(32.0)
+}
+
 pub(super) fn target_screen_extent(
     display_position: &str,
     position: Option<KeystrokeDisplayPosition>,
@@ -532,10 +552,12 @@ pub(super) fn render(
             let panel = if let Some(panel) = state.panel {
                 panel
             } else {
-                let (panel, badge_container, grip_view) = unsafe { create_panel(orientation) };
+                let (panel, badge_container, grip_view, settings_view) =
+                    unsafe { create_panel(orientation) };
                 state.panel = Some(panel);
                 state.badge_container = Some(badge_container);
                 state.grip_view = Some(grip_view);
+                state.settings_view = Some(settings_view);
                 panel
             };
             let badge_container = state
@@ -561,15 +583,24 @@ pub(super) fn render(
             } else {
                 screen_frame.size.width * 0.5
             };
+            // The keycap stream shares the panel's stream axis with the two controls (the leading
+            // drag handle and the trailing settings button), so their reserve comes off the budget
+            // BEFORE the trim decisions below. Every layer that trims (the state machine, this
+            // remove loop, the per-badge clamp and the latch) uses this same number: trimming
+            // against a larger budget here would let the stream run under the button.
+            let stream_budget = (max_extent - STREAM_BUDGET_DEDUCTION).max(32.0);
             let mut desired = estimated_stream_width(extents.iter().map(|extent| extent.length));
             let mut first = 0usize;
-            while extents.len() > 1 && desired > max_extent {
+            while extents.len() > 1 && desired > stream_budget {
                 extents.remove(0);
                 first += 1;
                 desired = estimated_stream_width(extents.iter().map(|extent| extent.length));
             }
-            // Only this final per-badge clamp can ellipsize a genuinely oversized badge.
-            let length_limit = (max_extent - PANEL_SIDE_PADDING * 2.0).max(32.0);
+            // Only this final per-badge clamp can ellipsize a genuinely oversized badge. It uses the
+            // CONTENT budget: estimated_stream_width() already adds the panel's side padding, so a
+            // badge allowed to fill stream_budget would overflow once that padding is added back.
+            let content_budget = (stream_budget - PANEL_SIDE_PADDING * 2.0).max(32.0);
+            let length_limit = content_budget;
             // A column is only as wide as its widest keycap, itself capped so one long key name
             // cannot turn the strip into a slab.
             let thickness_limit = if orientation.is_vertical() {
@@ -597,10 +628,14 @@ pub(super) fn render(
             // estimate-based trim does.
             let pinned = capped || state.latched || first > 0;
             state.latched = pinned;
+            // The panel's own length covers the keycap stream plus the controls' reserve: sizing it
+            // from the stream alone would clip the trailing button once the stream reaches budget.
             let panel_length = if pinned {
                 max_extent
             } else {
-                desired.min(max_extent).max(max_extent.min(64.0))
+                (desired + PANEL_CONTROLS_RESERVE * 2.0)
+                    .min(max_extent)
+                    .max(max_extent.min(64.0))
             };
             // The cross axis is one badge thick plus padding on both sides. For a row this is
             // BADGE_H + 2*10 = 54, i.e. PANEL_H; a column mirrors it with the badge's own width.
@@ -658,6 +693,12 @@ pub(super) fn render(
                 if let Some(grip_view) = state.grip_view {
                     let _: () = msg_send![grip_view, setFrame: grip_frame(orientation, size)];
                     update_grip_marker(grip_view, orientation);
+                }
+                if let Some(settings_view) = state.settings_view {
+                    let _: () = msg_send![
+                        settings_view,
+                        setFrame: settings_button_frame(orientation, size)
+                    ];
                 }
                 let palette = crate::theme::ui_palette();
                 if state.last_badges != badges || state.last_palette != Some(palette) {
@@ -765,6 +806,11 @@ pub(super) fn reset() {
         state.measurements.clear();
         state.latched = false;
         state.panel_cross_latched = 0.0;
+        // No press survives the panel's end: a later mouseUp must not open settings for a session
+        // that has already been torn down. The VIEW handle stays: the panel window is cached and
+        // reused, so dropping the handle here would leave the button in the tree but lose the only
+        // reference that re-lays it out and retints it on the next show.
+        state.settings_armed = false;
     });
 }
 
@@ -1092,6 +1138,60 @@ pub(super) fn smoke_runner() -> bool {
         changed && unsafe { backdrop_surface_matches_palette() }
     };
 
+    /// A1 smoke: the key panel's trailing settings button sits inside the panel on both orientations and
+    /// never overlaps a keycap.
+    ///
+    /// The budget refactor is what this guards: if the stream were allowed to use the button's reserve,
+    /// the last keycap would be laid out under the button, which no pure budget test would see.
+    fn smoke_settings_button_clear_of_keycaps() -> bool {
+        PANEL.with(|panel| {
+        let state = panel.borrow();
+        let (Some(window), Some(settings_view)) = (state.panel, state.settings_view) else {
+            return false;
+        };
+        let panel_frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
+        let button_frame: NSRect = unsafe { msg_send![settings_view, frame] };
+        let inside = button_frame.origin.x >= -0.5
+            && button_frame.origin.y >= -0.5
+            && button_frame.origin.x + button_frame.size.width <= panel_frame.size.width + 0.5
+            && button_frame.origin.y + button_frame.size.height <= panel_frame.size.height + 0.5;
+        if !inside {
+            eprintln!(
+                "[keystroke-display-smoke] settings button {:.1},{:.1} {:.1}x{:.1} is outside the {:.1}x{:.1} panel",
+                button_frame.origin.x,
+                button_frame.origin.y,
+                button_frame.size.width,
+                button_frame.size.height,
+                panel_frame.size.width,
+                panel_frame.size.height
+            );
+            return false;
+        }
+        let Some(container) = state.badge_container else {
+            return false;
+        };
+        let subviews: *mut AnyObject = unsafe { msg_send![container, subviews] };
+        let count: usize = unsafe { msg_send![subviews, count] };
+        for index in 0..count {
+            let badge: *mut AnyObject =
+                unsafe { msg_send![subviews, objectAtIndex: index as isize] };
+            let badge_frame: NSRect = unsafe { msg_send![badge, frame] };
+            let overlaps = button_frame.origin.x < badge_frame.origin.x + badge_frame.size.width
+                && badge_frame.origin.x < button_frame.origin.x + button_frame.size.width
+                && button_frame.origin.y < badge_frame.origin.y + badge_frame.size.height
+                && badge_frame.origin.y < button_frame.origin.y + button_frame.size.height;
+            if overlaps {
+                eprintln!(
+                    "[keystroke-display-smoke] keycap {index} overlaps the settings button"
+                );
+                return false;
+            }
+        }
+        true
+    })
+    }
+
+    let settings_button_valid = smoke_settings_button_clear_of_keycaps();
     let grip_valid = smoke_grip_interaction(saved_position);
     let rail_geometry_valid = {
         // The rail geometry over the real render path, in a column: every keycap is
@@ -1413,6 +1513,7 @@ pub(super) fn smoke_runner() -> bool {
         && smoke_process_isolated
         && rail_geometry_valid
         && stream_alignment_valid
+        && settings_button_valid
         && grip_valid
         && config_restored
         && (dev_material_forced || every_material_paints_its_surface)
@@ -1428,6 +1529,7 @@ pub(super) fn smoke_runner() -> bool {
         && row_split_valid
         && column_pair_margins_valid
         && stream_alignment_valid
+        && settings_button_valid
         && grip_valid
         && config_restored
         && (dev_material_forced || every_material_paints_its_surface)
@@ -1632,9 +1734,256 @@ unsafe fn text_centroid_offsets(
     Some(offsets)
 }
 
+/// The settings button's class: mouseDown arms the press (so a release outside the button cancels
+/// rather than acting), and the hover pair carries the neutral corner-glyph wash.
+unsafe fn settings_button_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    CLASS
+        .get_or_init(|| unsafe {
+            let name = CString::new("OhMyTabKeyPanelSettingsButton").unwrap();
+            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            if cls.is_null() {
+                return StaticClass(class!(NSButton));
+            }
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                settings_mouse_down as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                settings_entered as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                settings_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            // The click action MUST be registered on this class: the button targets itself and an
+            // unregistered selector would abort the process on the first click.
+            class_addMethod(
+                cls,
+                sel!(onKeyPanelSettings:),
+                on_key_panel_settings as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            StaticClass(cls as *const objc2::runtime::AnyClass)
+        })
+        .0 as *mut AnyObject
+}
+
+extern "C" fn settings_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    crate::callback_guard::void("settings_mouse_down", || unsafe {
+        PANEL.with(|panel| panel.borrow_mut().settings_armed = true);
+        set_settings_button_style(_self as *mut AnyObject, true);
+        // NSButton's own mouseDown: runs the highlight/press tracking loop. Overriding it without
+        // calling super replaced that loop entirely, so the button never tracked the press and
+        // never dispatched its action -- it looked right and did nothing when clicked.
+        type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
+        let mut sup = ObjcSuper {
+            receiver: _self,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let call: MouseDown = std::mem::transmute(objc_msgSendSuper as *const ());
+        call(&mut sup, sel!(mouseDown:), event);
+    });
+}
+
+extern "C" fn settings_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    crate::callback_guard::void("settings_entered", || unsafe {
+        set_settings_button_style(_self as *mut AnyObject, true);
+    });
+}
+
+extern "C" fn settings_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    crate::callback_guard::void("settings_exited", || {
+        // Leaving during the press cancels it; AppKit still delivers the action on mouseUp, so the
+        // armed flag is what tells a real click from a drag-out.
+        PANEL.with(|panel| panel.borrow_mut().settings_armed = false);
+        unsafe { set_settings_button_style(_self as *mut AnyObject, false) };
+    });
+}
+
+extern "C" fn on_key_panel_settings(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    crate::callback_guard::void("on_key_panel_settings", || {
+        // Two entry paths, with different guards:
+        //   * a real mouse press arms on mouseDown; the flag separates this press from a stale
+        //     mouseUp that belongs to a previous, already-dismissed panel;
+        //   * an Accessibility press (AXPress) has no mouseDown, so requiring the arm would reject
+        //     it. It is recognised by the absence of a current mouse event.
+        let from_mouse = unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let event: *mut AnyObject = msg_send![nsapp, currentEvent];
+            !event.is_null() && {
+                let kind: isize = msg_send![event, type];
+                kind == 1 || kind == 2
+            }
+        };
+        let armed = PANEL.with(|panel| {
+            let mut state = panel.borrow_mut();
+            let armed = state.settings_armed;
+            state.settings_armed = false;
+            armed
+        });
+        if from_mouse && !armed {
+            return;
+        }
+        open_key_panel_settings();
+    });
+}
+
+pub(super) fn open_key_panel_settings() {
+    crate::debug_assert_main_thread();
+    // Show settings first, then stop the panel: the panel would otherwise be gone for a frame while
+    // the settings window is still being built, which reads as a stall. The panel is a passive HUD
+    // with no session to retire, so there is no equivalent of the switcher's ordering constraint.
+    crate::settings::show_keystroke_display_page();
+
+    // The panel is a passive HUD: stop it in place. (A --show-keystroke-display launch freezes the
+    // idle deadline, so the timer is what this stops; the badge state is cleared by reset_on_main
+    // on the module's own path.)
+    reset();
+    super::reset_on_main();
+}
+
+/// A2 geometry: the panel and its gear in screen points, top-left origin. Returns None when the
+/// panel or its gear does not exist.
+pub(super) fn e2e_geometry() -> Option<super::E2ePanelGeometry> {
+    PANEL.with(|panel| {
+        let state = panel.borrow();
+        let window = state.panel?;
+        let gear = state.settings_view?;
+        unsafe {
+            let frame = crate::glass::panel_frame_of(window);
+            let screen = screen_geometries().first()?.frame;
+            let gear_frame: NSRect = msg_send![gear, frame];
+            Some(super::E2ePanelGeometry {
+                panel_x: frame.origin.x,
+                panel_y: screen.size.height - (frame.origin.y + frame.size.height),
+                panel_w: frame.size.width,
+                panel_h: frame.size.height,
+                gear_x: frame.origin.x + gear_frame.origin.x,
+                gear_y: screen.size.height
+                    - (frame.origin.y + gear_frame.origin.y + gear_frame.size.height),
+                gear_w: gear_frame.size.width,
+                gear_h: gear_frame.size.height,
+            })
+        }
+    })
+}
+/// Refresh the key panel's cached controls after a theme or locale change. The panel window is
+/// reused, so its settings gear would otherwise keep the previous language and an unhovered tint
+/// from the previous palette.
+pub(crate) unsafe fn refresh_cached_controls() {
+    PANEL.with(|panel| {
+        let state = panel.borrow();
+        let Some(button) = state.settings_view else {
+            return;
+        };
+        let label = make_nsstring(&crate::i18n::t("keystroke_display.open_settings"));
+        let _: () = msg_send![button, setAccessibilityLabel: label];
+        CFRelease(label as *const c_void);
+        let tooltip = make_nsstring(&crate::i18n::t("keystroke_display.open_settings"));
+        let _: () = msg_send![button, setToolTip: tooltip];
+        CFRelease(tooltip as *const c_void);
+        set_settings_button_style(button, false);
+    });
+}
+
+/// Normal/hover for the HUD's settings gear: a neutral ink over one faint wash, matching the other
+/// floating panels' corner glyph buttons.
+unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: bool) {
+    if button.is_null() {
+        return;
+    }
+    let palette = crate::theme::ui_palette();
+    let (tint, role) = if hovered {
+        (palette.primary_text, crate::glass::PanelInk::Primary)
+    } else {
+        (palette.secondary_text, crate::glass::PanelInk::Secondary)
+    };
+    let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        let background = if hovered {
+            palette.hover_bg
+        } else {
+            0x00000000
+        };
+        layer_set_background(layer, hex_to_cg_color(background));
+    }
+}
+
+/// Build the HUD's settings gear. Returns a +1 reference; the caller adds it to the backdrop and
+/// releases it.
+unsafe fn make_settings_button(frame: NSRect) -> *mut AnyObject {
+    let button: *mut AnyObject = msg_send![settings_button_class(), alloc];
+    let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+    }
+    let symbol_name = make_nsstring("gearshape");
+    let image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_name,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_name as *const c_void);
+    if !image.is_null() {
+        let config: *mut AnyObject = msg_send![
+            class!(NSImageSymbolConfiguration),
+            configurationWithPointSize: crate::theme::FONT_CAPTION,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+        let _: () = msg_send![image, setTemplate: true];
+        let _: () = msg_send![button, setImage: image];
+    }
+    let empty = make_nsstring("");
+    let _: () = msg_send![button, setTitle: empty];
+    CFRelease(empty as *const c_void);
+    let _: () = msg_send![button, setTarget: button];
+    let _: () = msg_send![button, setAction: sel!(onKeyPanelSettings:)];
+    set_settings_button_style(button, false);
+    let opts: u64 = 0x01 | 0x80;
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+        options: opts,
+        owner: button,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![button, addTrackingArea: tracking];
+    release_obj(tracking);
+    let label = make_nsstring(&crate::i18n::t("keystroke_display.open_settings"));
+    let _: () = msg_send![button, setAccessibilityLabel: label];
+    CFRelease(label as *const c_void);
+    let tooltip = make_nsstring(&crate::i18n::t("keystroke_display.open_settings"));
+    let _: () = msg_send![button, setToolTip: tooltip];
+    CFRelease(tooltip as *const c_void);
+    button
+}
+
 unsafe fn create_panel(
     orientation: Orientation,
-) -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
+) -> (
+    *mut AnyObject,
+    *mut AnyObject,
+    *mut AnyObject,
+    *mut AnyObject,
+) {
     // A provisional non-empty frame: `render` assigns the real size immediately after creation.
     let provisional = if orientation.is_vertical() {
         NSSize::new(PANEL_H, 64.0)
@@ -1692,6 +2041,12 @@ unsafe fn create_panel(
     }
     let _: () = msg_send![backdrop.content_parent, addSubview: grip_view];
     update_grip_marker(grip_view, orientation);
+    // The trailing settings button shares the panel with the keycap stream; its reserve is already
+    // taken off the stream budget, so it can never overlap the last keycap.
+    let settings_view: *mut AnyObject =
+        make_settings_button(settings_button_frame(orientation, provisional));
+    let _: () = msg_send![backdrop.content_parent, addSubview: settings_view];
+    release_obj(settings_view);
     *PANEL_BACKDROP.lock().unwrap() = Some(backdrop);
     release_obj(badge_container);
     release_obj(grip_view);
@@ -1699,7 +2054,81 @@ unsafe fn create_panel(
     // no key is pressed, and until a render or a theme refresh runs the surface would otherwise be
     // whatever the material installed.
     apply_glass_properties();
-    (panel, badge_container, grip_view)
+    (panel, badge_container, grip_view, settings_view)
+}
+
+/// Side of the key panel's trailing settings button.
+const SETTINGS_BTN_SIZE: f64 = crate::theme::FOOTER_CONTROL_SIZE;
+/// Gap kept between the last keycap and the settings button along the stream axis.
+const SETTINGS_BTN_GAP: f64 = crate::theme::FOOTER_CONTROL_GAP;
+/// Distance the settings button keeps from the panel's trailing edge on the cross axis.
+const SETTINGS_BTN_CROSS_INSET: f64 = PANEL_SIDE_PADDING;
+
+/// Stream-axis distance from the panel's trailing edge to where the keycap stream must stop: the
+/// settings button's own cross inset, its width, and the gap that keeps the last keycap off it.
+/// The inset is the part the earlier version forgot -- reserving only the button and gap left the
+/// last keycap flush against the button (a visible gap of 0 while SETTINGS_BTN_GAP promised one).
+pub(super) const TAIL_SETTINGS_RESERVE: f64 =
+    SETTINGS_BTN_CROSS_INSET + SETTINGS_BTN_SIZE + SETTINGS_BTN_GAP;
+/// Stream-axis length the leading drag handle removes from the keycap stream. The handle's hit area
+/// is thicker than the side padding, so it intrudes into the content area and must be reserved, or
+/// the first keycap sits under the pointer that opens the drag.
+pub(super) const HEAD_GRIP_RESERVE: f64 = GRIP_HIT_THICKNESS + GRIP_EDGE_INSET;
+
+/// The symmetric stream-axis reserve both ends carry: the larger of the two controls' needs, used on
+/// BOTH sides. A symmetric reserve is what keeps the stream centred in the panel (the property the
+/// existing smoke asserts) while still guaranteeing the trailing gap -- an asymmetric reserve would
+/// shift the keycaps off centre.
+pub(super) const PANEL_CONTROLS_RESERVE: f64 = if TAIL_SETTINGS_RESERVE > HEAD_GRIP_RESERVE {
+    TAIL_SETTINGS_RESERVE
+} else {
+    HEAD_GRIP_RESERVE
+};
+
+/// The stream-axis budget deduction. The stream is centred, so each end carries PANEL_CONTROLS_RESERVE
+/// of blank space while `estimated_stream_width` already counts PANEL_SIDE_PADDING per end; the
+/// deduction is therefore twice the reserve minus that padding.
+pub(super) const STREAM_BUDGET_DEDUCTION: f64 =
+    PANEL_CONTROLS_RESERVE * 2.0 - PANEL_SIDE_PADDING * 2.0;
+
+/// Where the settings button sits inside the panel: the stream's TRAILING end -- the trailing edge
+/// of a row, the bottom of a column -- which is the corner a user reaches for.
+fn settings_button_frame(orientation: Orientation, panel_size: NSSize) -> NSRect {
+    let rx = crate::glass::PANEL_CORNER_RADIUS.min(panel_size.width / 2.0);
+    let ry = crate::glass::PANEL_CORNER_RADIUS.min(panel_size.height / 2.0);
+    if orientation.is_vertical() {
+        // Column: the stream runs downward, so the trailing end is the bottom edge.
+        let inset = crate::theme::footer_control_inset(
+            crate::glass::PANEL_CORNER_RADIUS,
+            panel_size.height,
+            panel_size.width,
+            SETTINGS_BTN_SIZE,
+            panel_size.height,
+        );
+        let _ = (rx, ry);
+        let m = SETTINGS_BTN_CROSS_INSET.max(inset);
+        NSRect::new(
+            NSPoint::new(((panel_size.width - SETTINGS_BTN_SIZE) / 2.0).max(0.0), m),
+            NSSize::new(SETTINGS_BTN_SIZE, SETTINGS_BTN_SIZE),
+        )
+    } else {
+        // Row: the stream runs rightward, so the trailing end is the right edge.
+        let inset = crate::theme::footer_control_inset(
+            crate::glass::PANEL_CORNER_RADIUS,
+            panel_size.width,
+            panel_size.height,
+            SETTINGS_BTN_SIZE,
+            panel_size.height,
+        );
+        let m = SETTINGS_BTN_CROSS_INSET.max(inset);
+        NSRect::new(
+            NSPoint::new(
+                (panel_size.width - m - SETTINGS_BTN_SIZE).max(0.0),
+                ((panel_size.height - SETTINGS_BTN_SIZE) / 2.0).max(0.0),
+            ),
+            NSSize::new(SETTINGS_BTN_SIZE, SETTINGS_BTN_SIZE),
+        )
+    }
 }
 
 /// The drag handle's frame inside the panel. A row carries it as a vertical dotted bar on its
@@ -1760,41 +2189,107 @@ unsafe fn update_grip_marker(grip_view: *mut AnyObject, orientation: Orientation
     }
 }
 
+/// What the pointer is over inside the key panel. One decision function answers this, so the window's
+/// input state is written from exactly ONE place -- two pollers each calling
+/// setIgnoresMouseEvents: would overwrite each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelControl {
+    None,
+    Grip,
+    Settings,
+}
+
+/// Which control, if any, the cursor is over. `captured` is an in-flight gesture (a grip drag or a
+/// settings press): while one runs, the panel keeps receiving input wherever the pointer goes, or a
+/// mouseUp delivered outside the control could never finish the gesture.
+fn panel_control_under_cursor(
+    state: &PanelState,
+    cursor_point: Option<NSPoint>,
+    captured: bool,
+) -> PanelControl {
+    if cursor_point.is_none() {
+        return PanelControl::None;
+    }
+    let point = cursor_point.unwrap();
+    let Some(window) = state.panel else {
+        return PanelControl::None;
+    };
+    let frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
+    if captured {
+        // A gesture in flight keeps input enabled; the control it started on is what to report.
+        if state.drag.is_some() {
+            return PanelControl::Grip;
+        }
+        if state.settings_armed {
+            return PanelControl::Settings;
+        }
+    }
+    let local = panel_control_rects(state.orientation, frame.size);
+    for (control, rect) in [
+        (PanelControl::Settings, local.settings),
+        (PanelControl::Grip, local.grip),
+    ] {
+        let global = NSRect::new(
+            NSPoint::new(
+                frame.origin.x + rect.origin.x,
+                frame.origin.y + rect.origin.y,
+            ),
+            rect.size,
+        );
+        if contains(global, point) {
+            return control;
+        }
+    }
+    PanelControl::None
+}
+
+/// The two controls' rects in panel coordinates, computed together so the input decision and the
+/// renderer can never disagree about where they are.
+struct PanelControlRects {
+    grip: NSRect,
+    settings: NSRect,
+}
+
+/// Pure: the caller passes the orientation it already has from the borrowed state. It must NOT
+/// reach into PANEL itself -- render and the tracking path call this while already holding
+/// PANEL.borrow_mut(), and a second borrow there panics (RefCell) on the ordinary in-panel cursor
+/// path, which is the common case. Both ends report the SAME symmetric reserve, which is what keeps
+/// the stream centred while still clearing the trailing button.
+fn panel_control_rects(orientation: Orientation, panel_size: NSSize) -> PanelControlRects {
+    PanelControlRects {
+        grip: grip_frame(orientation, panel_size),
+        settings: settings_button_frame(orientation, panel_size),
+    }
+}
+
 fn update_grip_tracking(state: &mut PanelState, cursor_point: Option<NSPoint>) {
     if state.drag.is_some() {
         set_grip_mouse_state(state, true, GripCursor::Closed);
         return;
     }
     let panel_active = state.visible || state.fade_deadline.is_some();
-    let inside_grip = if panel_active {
-        cursor_point.is_some_and(|point| {
-            state.panel.is_some_and(|window| unsafe {
-                let frame: NSRect = crate::glass::panel_frame_of(window);
-                let local = grip_frame(state.orientation, frame.size);
-                contains(
-                    NSRect::new(
-                        NSPoint::new(
-                            frame.origin.x + local.origin.x,
-                            frame.origin.y + local.origin.y,
-                        ),
-                        local.size,
-                    ),
-                    point,
-                )
-            })
-        })
+    // The gesture-in-flight question is asked of the state itself, not of the pointer: a press that
+    // left the control must keep receiving events until it finishes or is cancelled.
+    let captured = state.drag.is_some() || state.settings_armed;
+    let control = if panel_active {
+        panel_control_under_cursor(state, cursor_point, captured)
     } else {
-        false
+        PanelControl::None
     };
-    set_grip_mouse_state(
-        state,
-        inside_grip,
-        if inside_grip {
-            GripCursor::Open
-        } else {
-            GripCursor::None
-        },
-    );
+    // ONE write of the window's input state, driven by the single decision above.
+    let (receive, cursor) = match control {
+        PanelControl::Grip => (
+            true,
+            if state.drag.is_some() {
+                GripCursor::Closed
+            } else {
+                GripCursor::Open
+            },
+        ),
+        PanelControl::Settings => (true, GripCursor::Pointing),
+        PanelControl::None => (false, GripCursor::None),
+    };
+    set_grip_mouse_state(state, receive, cursor);
 }
 
 fn set_grip_mouse_state(state: &mut PanelState, receive_events: bool, cursor: GripCursor) {
@@ -1820,6 +2315,7 @@ fn set_grip_cursor(state: &mut PanelState, cursor: GripCursor) {
             let cursor_object: *mut AnyObject = match cursor {
                 GripCursor::Open => msg_send![class!(NSCursor), openHandCursor],
                 GripCursor::Closed => msg_send![class!(NSCursor), closedHandCursor],
+                GripCursor::Pointing => msg_send![class!(NSCursor), pointingHandCursor],
                 GripCursor::None => std::ptr::null_mut(),
             };
             if !cursor_object.is_null() {
@@ -2249,14 +2745,41 @@ unsafe fn add_badge_label(parent: *mut AnyObject, frame: NSRect, text: &str, tex
     release_obj(field);
 }
 
-fn centered_stream_cursor(panel_length: f64, estimated_total: f64, vertical: bool) -> f64 {
+/// Where the keycap stream starts along the panel's stream axis.
+///
+/// The stream is centred in the CONTENT area -- the panel minus the leading drag handle's reserve and
+/// the trailing settings button's reserve -- not in the whole panel. Centring it in the whole panel
+/// put the last keycap exactly on the gear's edge (a visible gap of 0) even though
+/// SETTINGS_BTN_GAP is part of the reserve, because the reserve was subtracted from the budget but
+/// not from the space the stream was laid out in.
+///
+/// In non-flipped coordinates a row is measured from the leading (left) edge while a column is
+/// counted down from the top, so a column returns the content area's trailing edge.
+fn centered_stream_cursor(
+    panel_length: f64,
+    estimated_total: f64,
+    vertical: bool,
+    head_reserve: f64,
+    tail_reserve: f64,
+) -> f64 {
     let stream_length = (estimated_total - PANEL_SIDE_PADDING * 2.0).max(0.0);
-    let leading_margin = ((panel_length - stream_length) / 2.0).max(0.0);
+    let content_length = (panel_length - head_reserve - tail_reserve).max(0.0);
+    let margin = ((content_length - stream_length) / 2.0).max(0.0);
     if vertical {
-        panel_length - leading_margin
+        // Non-flipped: a column counts DOWN from the top, and the handle sits at the top
+        // (leading) edge while the settings button sits at the bottom (trailing) one.
+        panel_length - head_reserve - margin
     } else {
-        leading_margin
+        head_reserve + margin
     }
+}
+
+/// The stream-axis reserve the layout applies to BOTH ends. It is the symmetric
+/// `PANEL_CONTROLS_RESERVE`, not each control's own extent: a symmetric reserve keeps the keycap
+/// stream centred in the panel (the property the panel smoke asserts), while the larger side still
+/// guarantees the trailing gap. Using each side's own extent would shift the stream off centre.
+fn stream_axis_reserves(_orientation: Orientation, _panel_size: NSSize) -> (f64, f64) {
+    (PANEL_CONTROLS_RESERVE, PANEL_CONTROLS_RESERVE)
 }
 
 unsafe fn rebuild_badges(
@@ -2284,7 +2807,14 @@ unsafe fn rebuild_badges(
         panel_size.width
     };
     // Non-flipped coordinates count a column down from the top and a row up from the left.
-    let mut cursor = centered_stream_cursor(panel_length, total, orientation.is_vertical());
+    let (head_reserve, tail_reserve) = stream_axis_reserves(orientation, panel_size);
+    let mut cursor = centered_stream_cursor(
+        panel_length,
+        total,
+        orientation.is_vertical(),
+        head_reserve,
+        tail_reserve,
+    );
     for ((badge, label), extent) in badges.iter().zip(labels).zip(extents) {
         // `length` runs along the stream axis and `thickness` across it, so the on-screen box
         // swaps them for a column.
@@ -2793,6 +3323,7 @@ mod tests {
         accent_keycap_surface, centered_stream_cursor, default_edge_frame, neutral_keycap_surface,
         opaque_over, resize_frame_preserving_center, resolve_panel_frame, target_screen_index,
         uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry, BADGE_GAP, BADGE_H,
+        PANEL_SIDE_PADDING, SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE,
     };
     use crate::config::KeystrokeDisplayPosition;
     use crate::keystroke_display::state::{estimated_badge_width, BadgeKind, KEYCAP_RAIL_W};
@@ -2802,14 +3333,54 @@ mod tests {
     fn single_key_streams_are_centered_with_equal_end_margins_in_both_orientations() {
         // A one-letter row uses a 32pt keycap in a 64pt panel; a column uses a 34pt
         // keycap in a 64pt panel. `estimated_total` includes 12pt nominal padding per end.
-        let horizontal_cursor = centered_stream_cursor(64.0, 56.0, false);
+        // Zero reserves is the case the old implementation always took (the panel with no
+        // controls), so it stays the reference for "centred with equal margins".
+        let horizontal_cursor = centered_stream_cursor(64.0, 56.0, false, 0.0, 0.0);
         assert_eq!(horizontal_cursor, 16.0);
         assert_eq!(64.0 - horizontal_cursor - 32.0, horizontal_cursor);
 
-        let vertical_cursor = centered_stream_cursor(64.0, 58.0, true);
+        let vertical_cursor = centered_stream_cursor(64.0, 58.0, true, 0.0, 0.0);
         let vertical_keycap_start = vertical_cursor - 34.0;
         assert_eq!(vertical_keycap_start, 15.0);
         assert_eq!(vertical_keycap_start, 64.0 - vertical_cursor);
+    }
+
+    /// The stream keeps the promised gap from BOTH controls: the trailing keycap must clear the
+    /// settings button by at least the named gap, and the leading one must clear the handle. The
+    /// previous layout centred the stream in the whole panel while only subtracting the reserves
+    /// from the *budget*, so the last keycap sat exactly on the gear (gap 0).
+    #[test]
+    fn the_stream_keeps_its_gap_from_both_controls() {
+        let head = 20.0; // handle thickness
+        let tail = SETTINGS_BTN_SIZE + SETTINGS_BTN_GAP;
+        let panel = 240.0;
+        // A row: one 32pt keycap, estimated_total includes the 12pt nominal padding per end.
+        let total = 32.0 + PANEL_SIDE_PADDING * 2.0;
+        let cursor = centered_stream_cursor(panel, total, false, head, tail);
+        let keycap_start = cursor;
+        let keycap_end = cursor + 32.0;
+        assert!(
+            keycap_end <= panel - tail + 1e-9,
+            "the trailing keycap reaches {keycap_end}, past the {:.1}pt reserve (gap \
+             {SETTINGS_BTN_GAP} would be lost)",
+            panel - tail
+        );
+        assert!(
+            keycap_start >= head - 1e-9,
+            "the leading keycap starts at {keycap_start}, inside the {head}pt handle reserve"
+        );
+        // Column: non-flipped, counted down from the top.
+        let column_total = 34.0 + PANEL_SIDE_PADDING * 2.0;
+        let column_cursor = centered_stream_cursor(panel, column_total, true, head, tail);
+        let column_keycap_start = column_cursor - 34.0;
+        assert!(
+            column_keycap_start >= tail - 1e-9,
+            "the column's last keycap starts at {column_keycap_start}, inside the {tail}pt reserve"
+        );
+        assert!(
+            column_cursor <= panel - head + 1e-9,
+            "the column's first keycap tops out at {column_cursor}, inside the {head}pt handle reserve"
+        );
     }
 
     #[test]

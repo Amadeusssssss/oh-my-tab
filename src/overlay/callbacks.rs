@@ -64,6 +64,23 @@ pub(crate) fn commit_first_summon(backward: bool) {
     commit_selected_window(false);
 }
 
+/// Development helper (`--show-overlay`): summon the switcher and leave it standing for an A2
+/// gesture. It follows the same refresh-then-show path as the first hotkey press (so real windows
+/// are collected), but a normal launch can never reach it.
+pub(crate) fn show_overlay_for_development() {
+    crate::debug_assert_main_thread();
+    crate::performance::begin_switcher_activity();
+    request_window_refresh();
+    with_tab_state(|state_opt| {
+        let state = state_opt.as_mut().unwrap();
+        state.visible = false;
+        state.pending_first_show = true;
+        state.pending_first_backward = false;
+        state.pending_first_release = false;
+    });
+    schedule_first_summon_timeout();
+}
+
 fn step_switcher(backward: bool) {
     let (pending, first_show) = with_tab_state(|state_opt| {
         let state = state_opt.as_ref().unwrap();
@@ -779,7 +796,7 @@ pub(super) unsafe fn update_thumbnail_scroller(
         let _: () = msg_send![scroller.0, setHidden: true];
         return;
     }
-    let footer_h = status_h();
+    let footer_h = footer_band_h();
     let frame = NSRect::new(
         NSPoint::new(
             panel_w - H_PADDING - THUMB_SCROLLBAR_W + THUMB_SCROLLBAR_W / 2.0,
