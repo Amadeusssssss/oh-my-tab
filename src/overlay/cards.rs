@@ -1214,6 +1214,10 @@ pub(crate) fn show_overlay() {
         // whole summon, so the settings window is never raised (and no stash is needed).
         let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
         let _: bool = msg_send![window, makeFirstResponder: container];
+        // The panel is now key and on screen: publish the snapshot the binding tap reads, so its
+        // Cmd+W/M/H/Q stop being ordinary bindings and start belonging to the panel. Done here,
+        // after the window is ordered front, because only a key panel can receive them at all.
+        publish_panel_snapshot(true);
         // A2 E2E: the overlay is on screen and the selection is set, so write a snapshot (only with
         // `--e2e-state=<path>`). Placed after the window is ordered front and outside every AppState
         // borrow, so it can safely borrow the state once more to read it.

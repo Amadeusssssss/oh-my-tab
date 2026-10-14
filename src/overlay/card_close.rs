@@ -589,6 +589,13 @@ pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *m
     if card_close_in_progress() {
         return;
     }
+    // An action key was pressed during this summon: the user is operating the panel directly, so
+    // releasing the trigger modifier must not commit the card that happens to be highlighted.
+    // Return/card-click commit, Esc dismisses; every other exit clears the flag.
+    if is_sticky() {
+        log_debug!("[overlay] CmdReleased ignored: this summon is sticky after an action key");
+        return;
+    }
     let visible = with_tab_state(|state_opt| {
         let Some(state) = state_opt.as_mut() else {
             return false;
@@ -683,6 +690,11 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
         state.visible = false;
         Some(target)
     });
+    // The session is ending by a commit: retire sticky and the published claim NOW. The visual
+    // order-out is deferred, and a re-summon inside that window must start clean rather than
+    // inherit this session's sticky flag (which would make the next release fail to commit).
+    clear_sticky();
+    publish_panel_snapshot(false);
     let Some((pid, cgwid, minimized, on_other_desktop, app_name, selected)) = target else {
         let hidden = with_tab_state(|state_opt| {
             let Some(state) = state_opt.as_mut() else {
@@ -874,6 +886,10 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
         }
     });
     if let Some((pid, cgwid, minimized, on_other_desktop)) = action {
+        // A card click commits too, so it ends the session exactly like Return and the release
+        // commit: clear sticky and the published claim now, while the visual order-out is deferred.
+        clear_sticky();
+        publish_panel_snapshot(false);
         vanish_overlay();
         // Same as on_cmd_released: no settings-window handling needed (see comment there);
         // the raise is deferred by one runloop turn so the vanish commits first.

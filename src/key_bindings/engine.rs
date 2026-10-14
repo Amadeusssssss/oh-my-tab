@@ -156,12 +156,9 @@ pub(crate) fn start() {
     }
     // The permission supervisor works off a config snapshot it cloned earlier, so a start request
     // can arrive after the user switched bindings off. Re-check the live config: booting the tap
-    // then would swallow chords for a disabled feature.
-    if !crate::config::CONFIG
-        .read()
-        .map(|cfg| enabled_in(&cfg))
-        .unwrap_or(false)
-    {
+    // then would swallow chords for a disabled feature -- UNLESS the panel's own action keys are
+    // on, because their claim is established by this tap and would otherwise never run.
+    if !tap_is_needed() {
         return;
     }
     let mut guard = match ENGINE_THREAD.lock() {
@@ -178,6 +175,22 @@ pub(crate) fn start() {
     reset_input_state();
     *guard = Some(spawn_tap_thread());
     log_info!("Key bindings enabled.");
+}
+
+/// Whether ANY feature this tap serves still needs it.
+///
+/// The tap serves two independent features now: the user's key bindings and the overlay's own
+/// action keys (Cmd+W/M/H/Q while the panel is open). The panel's chords are claimed by THIS tap,
+/// so the tap has to run when either feature is on -- checking only the binding switch left the
+/// four panel switches inert (and a claimed Cmd+Q able to reach the app's own Quit item).
+///
+/// One predicate, used by every lifecycle caller (startup, config change, permission recovery), so
+/// the answers cannot drift apart.
+pub(crate) fn tap_is_needed() -> bool {
+    crate::config::CONFIG
+        .read()
+        .map(|cfg| enabled_in(&cfg) || crate::panel_actions::configured_in(&cfg))
+        .unwrap_or(false)
 }
 
 /// Stop the tap thread. Idempotent.
@@ -199,6 +212,16 @@ pub(crate) fn reset_input_state() {
     if let Ok(mut keys) = SWALLOWED_KEYS.lock() {
         keys.clear();
     }
+    // The panel's HELD record goes: this runs when the tap STOPS or restarts, so any key-up still
+    // outstanding is one this process can no longer receive, and keeping the record would make the
+    // next real press look like a repeat and be swallowed.
+    //
+    // The queued actions are NOT dropped here -- they are cancelled by session generation. A press
+    // already released to AppKit must still be consumed when the main thread handles it; deleting
+    // the record would make the handler report "not ours" and let a panel-claimed Cmd+Q reach this
+    // app's own Quit item.
+    crate::panel_actions::clear_held();
+    crate::panel_actions::end_session();
     if let Ok(mut modifiers) = MODIFIER_DOWN.lock() {
         modifiers.clear();
     }
@@ -341,6 +364,11 @@ fn decide_key(
     clear_pending_gestures(gestures);
     match event.kind {
         KeyKind::Up => {
+            // Release of a key the panel claimed: it belonged to the panel for its whole hold, so
+            // the release passes through too (and leaves the ordinary record untouched).
+            if crate::panel_actions::decide_release(event.keycode) {
+                return KeyDecision::PassThrough;
+            }
             if let Some(index) = swallowed.iter().position(|held| *held == event.keycode) {
                 swallowed.swap_remove(index);
                 KeyDecision::Swallow(None)
@@ -349,36 +377,74 @@ fn decide_key(
             }
         }
         KeyKind::Down if event.autorepeat => {
+            // A repeat of a key the panel claimed stays claimed: one press is one action. This is
+            // checked before the ordinary swallow record so a binding opened later in the same hold
+            // cannot steal repeats back.
+            // A repeat either answers for an already-claimed hold (swallow) or is not ours at all;
+            // it must never establish a new claim.
+            match crate::panel_actions::decide_press(
+                event.keycode,
+                event.flags,
+                swallowed.contains(&event.keycode),
+                true,
+            ) {
+                crate::panel_actions::ClaimDecision::SwallowRepeat => {
+                    return KeyDecision::Swallow(None);
+                }
+                crate::panel_actions::ClaimDecision::PassThrough => {
+                    return KeyDecision::PassThrough;
+                }
+                crate::panel_actions::ClaimDecision::NotClaimed => {}
+            }
             if swallowed.contains(&event.keycode) {
                 KeyDecision::Swallow(None)
             } else {
                 KeyDecision::PassThrough
             }
         }
-        KeyKind::Down => match table.lookup_chord(event.keycode, event.flags) {
-            Some(action) => {
-                if swallowed.contains(&event.keycode) {
-                    // A second press without a release: treat it as a repeat, but one key never
-                    // fires two actions.
-                    KeyDecision::Swallow(None)
-                } else if action.is_window_scoped() && self_frontmost {
-                    // A window action cannot act on this app's own window, so while our settings
-                    // window is frontmost the chord belongs to the focused control: Option+arrow
-                    // moves the caret in a text field. Deciding this here rather than on the main
-                    // thread is what keeps those editing keys working -- the main thread's skip
-                    // happens after the press was already swallowed, and no later handler can give
-                    // back an event the app never received.
-                    //
-                    // Nothing is recorded in `swallowed`, so the matching release passes through
-                    // too and the field sees a complete press/release pair.
-                    KeyDecision::PassThrough
-                } else {
-                    swallowed.push(event.keycode);
-                    KeyDecision::Swallow(Some(action))
+        KeyKind::Down => {
+            // The panel owns the chord while it is open and the matching switch is on: its press
+            // belongs to AppKit, not to a binding. `binding_already_swallowed` keeps ownership
+            // unambiguous -- a key a binding took first is never reassigned to the panel.
+            match crate::panel_actions::decide_press(
+                event.keycode,
+                event.flags,
+                swallowed.contains(&event.keycode),
+                false,
+            ) {
+                crate::panel_actions::ClaimDecision::PassThrough => {
+                    return KeyDecision::PassThrough;
                 }
+                crate::panel_actions::ClaimDecision::SwallowRepeat => {
+                    return KeyDecision::Swallow(None);
+                }
+                crate::panel_actions::ClaimDecision::NotClaimed => {}
             }
-            None => KeyDecision::PassThrough,
-        },
+            match table.lookup_chord(event.keycode, event.flags) {
+                Some(action) => {
+                    if swallowed.contains(&event.keycode) {
+                        // A second press without a release: treat it as a repeat, but one key never
+                        // fires two actions.
+                        KeyDecision::Swallow(None)
+                    } else if action.is_window_scoped() && self_frontmost {
+                        // A window action cannot act on this app's own window, so while our settings
+                        // window is frontmost the chord belongs to the focused control: Option+arrow
+                        // moves the caret in a text field. Deciding this here rather than on the main
+                        // thread is what keeps those editing keys working -- the main thread's skip
+                        // happens after the press was already swallowed, and no later handler can give
+                        // back an event the app never received.
+                        //
+                        // Nothing is recorded in `swallowed`, so the matching release passes through
+                        // too and the field sees a complete press/release pair.
+                        KeyDecision::PassThrough
+                    } else {
+                        swallowed.push(event.keycode);
+                        KeyDecision::Swallow(Some(action))
+                    }
+                }
+                None => KeyDecision::PassThrough,
+            }
+        }
     }
 }
 

@@ -2079,6 +2079,10 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         cfg.windows.enabled = true;
         cfg.windows.show_minimized = true;
         cfg.windows.show_hidden_app_windows = true;
+        cfg.windows.panel_close_enabled = true;
+        cfg.windows.panel_minimize_enabled = true;
+        cfg.windows.panel_hide_enabled = true;
+        cfg.windows.panel_quit_enabled = true;
         cfg.layout.thumbnails_enabled = true;
         cfg.layout.focused_thumbnail_prewarm = true;
         cfg.layout.show_app_name_in_cards = true;
@@ -2115,10 +2119,19 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 let parent: *mut AnyObject = msg_send![control, superview];
                 parent == keystroke_page_document
             });
-            Some((
+            // The window-related controls are grouped: Rust implements PartialEq/Debug for tuples
+            // only up to 12 elements, and the flat form reached 16.
+            let windows_controls = (
                 msg_send![ui.windows_enabled, state],
                 msg_send![ui.show_minimized, state],
                 msg_send![ui.show_hidden_app_windows, state],
+                msg_send![ui.panel_close_enabled, state],
+                msg_send![ui.panel_minimize_enabled, state],
+                msg_send![ui.panel_hide_enabled, state],
+                msg_send![ui.panel_quit_enabled, state],
+            );
+            Some((
+                windows_controls,
                 msg_send![ui.thumbnails_enabled, indexOfSelectedItem],
                 msg_send![ui.focused_thumbnail_prewarm, state],
                 msg_send![ui.show_app_name_in_cards, state],
@@ -2175,8 +2188,16 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
 
         let rebuilt_matches = states
             == Some((
-                1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 2isize, 1isize, 1isize,
-                1isize, true,
+                (1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 1isize),
+                1isize,
+                1isize,
+                1isize,
+                1isize,
+                2isize,
+                1isize,
+                1isize,
+                1isize,
+                true,
             ));
         let refreshed_matches = refreshed == Some((0isize, 1isize, 0isize, 0isize, 2isize));
         let switch_follows_reload = switch_off == Some(0) && switch_on == Some(1);
@@ -2796,6 +2817,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             status_bar_text_size_value_label: std::ptr::null_mut(),
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
+            panel_close_enabled: std::ptr::null_mut(),
+            panel_minimize_enabled: std::ptr::null_mut(),
+            panel_hide_enabled: std::ptr::null_mut(),
+            panel_quit_enabled: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
             show_hidden_app_windows: std::ptr::null_mut(),
             show_other_desktops: std::ptr::null_mut(),

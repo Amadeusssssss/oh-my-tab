@@ -24,6 +24,7 @@ mod menu;
 mod mouse;
 mod onboarding;
 mod overlay;
+mod panel_actions;
 mod performance;
 mod pointer_locator;
 mod quick_actions;
@@ -942,6 +943,8 @@ extern "C" fn on_keyboard_layout_changed(_self: *mut c_void, _cmd: Sel, _arg: *m
             if !is_main {
                 let _: () = msg_send![_self as *mut AnyObject,
                     performSelectorOnMainThread: sel!(handleKeyboardLayoutChanged:),
+                    // (the handler below refreshes the layout cache and republishes the panel key
+                    // map, so a layout switch cannot leave the overlay matching stale keys)
                     withObject: std::ptr::null::<AnyObject>(),
                     waitUntilDone: false
                 ];
@@ -1218,6 +1221,16 @@ fn create_overlay_window() -> *mut AnyObject {
                 sel!(canBecomeKeyWindow),
                 overlay_window_can_become_key as *mut c_void,
                 types_bool.as_ptr(),
+            );
+            // Command chords do not arrive at keyDown:. AppKit offers them to performKeyEquivalent:
+            // (key window, then the view hierarchy, then the main menu), so the overlay's own
+            // Cmd+W/M/H/Q are matched here -- the same layer the settings window uses for its Cmd+Q.
+            let types_key_equiv = CString::new("B@:@").unwrap(); // -performKeyEquivalent:(NSEvent*) -> BOOL
+            class_addMethod(
+                cls,
+                sel!(performKeyEquivalent:),
+                overlay_window_perform_key_equivalent as *mut c_void,
+                types_key_equiv.as_ptr(),
             );
             objc_registerClassPair(cls);
             cls
@@ -1524,6 +1537,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleCardCloseAXResult:),
             overlay::on_card_close_ax_result as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handlePanelActionRefresh:),
+            overlay::on_panel_action_refresh as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2643,6 +2662,7 @@ pub fn run() {
             || arg == "--smoke-card-badges"
             || arg == "--smoke-selection-ring"
             || arg == "--smoke-space-state-matrix"
+            || arg == "--smoke-panel-keys"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -3185,9 +3205,27 @@ pub fn run() {
                     std::process::exit(1);
                 }
             }
+            // In-overlay action keys: the panel is now summoned and key, so drive the registered
+            // performKeyEquivalent: with real NSEvents. This covers method registration, the
+            // eligibility decision and the consumption rule; the system's own dispatch is the A2
+            // scenario's job (this runner says so rather than implying otherwise).
+            if std::env::args().any(|a| a == "--smoke-panel-keys")
+                && !crate::overlay::smoke_panel_key_equivalent()
+            {
+                eprintln!("[smoke-panel-keys] the panel key handler contract failed");
+                std::process::exit(1);
+            }
             log_info!("[smoke-overlay] summon survived");
             std::process::exit(0);
         }
+    }
+
+    // Smoke-test entry (--smoke-panel-keys) on its own: the handler needs a real overlay window,
+    // so it is exercised through the summon path above when both flags are given. Run alone, it
+    // reports that it needs the window rather than silently passing.
+    if std::env::args().any(|a| a == "--smoke-panel-keys") {
+        eprintln!("[smoke-panel-keys] needs the overlay window: run with --smoke-overlay --smoke-panel-keys");
+        std::process::exit(1);
     }
 
     // Settings layout smoke entry: open and traverse all eight pages on the real NSApplication

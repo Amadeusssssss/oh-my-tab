@@ -653,6 +653,15 @@ pub struct WindowsSection {
     // a window has no AX element (the AX window list is Space-filtered), so its card keeps the CG
     // title and is icon-only.
     pub show_other_desktops: bool,
+    // In-overlay action keys (⌘W / ⌘M / ⌘H / ⌘Q). Each acts on the HIGHLIGHTED card while the
+    // switcher panel is open, and each is gated by its own switch. All default off: ⌘Q quits an
+    // app and ⌘H hides one, so the honest default is opt-in -- and the panel already closes the
+    // selected card with backspace, so nothing is lost by starting off. Command is the required
+    // modifier in BOTH trigger modes: an Option+Tab user keeps holding Option and adds Command.
+    pub panel_close_enabled: bool,
+    pub panel_minimize_enabled: bool,
+    pub panel_hide_enabled: bool,
+    pub panel_quit_enabled: bool,
     // Overlay display position: "active_window" = follow the active window's screen,
     // "main" = always on the main screen. Defaults to following the active window.
     pub overlay_position: String,
@@ -668,6 +677,10 @@ impl Default for WindowsSection {
             show_minimized: false,
             show_hidden_app_windows: false,
             show_other_desktops: true,
+            panel_close_enabled: false,
+            panel_minimize_enabled: false,
+            panel_hide_enabled: false,
+            panel_quit_enabled: false,
             overlay_position: "active_window".to_string(),
             activation_mode: "hover".to_string(),
         }
@@ -1608,6 +1621,10 @@ impl Config {
             // A boolean cannot fail validation, so it is adopted unconditionally like the
             // other switches (same convention as the layout booleans above).
             self.windows.show_other_desktops = other.windows.show_other_desktops;
+            self.windows.panel_close_enabled = other.windows.panel_close_enabled;
+            self.windows.panel_minimize_enabled = other.windows.panel_minimize_enabled;
+            self.windows.panel_hide_enabled = other.windows.panel_hide_enabled;
+            self.windows.panel_quit_enabled = other.windows.panel_quit_enabled;
             if !errs
                 .iter()
                 .any(|e| e.starts_with("windows.overlay_position"))
@@ -2713,6 +2730,12 @@ mod tests {
         assert_err_count(&cfg, 0);
         assert!(!cfg.windows.show_minimized);
         assert!(!cfg.windows.show_hidden_app_windows);
+        // The in-overlay action keys ship OFF: they act on other apps (hide/quit especially), so
+        // opting in is the honest default.
+        assert!(!cfg.windows.panel_close_enabled);
+        assert!(!cfg.windows.panel_minimize_enabled);
+        assert!(!cfg.windows.panel_hide_enabled);
+        assert!(!cfg.windows.panel_quit_enabled);
         assert!(cfg.windows.show_other_desktops);
     }
 
@@ -3449,6 +3472,43 @@ speed = 2.6
     }
 
     #[test]
+    fn a_config_without_the_panel_action_keys_defaults_them_off() {
+        // An existing config predates these switches; it must gain them switched OFF, and the
+        // surrounding values must survive untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[windows]\nshow_minimized = true\nactivation_mode = \"click\"\n",
+        )
+        .unwrap();
+        let (loaded, errs) = Config::load_or_default_from(&path);
+        assert!(errs.is_empty(), "errors: {:?}", errs);
+        assert!(!loaded.windows.panel_close_enabled);
+        assert!(!loaded.windows.panel_minimize_enabled);
+        assert!(!loaded.windows.panel_hide_enabled);
+        assert!(!loaded.windows.panel_quit_enabled);
+        assert!(loaded.windows.show_minimized);
+        assert_eq!(loaded.windows.activation_mode, "click");
+    }
+
+    #[test]
+    fn a_wrongly_typed_panel_action_key_falls_back_without_discarding_siblings() {
+        // The per-field promise: one bad TOML type must not take the valid neighbours with it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[windows]\npanel_quit_enabled = \"yes please\"\nshow_minimized = true\n",
+        )
+        .unwrap();
+        let (loaded, errs) = Config::load_or_default_from(&path);
+        assert!(!errs.is_empty(), "a wrong TOML type must be reported");
+        assert!(!loaded.windows.panel_quit_enabled);
+        assert!(loaded.windows.show_minimized, "the valid sibling is kept");
+    }
+
+    #[test]
     fn save_and_load_roundtrip_preserves_custom_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -3463,6 +3523,10 @@ speed = 2.6
         cfg.windows.activation_mode = "click".into();
         cfg.windows.show_minimized = true;
         cfg.windows.show_hidden_app_windows = false;
+        cfg.windows.panel_close_enabled = true;
+        cfg.windows.panel_minimize_enabled = true;
+        cfg.windows.panel_hide_enabled = true;
+        cfg.windows.panel_quit_enabled = true;
         // Non-default: the shipped default is true, so storing false proves the roundtrip.
         cfg.windows.show_other_desktops = false;
         cfg.windows.enabled = false; // non-default: verify the roundtrip
@@ -3501,6 +3565,10 @@ speed = 2.6
         assert_eq!(loaded.windows.activation_mode, "click");
         assert!(loaded.windows.show_minimized);
         assert!(!loaded.windows.show_hidden_app_windows);
+        assert!(loaded.windows.panel_close_enabled);
+        assert!(loaded.windows.panel_minimize_enabled);
+        assert!(loaded.windows.panel_hide_enabled);
+        assert!(loaded.windows.panel_quit_enabled);
         assert!(!loaded.windows.show_other_desktops);
         assert!(!loaded.windows.enabled);
         // Mouse profiles survive untouched (one wildcard + one per-device).

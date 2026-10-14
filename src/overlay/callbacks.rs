@@ -425,6 +425,10 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 minimized,
                 on_other_desktop,
             } => {
+                // Commit ends the session: retire sticky and the published claim now (the visual
+                // order-out is deferred), so a re-summon cannot inherit them.
+                clear_sticky();
+                publish_panel_snapshot(false);
                 vanish_overlay();
                 // Same as on_cmd_released: no settings-window handling needed (see comment
                 // there); the raise is deferred by one runloop turn so the vanish commits first.

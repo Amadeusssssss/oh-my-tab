@@ -42,6 +42,9 @@ struct ChangeFlags {
     key_bindings: bool,
     keystroke_display: bool,
     updates: bool,
+    // Any of the four in-panel action switches changed: the panel's published key snapshot has to
+    // be rebuilt, or the tap keeps claiming (or ignoring) the old chord set.
+    panel_actions: bool,
 }
 
 /// Whether an already-open settings window has to re-read the config in place after this change.
@@ -51,6 +54,7 @@ struct ChangeFlags {
 /// thumbnail size hit exactly that).
 fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
     flags.modifier
+        || flags.panel_actions
         || flags.thumbnails
         || flags.focused_thumbnail_prewarm
         || flags.thumbnail_size
@@ -92,6 +96,11 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         updates: startup
             || old.updates.automatically_check != new.updates.automatically_check
             || old.updates.automatically_download != new.updates.automatically_download,
+        panel_actions: startup
+            || old.windows.panel_close_enabled != new.windows.panel_close_enabled
+            || old.windows.panel_minimize_enabled != new.windows.panel_minimize_enabled
+            || old.windows.panel_hide_enabled != new.windows.panel_hide_enabled
+            || old.windows.panel_quit_enabled != new.windows.panel_quit_enabled,
     }
 }
 
@@ -273,19 +282,41 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         }
     }
 
-    if flags.key_bindings || flags.modifier || flags.clipboard_shortcut {
+    // The panel's action switches change whether the tap must run at all, so they belong to the
+    // SAME branch as the binding switches: publishing a snapshot that claims chords while the tap
+    // is not running makes the switches look live while the keys still go to the app.
+    if flags.key_bindings || flags.modifier || flags.clipboard_shortcut || flags.panel_actions {
         // Publish first, then start: a tap that begins between the two must never read a stale
         // table. The published config is the settled one, so a binding that had to yield is gone
         // from the table as well. Stopping with both groups off is the graceful direction.
         crate::key_bindings::publish(&effective);
-        if crate::key_bindings::enabled_in(&effective) {
+        if crate::key_bindings::enabled_in(&effective)
+            || crate::panel_actions::configured_in(&effective)
+        {
             crate::key_bindings::start();
         } else if !matches!(source, ConfigChangeSource::Startup) {
             crate::key_bindings::stop();
         }
+        // The tolerated hold modifier follows the trigger mode, so a mode change republishes too.
+        let visible = crate::with_tab_state(|state_opt| {
+            state_opt
+                .as_ref()
+                .is_some_and(|state| state.visible || state.pending_first_show)
+        });
+        crate::overlay::publish_panel_snapshot(visible);
     }
     if flags.keystroke_display {
         crate::keystroke_display::apply_config_change(old, new);
+    }
+    if flags.panel_actions {
+        // Rebuild the tap-visible chord set. Visibility is read live here rather than cached: a
+        // switch flipped while the panel is open must take effect on the very next key.
+        let visible = crate::with_tab_state(|state_opt| {
+            state_opt
+                .as_ref()
+                .is_some_and(|state| state.visible || state.pending_first_show)
+        });
+        crate::overlay::publish_panel_snapshot(visible);
     }
     if flags.updates {
         crate::updater::set_automatic_checks(new.updates.automatically_check);
@@ -307,6 +338,34 @@ mod tests {
             change_flags(&cfg, &cfg, ConfigChangeSource::Settings),
             ChangeFlags::default()
         );
+    }
+
+    #[test]
+    fn a_panel_action_switch_changes_alone_and_republishes() {
+        // Each of the four switches must be detected on its own: a flag that only fired when two
+        // changed would leave the tap claiming a chord the user had just switched off.
+        for set in [
+            |c: &mut Config| c.windows.panel_close_enabled = true,
+            |c: &mut Config| c.windows.panel_minimize_enabled = true,
+            |c: &mut Config| c.windows.panel_hide_enabled = true,
+            |c: &mut Config| c.windows.panel_quit_enabled = true,
+        ] {
+            let old = Config::default();
+            let mut new = old.clone();
+            set(&mut new);
+            let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+            assert!(
+                flags.panel_actions,
+                "a panel action switch must be detected"
+            );
+            assert!(needs_in_place_control_sync(&flags));
+        }
+        // Toggling one back off is a change too.
+        let mut on = Config::default();
+        on.windows.panel_quit_enabled = true;
+        let mut off = on.clone();
+        off.windows.panel_quit_enabled = false;
+        assert!(change_flags(&on, &off, ConfigChangeSource::Settings).panel_actions);
     }
 
     #[test]

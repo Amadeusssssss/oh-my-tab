@@ -699,82 +699,95 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     let summon_focus_key = result.summon_focus_key;
     let subscriptions = window_server_candidates();
 
-    let applied = crate::space_transition::while_stable(result.space_transition_generation, || {
-        with_tab_state(|state_opt| {
-            // Nothing to apply into: the guard resets the flag when the else branch returns.
-            let state = state_opt.as_mut()?;
-            let selected_key = state
-                .windows
-                .get(state.selected)
-                .map(|window| (window.pid, window.window_id));
-            let mut mru = state.mru.clone();
-            for (key, timestamp) in result.mru {
-                if mru.get(&key).is_none_or(|current| *current < timestamp) {
-                    mru.insert(key, timestamp);
+    let applied =
+        crate::space_transition::while_stable(result.space_transition_generation, || {
+            with_tab_state(|state_opt| {
+                // Nothing to apply into: the guard resets the flag when the else branch returns.
+                let state = state_opt.as_mut()?;
+                let selected_key = state
+                    .windows
+                    .get(state.selected)
+                    .map(|window| (window.pid, window.window_id));
+                let mut mru = state.mru.clone();
+                for (key, timestamp) in result.mru {
+                    if mru.get(&key).is_none_or(|current| *current < timestamp) {
+                        mru.insert(key, timestamp);
+                    }
                 }
-            }
-            let replace_pid = result.replace_pid;
-            let active_key = result.active_key;
-            // A directed refresh replaces only the target PID; cards and ordering memory for every
-            // other application remain intact.
-            let mut sorted_windows =
-                merge_refreshed_windows(&state.windows, replace_pid, result.windows);
-            sort_windows_by_mru(&mut sorted_windows, &mru, std::time::Instant::now());
-            if replace_pid.is_none() {
-                // Re-establish one frontmost representative after a full merge so an old snapshot
-                // cannot leave multiple stale is_active flags behind.
-                for window in &mut sorted_windows {
-                    window.is_active = false;
+                let replace_pid = result.replace_pid;
+                let active_key = result.active_key;
+                // A directed refresh replaces only the target PID; cards and ordering memory for every
+                // other application remain intact.
+                let mut sorted_windows =
+                    merge_refreshed_windows(&state.windows, replace_pid, result.windows);
+                sort_windows_by_mru(&mut sorted_windows, &mru, std::time::Instant::now());
+                if replace_pid.is_none() {
+                    // Re-establish one frontmost representative after a full merge so an old snapshot
+                    // cannot leave multiple stale is_active flags behind.
+                    for window in &mut sorted_windows {
+                        window.is_active = false;
+                    }
+                    if let Some(first) = sorted_windows.first_mut() {
+                        first.is_active = true;
+                    }
+                } else if let Some(active_key) = active_key {
+                    for window in &mut sorted_windows {
+                        window.is_active = (window.pid, window.window_id) == active_key;
+                    }
                 }
-                if let Some(first) = sorted_windows.first_mut() {
-                    first.is_active = true;
+                let set_changed = replace_pid.is_some() || {
+                    let old: HashSet<(i32, u32)> =
+                        state.windows.iter().map(|w| (w.pid, w.window_id)).collect();
+                    let new: HashSet<(i32, u32)> = sorted_windows
+                        .iter()
+                        .map(|w| (w.pid, w.window_id))
+                        .collect();
+                    old != new
+                };
+                // A per-card STATE change with the same window set. Minimizing a window while
+                // `show_minimized` is on keeps every window key while flipping that card, so a
+                // consumer that only keyed off `set_changed` would never learn about it -- the A2
+                // scenario could not observe a correct Cmd+M. Narrow on purpose: only the minimized
+                // flag, which is the one this feature changes without touching the set.
+                let state_refresh_changed = state.windows.iter().zip(sorted_windows.iter()).any(
+                    |(old_window, new_window)| {
+                        (old_window.pid, old_window.window_id)
+                            == (new_window.pid, new_window.window_id)
+                            && old_window.minimized != new_window.minimized
+                    },
+                );
+                let was_visible = state.visible;
+                let windows = if was_visible && !set_changed {
+                    preserve_existing_window_order(&state.windows, sorted_windows)
+                } else {
+                    sorted_windows
+                };
+                // Selection follows the target window, not the live list index:
+                // - user_picked=true (user navigated): pin to selected_target_key; reorders cannot move it.
+                // - user_picked=false (still the first-frame default): lock to the summon-time target so a
+                //   refresh doesn't re-pick just because the MRU order was bumped by the frontmost window.
+                let selected = select_index_after_refresh(
+                    state.user_picked,
+                    state.selected_target_key,
+                    selected_key,
+                    state.selected,
+                    &windows,
+                );
+                // Set-level change (windows added/removed): only this needs a full overlay rebuild. A pure
+                // reorder (MRU bumped by the frontmost, surface flip) only updates data without rebuilding
+                // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
+                // (replace_pid) swapping a PID's cards also counts as a set change.
+                state.windows = windows;
+                WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
+                state.selected = selected;
+                state.mru = mru;
+                if state.windows.is_empty() {
+                    state.visible = false;
                 }
-            } else if let Some(active_key) = active_key {
-                for window in &mut sorted_windows {
-                    window.is_active = (window.pid, window.window_id) == active_key;
-                }
-            }
-            let set_changed = replace_pid.is_some() || {
-                let old: HashSet<(i32, u32)> =
-                    state.windows.iter().map(|w| (w.pid, w.window_id)).collect();
-                let new: HashSet<(i32, u32)> = sorted_windows
-                    .iter()
-                    .map(|w| (w.pid, w.window_id))
-                    .collect();
-                old != new
-            };
-            let was_visible = state.visible;
-            let windows = if was_visible && !set_changed {
-                preserve_existing_window_order(&state.windows, sorted_windows)
-            } else {
-                sorted_windows
-            };
-            // Selection follows the target window, not the live list index:
-            // - user_picked=true (user navigated): pin to selected_target_key; reorders cannot move it.
-            // - user_picked=false (still the first-frame default): lock to the summon-time target so a
-            //   refresh doesn't re-pick just because the MRU order was bumped by the frontmost window.
-            let selected = select_index_after_refresh(
-                state.user_picked,
-                state.selected_target_key,
-                selected_key,
-                state.selected,
-                &windows,
-            );
-            // Set-level change (windows added/removed): only this needs a full overlay rebuild. A pure
-            // reorder (MRU bumped by the frontmost, surface flip) only updates data without rebuilding
-            // the list — otherwise the overlay "keeps jumping after it opened". A directed refresh
-            // (replace_pid) swapping a PID's cards also counts as a set change.
-            state.windows = windows;
-            WINDOW_COUNT.store(state.windows.len(), std::sync::atomic::Ordering::Release);
-            state.selected = selected;
-            state.mru = mru;
-            if state.windows.is_empty() {
-                state.visible = false;
-            }
-            Some((was_visible, set_changed))
-        })
-    });
-    let (was_visible, set_changed) = match applied {
+                Some((was_visible, set_changed, state_refresh_changed))
+            })
+        });
+    let (was_visible, set_changed, state_refresh_changed) = match applied {
         Some(Some(applied)) => applied,
         Some(None) => return,
         None => {
@@ -812,6 +825,12 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     if crate::e2e_state::is_enabled() {
         if set_changed {
             crate::e2e_state::record("refresh");
+        } else if state_refresh_changed {
+            // The candidate SET is unchanged but a per-card state is not: minimizing a window with
+            // show_minimized on keeps the same window keys while flipping that card's minimized
+            // flag, so a scenario waiting for the new state would otherwise never see a frame and
+            // would fail a correct implementation.
+            crate::e2e_state::record("state_refresh");
         }
         crate::e2e_state::record_if_space_context_changed();
     }

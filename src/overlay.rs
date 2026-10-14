@@ -344,10 +344,16 @@ mod cancel;
 mod card_close;
 mod cards;
 pub(crate) mod hover;
+mod panel_keys;
 use callbacks::*;
 use cancel::*;
 use cards::*;
 pub(crate) use cards::{smoke_card_badges, smoke_selection_ring};
+pub(crate) use panel_keys::smoke_panel_key_equivalent;
+pub(crate) use panel_keys::{
+    clear_sticky, is_sticky, on_panel_action_refresh, overlay_window_perform_key_equivalent,
+    publish_panel_snapshot, take_action_focus,
+};
 
 use card_close::*;
 pub(crate) use card_close::{
@@ -1626,6 +1632,14 @@ pub(crate) fn update_status_label() {
 }
 
 pub(crate) fn hide_overlay() {
+    // The session is over: end the sticky session and stop claiming chords, so the next summon
+    // starts clean. The physical held record survives (see clear_sticky): a key the user is still
+    // holding must keep its ownership until its release.
+    clear_sticky();
+    publish_panel_snapshot(false);
+    // The A2 layer asserts "the panel ended" by reading the snapshot, and this transition is what
+    // it waits for; without a frame here the script keeps reading the previous visible=true.
+    crate::e2e_state::record("panel-closed");
     stop_hover_timer();
     clear_thumbnail_scroll_drag();
     set_thumbnail_scroller_hover(false, false);

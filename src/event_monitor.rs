@@ -236,6 +236,14 @@ unsafe extern "C" fn event_tap_callback(
                 crate::enqueue_global_event(switcher_tab_event(flags));
                 return std::ptr::null_mut();
             }
+            // A key the panel already claimed belongs to the overlay (its own ⌘W/M/H/Q). The
+            // clipboard interception sits in its own tap and must not swallow that chord: the
+            // binding engine runs first (installed later at HEAD_INSERT) and records the claim, so
+            // this tap defers to it. Without this, a clipboard chord set to ⌘W would make the
+            // panel's own key unreachable.
+            if crate::panel_actions::has_pending_action(keycode) {
+                return event;
+            }
             if clipboard_shortcut_matches(keycode, flags) {
                 // Side-button mappings that synthesize this chord intentionally loop back through
                 // the session tap and can open clipboard history as well.

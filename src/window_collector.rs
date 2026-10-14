@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::app_identity::{resolve_app_identity, AppIdentity};
 use crate::config::CONFIG;
 use crate::ffi::{
-    kCFBooleanFalse, AXError, AXUIElementCopyAttributeValue,
+    kCFBooleanFalse, kCFBooleanTrue, AXError, AXUIElementCopyAttributeValue,
     AXUIElementCopyMultipleAttributeValues, AXUIElementCreateApplication, AXUIElementGetTypeID,
     AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
     AXUIElementSetMessagingTimeout, AXValueGetType, AXValueGetTypeID, AXValueGetValue,
@@ -53,7 +53,8 @@ pub(crate) use raise::activate_pid_with_api;
 pub(crate) use raise::{
     activate_pid, ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
     clear_ax_window_cache_for_window, close_ax_window, focused_window_cgwid,
-    forget_non_normal_window, raise_window_fast,
+    forget_non_normal_window, hide_application, raise_window_fast, set_ax_minimized,
+    terminate_application,
 };
 pub(crate) use raiser::{begin_raise, note_focused_window};
 pub(crate) use raiser::{

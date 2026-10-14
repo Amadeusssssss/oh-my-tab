@@ -148,6 +148,32 @@ pub(crate) fn is_printable(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|ch| !ch.is_control())
 }
 
+/// The physical keycode that produces `character` on the current layout, or `None` when the
+/// layout cannot be read or produces it on no key.
+///
+/// The overlay's action keys are matched by the character the user intends (w/m/h/q) rather than by
+/// a fixed position, so AZERTY and QWERTZ work. The lookup has to happen on the main thread, which
+/// is why it is done while building the panel snapshot rather than inside the event tap.
+pub(crate) fn keycode_for_character(character: char) -> Option<u16> {
+    if !crate::is_main_thread() {
+        crate::debug_assert_main_thread();
+        return None;
+    }
+    // Search the same printable ANSI positions the glyph table covers; the layout translation
+    // decides which of them yields the requested character.
+    for &(keycode, _) in ANSI_KEY_GLYPHS {
+        let Ok(Some(text)) = translate_unmodified(keycode) else {
+            continue;
+        };
+        // Exactly this character, on its own: a composed or multi-character translation is not a
+        // plain key, and the caller wants the single key that types it.
+        if text.chars().count() == 1 && text.starts_with(character) {
+            return Some(keycode);
+        }
+    }
+    None
+}
+
 /// Retained source reference keeps the borrowed CFData returned by TISGetInputSourceProperty
 /// alive. TIS APIs are main-thread-only in AppKit processes; all access is from the panel timer.
 struct LayoutData {
@@ -223,6 +249,15 @@ pub(crate) fn refresh_layout_cache() {
             }
         }
     }
+    // The panel's chord map is resolved from this layout, so a layout switch has to republish it:
+    // otherwise the overlay keeps matching the previous layout's physical keys while the user types
+    // on the new one (QWERTY -> AZERTY would keep W/M/H/Q where they were).
+    let visible = crate::with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .is_some_and(|state| state.visible || state.pending_first_show)
+    });
+    crate::overlay::publish_panel_snapshot(visible);
 }
 
 /// Borrowed notification name exported by HIToolbox for NSDistributedNotificationCenter.
@@ -322,60 +357,61 @@ unsafe fn translate_with_layout(layout: *const u8, keycode: u16) -> Result<Optio
 }
 
 fn ansi_key_glyph(keycode: u16) -> Option<String> {
-    const ANSI_KEY_GLYPHS: &[(u16, &str)] = &[
-        (0, "a"),
-        (1, "s"),
-        (2, "d"),
-        (3, "f"),
-        (4, "h"),
-        (5, "g"),
-        (6, "z"),
-        (7, "x"),
-        (8, "c"),
-        (9, "v"),
-        (11, "b"),
-        (keyboard::VK_Q, "q"),
-        (13, "w"),
-        (14, "e"),
-        (15, "r"),
-        (16, "y"),
-        (17, "t"),
-        (18, "1"),
-        (19, "2"),
-        (20, "3"),
-        (21, "4"),
-        (22, "6"),
-        (23, "5"),
-        (24, "="),
-        (25, "9"),
-        (26, "7"),
-        (27, "-"),
-        (28, "8"),
-        (29, "0"),
-        (30, "]"),
-        (31, "o"),
-        (32, "u"),
-        (33, "["),
-        (34, "i"),
-        (35, "p"),
-        (37, "l"),
-        (38, "j"),
-        (39, "'"),
-        (40, "k"),
-        (41, ";"),
-        (42, "\\"),
-        (43, ","),
-        (44, "/"),
-        (45, "n"),
-        (46, "m"),
-        (47, "."),
-        (50, "`"),
-    ];
     ANSI_KEY_GLYPHS
         .iter()
         .find(|(code, _)| *code == keycode)
         .map(|(_, glyph)| (*glyph).to_string())
 }
+
+const ANSI_KEY_GLYPHS: &[(u16, &str)] = &[
+    (0, "a"),
+    (1, "s"),
+    (2, "d"),
+    (3, "f"),
+    (4, "h"),
+    (5, "g"),
+    (6, "z"),
+    (7, "x"),
+    (8, "c"),
+    (9, "v"),
+    (11, "b"),
+    (keyboard::VK_Q, "q"),
+    (13, "w"),
+    (14, "e"),
+    (15, "r"),
+    (16, "y"),
+    (17, "t"),
+    (18, "1"),
+    (19, "2"),
+    (20, "3"),
+    (21, "4"),
+    (22, "6"),
+    (23, "5"),
+    (24, "="),
+    (25, "9"),
+    (26, "7"),
+    (27, "-"),
+    (28, "8"),
+    (29, "0"),
+    (30, "]"),
+    (31, "o"),
+    (32, "u"),
+    (33, "["),
+    (34, "i"),
+    (35, "p"),
+    (37, "l"),
+    (38, "j"),
+    (39, "'"),
+    (40, "k"),
+    (41, ";"),
+    (42, "\\"),
+    (43, ","),
+    (44, "/"),
+    (45, "n"),
+    (46, "m"),
+    (47, "."),
+    (50, "`"),
+];
 
 #[cfg(test)]
 mod tests {

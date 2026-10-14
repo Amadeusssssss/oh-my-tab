@@ -1302,6 +1302,22 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             .map(|cfg| cfg.key_bindings.enabled)
             .unwrap_or(false)
     ));
+    // In-overlay action keys: whether the panel currently claims any chord, and which switch is on.
+    // A scenario asserts the claim follows the switch AND the panel's visibility -- neither alone
+    // decides it, and a self-report cannot be inferred from the key handler's return value.
+    // The EFFECTIVE state, not the raw config: a development launch switch can override the
+    // switches for one run, and a scenario that asserted the config would be asserting a value the
+    // running app is not using.
+    let panel = crate::panel_actions::effective();
+    json.push_str(&format!(
+        "  \"panel_actions\": {{\"claims\": {}, \"visible\": {}, \"close\": {}, \"minimize\": {}, \"hide\": {}, \"quit\": {}}},\n",
+        crate::panel_actions::claims_any(),
+        panel.visible,
+        panel.close,
+        panel.minimize,
+        panel.hide,
+        panel.quit,
+    ));
     json.push_str(&format!(
         "  \"key_bindings_entries\": {},\n",
         crate::config::CONFIG

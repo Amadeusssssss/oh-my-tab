@@ -28,6 +28,10 @@ pub(super) enum ControlField {
     StatusBarTextSize,
     OverlayPosition,
     ActivationMode,
+    PanelCloseEnabled,
+    PanelMinimizeEnabled,
+    PanelHideEnabled,
+    PanelQuitEnabled,
     CornerRadius,
     Modifier,
     KeystrokeDisplayEnabled,
@@ -99,6 +103,10 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.status_bar_text_size, ControlField::StatusBarTextSize))
             .or_else(|| m(u.overlay_position, ControlField::OverlayPosition))
             .or_else(|| m(u.activation_mode, ControlField::ActivationMode))
+            .or_else(|| m(u.panel_close_enabled, ControlField::PanelCloseEnabled))
+            .or_else(|| m(u.panel_minimize_enabled, ControlField::PanelMinimizeEnabled))
+            .or_else(|| m(u.panel_hide_enabled, ControlField::PanelHideEnabled))
+            .or_else(|| m(u.panel_quit_enabled, ControlField::PanelQuitEnabled))
             .or_else(|| m(u.corner_radius, ControlField::CornerRadius))
             .or_else(|| m(u.modifier, ControlField::Modifier))
             .or_else(|| {
@@ -511,6 +519,22 @@ fn apply_control_field(field: ControlField) {
                         _ => "hover",
                     }
                     .into();
+                }
+                ControlField::PanelCloseEnabled => {
+                    let state: isize = msg_send![u.panel_close_enabled, state];
+                    cfg.windows.panel_close_enabled = state == 1;
+                }
+                ControlField::PanelMinimizeEnabled => {
+                    let state: isize = msg_send![u.panel_minimize_enabled, state];
+                    cfg.windows.panel_minimize_enabled = state == 1;
+                }
+                ControlField::PanelHideEnabled => {
+                    let state: isize = msg_send![u.panel_hide_enabled, state];
+                    cfg.windows.panel_hide_enabled = state == 1;
+                }
+                ControlField::PanelQuitEnabled => {
+                    let state: isize = msg_send![u.panel_quit_enabled, state];
+                    cfg.windows.panel_quit_enabled = state == 1;
                 }
                 ControlField::CornerRadius => {
                     // Corner radius is a numeric text field on the notification path; it
@@ -1058,6 +1082,10 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
         ui.status_bar_text_size_value_label,
         ui.overlay_position,
         ui.activation_mode,
+        ui.panel_close_enabled,
+        ui.panel_minimize_enabled,
+        ui.panel_hide_enabled,
+        ui.panel_quit_enabled,
         ui.corner_radius,
         ui.modifier,
     ] {
@@ -1354,6 +1382,17 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 0
             };
             let _: () = msg_send![u.modifier, selectItemAtIndex: modifier_idx];
+
+            // The in-overlay action switches follow a reload like every other control: a config
+            // file edit or a defaults restore must not leave the page showing the old state.
+            for (control, on) in [
+                (u.panel_close_enabled, cfg.windows.panel_close_enabled),
+                (u.panel_minimize_enabled, cfg.windows.panel_minimize_enabled),
+                (u.panel_hide_enabled, cfg.windows.panel_hide_enabled),
+                (u.panel_quit_enabled, cfg.windows.panel_quit_enabled),
+            ] {
+                let _: () = msg_send![control, setState: if on { 1isize } else { 0isize }];
+            }
 
             let _: () = msg_send![
                 u.keystroke_display_enabled,

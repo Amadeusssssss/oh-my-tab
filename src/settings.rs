@@ -240,6 +240,11 @@ pub(super) struct SettingsUi {
     windows_enabled: *mut AnyObject,   // app-switcher master switch
     overlay_position: *mut AnyObject,  // overlay position (follow active window / main screen)
     activation_mode: *mut AnyObject,   // activation mode (hover / click)
+    // In-overlay action keys (Cmd+W / M / H / Q on the highlighted card); all default off.
+    panel_close_enabled: *mut AnyObject,
+    panel_minimize_enabled: *mut AnyObject,
+    panel_hide_enabled: *mut AnyObject,
+    panel_quit_enabled: *mut AnyObject,
     keystroke_display_enabled: *mut AnyObject,
     keystroke_display_mode: *mut AnyObject,
     keystroke_display_tap_level: *mut AnyObject,
@@ -407,6 +412,10 @@ const SETTINGS_SECTION_HEADER_GAP: f64 = 24.0;
 const SETTINGS_CONTROL_TRAILING_INSET: f64 = 16.0;
 /// Clear space between a localized row label and its control column.
 pub(crate) const SETTINGS_CONTROL_LABEL_GAP: f64 = 16.0;
+/// Vertical offset that centers a 32pt control inside a described (two-line) row. Every described
+/// row in the settings pages positions its control this way; the value is a token so a call site
+/// does not carry its own copy of the layout number.
+pub(crate) const SETTINGS_DESCRIBED_CONTROL_OFFSET: f64 = 10.0;
 
 /// The action-type popup items; index maps 1:1 to semantics (shared by render and the
 /// change handler).
@@ -1553,6 +1562,20 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 _ => 0,
             };
             let _: () = msg_send![ui.activation_mode, selectItemAtIndex: activation_idx as isize];
+            // In-overlay action keys: four independent switches, off by default. They must be filled
+            // here (the ordinary load path), not only by the external config-change refresh, or a
+            // freshly opened or rebuilt page shows them off while the config says otherwise.
+            for (control, on) in [
+                (ui.panel_close_enabled, cfg.windows.panel_close_enabled),
+                (
+                    ui.panel_minimize_enabled,
+                    cfg.windows.panel_minimize_enabled,
+                ),
+                (ui.panel_hide_enabled, cfg.windows.panel_hide_enabled),
+                (ui.panel_quit_enabled, cfg.windows.panel_quit_enabled),
+            ] {
+                let _: () = msg_send![control, setState: if on { 1isize } else { 0isize }];
+            }
             // log_level: popup index 0..1 = debug, info; default index 1 (info).
             let ll_idx = match cfg.logging.level.as_str() {
                 "debug" => 0,

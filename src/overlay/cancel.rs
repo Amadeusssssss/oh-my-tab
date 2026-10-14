@@ -66,6 +66,20 @@ fn overlay_window_resigned_inner() {
     if card_close_in_progress() {
         return;
     }
+    // A panel action that changed the frontmost app (hide/quit) makes this panel resign key as a
+    // side effect. That is not the user clicking away, and dismissing here would close the panel
+    // the feature promises to keep open.
+    if take_action_focus() {
+        log_debug!("[overlay] resign-key attributed to a panel action; the panel stays open");
+        // Losing key does not restore itself: the panel must be able to receive the very next
+        // key (Return, Esc, another action). Re-make it key so the session stays usable.
+        unsafe {
+            if let Some(window) = overlay_window_ptr() {
+                let _: () = msg_send![window, makeKeyWindow];
+            }
+        }
+        return;
+    }
     // Read and update the visibility in one short borrow. The release handler clears `visible`
     // before any AppKit call, so this callback can safely be re-entered by `hide_overlay`.
     let should_hide = with_tab_state(|state_opt| match state_opt.as_mut() {

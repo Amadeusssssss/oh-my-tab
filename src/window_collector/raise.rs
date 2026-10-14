@@ -693,6 +693,84 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
     }
 }
 
+/// Set a window's minimized state via AX, the same mutation the arrow-key window management
+/// performs. Targets one exact window by its CGWindowID, unlike the frontmost-window entry in
+/// `window_management` -- the switcher acts on the HIGHLIGHTED card. Returns whether AX accepted
+/// the write; the caller must not treat that as "the window is now minimized", since the state is
+/// observable only through a later scan.
+pub(crate) fn set_ax_minimized(pid: i32, cgwid: u32, minimized: bool) -> bool {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.5);
+        let windows_key = cf_string_new("AXWindows");
+        let mut windows_array: *const c_void = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
+        CFRelease(windows_key);
+        CFRelease(app);
+        if err != K_AX_SUCCESS || windows_array.is_null() {
+            return false;
+        }
+        let minimized_key = cf_string_new("AXMinimized");
+        let mut ok = false;
+        let count = CFArrayGetCount(windows_array);
+        for i in 0..count {
+            let element = CFArrayGetValueAtIndex(windows_array, i);
+            if element.is_null() || ax_window_cgwid(element) != Some(cgwid) {
+                continue;
+            }
+            let target = if minimized {
+                kCFBooleanTrue
+            } else {
+                kCFBooleanFalse
+            };
+            ok = AXUIElementSetAttributeValue(element, minimized_key, target) == K_AX_SUCCESS;
+            break;
+        }
+        CFRelease(minimized_key);
+        CFRelease(windows_array);
+        ok
+    }
+}
+
+/// Hide a running application (`NSRunningApplication hide`), the same call `command+H` makes.
+/// Returns whether the request was accepted; a later lifecycle notification reports the truth.
+/// Finder is deliberately excluded: macOS keeps a desktop owner, so hiding it makes the system
+/// re-promote it and the window reappears -- which read as a broken toggle.
+pub(crate) fn hide_application(pid: i32) -> bool {
+    unsafe {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            return false;
+        }
+        // "Hide" always hides. An already-hidden app stays hidden: the switch promises "hide the
+        // app", and un-hiding here would make the same key do the opposite of its label.
+        msg_send![app, hide]
+    }
+}
+
+/// Ask an application to quit (`NSRunningApplication terminate`). A successful call means only
+/// that the request was DELIVERED: a save-confirmation sheet, a cancelled quit, or a hung event
+/// loop all leave the process running. Callers must therefore never remove the app's cards on this
+/// return value -- the ordinary lifecycle notifications and refresh report what actually happened.
+pub(crate) fn terminate_application(pid: i32) -> bool {
+    unsafe {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            return false;
+        }
+        msg_send![app, terminate]
+    }
+}
+
 /// First half of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
 /// establishes the key window. Normal windows call it at commit time; minimized windows call it
 /// from the background raiser after being restored.

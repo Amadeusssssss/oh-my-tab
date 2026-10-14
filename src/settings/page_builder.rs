@@ -311,6 +311,45 @@ pub(super) unsafe fn build_switcher_page(
     )
     .1;
     bind_control(target, ui.activation_mode);
+    // In-overlay action keys: one switch per key, all default-off. They only apply while the
+    // overlay is the key window (Command is held throughout the summon) and each acts on the
+    // HIGHLIGHTED card. Every one of them is a described row: the chord is real information the
+    // user cannot guess from the label alone.
+    let panel_rows: [(&str, &str); 4] = [
+        ("settings.row_panel_close", "settings.desc_panel_close"),
+        (
+            "settings.row_panel_minimize",
+            "settings.desc_panel_minimize",
+        ),
+        ("settings.row_panel_hide", "settings.desc_panel_hide"),
+        ("settings.row_panel_quit", "settings.desc_panel_quit"),
+    ];
+    for (title_key, desc_key) in panel_rows {
+        let y = canvas.next_row(described_row_h);
+        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+        let control = SettingsRow::described(
+            switcher_view,
+            label_x,
+            y,
+            ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+            described_row_h,
+            &t(title_key),
+            &t(desc_key),
+            SettingsControl::switch(
+                ctrl_x + ctrl_w,
+                y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
+                row_h,
+                false,
+            ),
+        );
+        bind_control(target, control);
+        match title_key {
+            "settings.row_panel_close" => ui.panel_close_enabled = control,
+            "settings.row_panel_minimize" => ui.panel_minimize_enabled = control,
+            "settings.row_panel_hide" => ui.panel_hide_enabled = control,
+            _ => ui.panel_quit_enabled = control,
+        }
+    }
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     ui.corner_radius = SettingsRow::tall(

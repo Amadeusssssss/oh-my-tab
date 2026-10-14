@@ -169,7 +169,9 @@ fn start_configured_services() {
     // overwrite a newer one published while this thread was working, which would silently revive
     // bindings the user had just switched off. Starting is this thread's business, and `start`
     // re-reads the live config, so a late request cannot boot the engine for a disabled feature.
-    if crate::key_bindings::enabled_in(&config) {
+    // The tap serves the bindings AND the panel's own action keys; the same predicate decides
+    // whether it must run, so neither feature can be left inert by the other's switch.
+    if crate::key_bindings::enabled_in(&config) || crate::panel_actions::configured_in(&config) {
         crate::key_bindings::start();
     }
 }
