@@ -599,11 +599,60 @@ unsafe impl Sync for ExternalLinkButtonClass {}
 
 pub(super) static EXTERNAL_LINK_BUTTON_CLASS: OnceLock<ExternalLinkButtonClass> = OnceLock::new();
 pub(super) static SIDEBAR_BUTTON_CLASS: OnceLock<SidebarButtonClass> = OnceLock::new();
+/// How many times the sidebar label's ink has been measured since the process started.
+///
+/// The measurement renders a bitmap and scans it, which blocks the main thread long enough to be felt,
+/// so it must not sit on a colour-only path. This counter exists for `--smoke-settings-layout` to
+/// assert that: hover and a page switch change colour but cannot move geometry, so the count must not
+/// move either. Without a counter the regression is invisible -- re-measuring computes the same frame,
+/// so comparing frames before and after would report "unchanged" on the slow implementation too.
+pub(super) static SIDEBAR_INK_MEASUREMENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many ink measurements have run so far, for `--smoke-settings-layout` to assert that a
+/// colour-only path (hover, page switch) did not run one.
+pub(super) fn sidebar_ink_measurement_count() -> usize {
+    SIDEBAR_INK_MEASUREMENTS.load(Ordering::SeqCst)
+}
+
 pub(super) static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_HOVERED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
+    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+
+/// A sidebar label's resolved geometry, with the inputs that determine it.
+///
+/// `center_sidebar_label` is reached from colour-only paths -- switching pages re-applies every title
+/// even though only the accent colour moved -- and resolving the frame costs a bitmap render and scan
+/// on the main thread. Reusing the resolved frame whenever these inputs are unchanged keeps those
+/// paths off the measurement while still re-applying the frame, so a caller that changed the colour
+/// gets the geometry it already had rather than a stale one.
+/// The inputs that determine a sidebar label's resolved frame. Equality means "the frame is still
+/// valid", so this carries every input the resolution depends on and *only* those: a result field here
+/// would make an unchanged label look changed and the cache would never hit.
+#[derive(Clone, PartialEq, Debug)]
+struct SidebarLabelGeometry {
+    row_h: f64,
+    width: f64,
+    title: String,
+    font_size: f64,
+    /// The backing scale the ink was measured at. The measurement reads a bitmap, so its result is
+    /// quantised to the backing store's pixels: the same logical geometry can resolve differently on
+    /// a 1x and a 2x display, and a window moved between them must not reuse the other's answer.
+    /// `0.0` means the label had no window yet (see `center_sidebar_label`).
+    backing_scale: f64,
+}
+
+/// A resolved frame together with the inputs it was resolved from.
+#[derive(Clone, Debug)]
+struct ResolvedSidebarLabel {
+    key: SidebarLabelGeometry,
+    origin_y: f64,
+    height: f64,
+}
+
+static SIDEBAR_LABEL_GEOMETRY: LazyLock<MainThreadSlot<HashMap<usize, ResolvedSidebarLabel>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 pub(super) static SIDEBAR_UPDATE_DOTS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
@@ -634,6 +683,10 @@ pub(super) fn clear_sidebar_view_registries() {
     SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
     SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
     SIDEBAR_UPDATE_DOTS.lock().unwrap().clear();
+    // Same rule as the maps above: this one is keyed by the label's address, and a rebuild releases
+    // those labels. A new label landing on a recycled address would otherwise inherit the previous
+    // one's geometry and draw at the wrong height without ever measuring.
+    SIDEBAR_LABEL_GEOMETRY.lock().unwrap().clear();
 }
 
 pub(super) extern "C" fn external_link_mouse_entered(
@@ -2342,13 +2395,34 @@ unsafe fn set_sidebar_title_appearance(
     font: *mut AnyObject,
     color: *mut AnyObject,
 ) {
-    let title_ns = make_nsstring(title);
     let label = SIDEBAR_TITLE_LABELS
         .lock()
         .unwrap()
         .get(&(btn as usize))
         .map(|p| p.0)
         .unwrap_or(btn);
+    set_sidebar_title_text(label, title, font, color);
+    let button_frame: NSRect = msg_send![btn, frame];
+    center_sidebar_label(label, button_frame.size.height);
+}
+
+/// Apply a sidebar label's font, colour, text and line height, leaving its geometry alone.
+///
+/// The colour is baked into the attributed string (`setTextColor:` is ignored once an attributed value
+/// is set), so a colour-only change still has to rebuild that string -- but the colour cannot move a
+/// glyph. Keeping the geometry out of this half is what keeps `center_sidebar_label` out of the hover
+/// path: its ink measurement renders a bitmap and scans it, which made the sidebar hover visibly lag
+/// behind the cursor.
+unsafe fn set_sidebar_title_text(
+    label: *mut AnyObject,
+    title: &str,
+    font: *mut AnyObject,
+    color: *mut AnyObject,
+) {
+    if label.is_null() {
+        return;
+    }
+    let title_ns = make_nsstring(title);
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setStringValue: title_ns];
@@ -2359,8 +2433,6 @@ unsafe fn set_sidebar_title_appearance(
             crate::theme::LINE_HEIGHT_BODY_RATIO,
         ),
     );
-    let button_frame: NSRect = msg_send![btn, frame];
-    center_sidebar_label(label, button_frame.size.height);
     CFRelease(title_ns as *const c_void);
 }
 
@@ -2416,9 +2488,12 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
         .get(&(btn as usize))
         .map(|p| p.0);
     if let Some(label) = label {
+        // Colour only: the title, font and row height are unchanged, so the frame this label was
+        // already given still holds the ink on the row's mid-line. Re-centring here would re-run the
+        // bitmap measurement on every hover change.
         let title = crate::ffi::nsstring_to_rust(msg_send![label, stringValue]);
         let font: *mut AnyObject = msg_send![label, font];
-        set_sidebar_title_appearance(btn, &title, font, color);
+        set_sidebar_title_text(label, &title, font, color);
     }
     if let Some(icon) = SIDEBAR_ICON_VIEWS
         .lock()
@@ -2443,6 +2518,10 @@ pub(super) unsafe fn sidebar_hover_style_smoke(button: *mut AnyObject) -> bool {
     if layer.is_null() {
         return false;
     }
+    // A hover change alters colour only, so it must not re-measure the label's ink: that measurement
+    // renders the button into a bitmap and scans it, which is the difference between a hover that
+    // tracks the cursor and one that visibly lags it.
+    let before_hover = SIDEBAR_INK_MEASUREMENTS.load(Ordering::SeqCst);
     set_sidebar_hovered(button, true);
     let fill = crate::ffi::layer_background_color(layer);
     let observed_alpha = if fill.is_null() {
@@ -2458,12 +2537,246 @@ pub(super) unsafe fn sidebar_hover_style_smoke(button: *mut AnyObject) -> bool {
     } else {
         crate::ffi::CGColorGetAlpha(cleared)
     };
+    let measurements = SIDEBAR_INK_MEASUREMENTS.load(Ordering::SeqCst);
+    if measurements != before_hover {
+        log_info!(
+            "[smoke-settings-layout] a hover change re-measured the sidebar ink {} time(s); hover must not run the bitmap measurement",
+            measurements - before_hover
+        );
+        return false;
+    }
     (observed_alpha - expected_alpha).abs() <= 0.005 && cleared_alpha <= 0.005
 }
 
-/// Fit the sidebar label to its measured cell height and center that frame in the shared row.
-/// This compensates for AppKit's top-biased text drawing and is rerun when selection changes the
-/// font weight.
+/// The vertical span of a child view's ink, measured by rendering its PARENT and scanning only the
+/// child's columns: the view's own rendered position, in the parent's coordinate space (y-up).
+///
+/// Rendering the child alone is not equivalent. A label rendered by itself reports its ink at a
+/// position the window does not honour -- the two differ in the direction of the parent's flippedness
+/// -- so a correction and an assertion that both used the solo measurement agreed with each other
+/// while the screen disagreed with both.
+///
+/// The background is sampled at the parent's left edge, mid-height: that point is inside the rounded
+/// rect (so it never falls in a clipped corner, which would report the wash as ink) and outside the
+/// child's own columns.
+/// Convert a bitmap row range into a span in the parent view's own coordinate space.
+///
+/// `top`/`bottom` are pixel *row indices* (bottom >= top), and a row covers `[i, i+1)`, so its centre
+/// is `i + 0.5`. A flipped parent -- the sidebar buttons are flipped -- grows y downward, so its row
+/// order already matches its coordinates; a parent that is not flipped needs the rows mirrored about
+/// the bitmap. Treating a flipped parent as y-up mirrors the span, which is a real defect this
+/// repository shipped: the text is drawn visibly off the row's mid-line, and because the correction and
+/// the assertion shared the same measurement they agreed with each other while the screen disagreed
+/// with both. The conversion is a pure function so that mistake has an assertion of its own.
+pub(super) fn pixel_rows_to_parent_span(
+    top: isize,
+    bottom: isize,
+    pixels_high: isize,
+    scale_y: f64,
+    parent_origin_y: f64,
+    flipped: bool,
+) -> (f64, f64) {
+    let (a, b) = if flipped {
+        (top as f64 + 0.5, bottom as f64 + 0.5)
+    } else {
+        (
+            pixels_high as f64 - (bottom as f64 + 0.5),
+            pixels_high as f64 - (top as f64 + 0.5),
+        )
+    };
+    (parent_origin_y + a / scale_y, parent_origin_y + b / scale_y)
+}
+
+unsafe fn child_ink_span_in_parent(child: *mut AnyObject) -> Option<(f64, f64)> {
+    if child.is_null() {
+        return None;
+    }
+    let parent: *mut AnyObject = msg_send![child, superview];
+    if parent.is_null() {
+        return None;
+    }
+    let pb: NSRect = msg_send![parent, bounds];
+    if pb.size.width <= 1.0 || pb.size.height <= 1.0 {
+        return None;
+    }
+    let rep: *mut AnyObject = msg_send![parent, bitmapImageRepForCachingDisplayInRect: pb];
+    if rep.is_null() {
+        return None;
+    }
+    let _: () = msg_send![parent, cacheDisplayInRect: pb, toBitmapImageRep: rep];
+    let pw: isize = msg_send![rep, pixelsWide];
+    let ph: isize = msg_send![rep, pixelsHigh];
+    if pw <= 1 || ph <= 1 {
+        return None;
+    }
+    let sx = pw as f64 / pb.size.width;
+    let sy = ph as f64 / pb.size.height;
+    let cf: NSRect = msg_send![child, frame];
+    let x0 = ((cf.origin.x - pb.origin.x) * sx).floor().max(0.0) as isize;
+    let x1 = (((cf.origin.x - pb.origin.x) + cf.size.width) * sx)
+        .ceil()
+        .min(pw as f64) as isize;
+    if x1 <= x0 {
+        return None;
+    }
+    let bg_color: *mut AnyObject = msg_send![rep, colorAtX: 0isize, y: ph / 2];
+    if bg_color.is_null() {
+        return None;
+    }
+    let (br, bgc, bb, ba) = color_components(bg_color);
+    let mut top = isize::MAX;
+    let mut bottom = isize::MIN;
+    for py in 0..ph {
+        for px in x0..x1 {
+            let c: *mut AnyObject = msg_send![rep, colorAtX: px, y: py];
+            if c.is_null() {
+                continue;
+            }
+            let (r, g, b, a) = color_components(c);
+            if (r - br).abs() > 0.02
+                || (g - bgc).abs() > 0.02
+                || (b - bb).abs() > 0.02
+                || (a - ba).abs() > 0.02
+            {
+                top = top.min(py);
+                bottom = bottom.max(py);
+            }
+        }
+    }
+    if top > bottom {
+        return None;
+    }
+    let flipped: bool = msg_send![parent, isFlipped];
+    Some(pixel_rows_to_parent_span(
+        top,
+        bottom,
+        ph,
+        sy,
+        pb.origin.y,
+        flipped,
+    ))
+}
+
+/// A label's current title, for a diagnostic that has to name the row it is about. Never fails: an
+/// unreadable or empty title becomes a placeholder rather than aborting the check that uses it.
+unsafe fn sidebar_label_title(label: *mut AnyObject) -> String {
+    let value: *mut AnyObject = msg_send![label, stringValue];
+    if value.is_null() {
+        return String::from("<unreadable>");
+    }
+    let cstr: *const std::os::raw::c_char = msg_send![value, UTF8String];
+    if cstr.is_null() {
+        return String::from("<unreadable>");
+    }
+    std::ffi::CStr::from_ptr(cstr)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The RGBA components of a colour read back out of an RGB bitmap.
+unsafe fn color_components(color: *mut AnyObject) -> (f64, f64, f64, f64) {
+    let r: f64 = msg_send![color, redComponent];
+    let g: f64 = msg_send![color, greenComponent];
+    let b: f64 = msg_send![color, blueComponent];
+    let a: f64 = msg_send![color, alphaComponent];
+    (r, g, b, a)
+}
+
+/// Assert the sidebar's icon and title ink share one vertical mid-line on the real view tree.
+///
+/// This is the A1 assertion for the misalignment defect: the label's frame was centred while its ink
+/// was not, so the icon read as sitting high beside its title. It is measured from each view's own
+/// rendered pixels rather than from the frames, because the frames are exactly what was wrong. The
+/// tolerance is 1pt: one display pixel at 1x, and below the ~1.6pt error the defect produced.
+pub(super) unsafe fn debug_validate_sidebar_ink_alignment() -> bool {
+    // Every sidebar button registers both a label and an icon, so a label without one is itself an
+    // anomaly. It must fail rather than be filtered out: a dropped pair is a row this check silently
+    // stopped covering, which is the same "cannot decide reads as pass" hole as a failed measurement.
+    let mut rows: Vec<(*mut AnyObject, *mut AnyObject)> = Vec::new();
+    let mut unpaired = 0usize;
+    {
+        let labels = SIDEBAR_TITLE_LABELS.lock().unwrap();
+        let icons = SIDEBAR_ICON_VIEWS.lock().unwrap();
+        for (button, label) in labels.iter() {
+            match icons.get(button) {
+                Some(icon) => rows.push((label.0, icon.0)),
+                None => unpaired += 1,
+            }
+        }
+    }
+    if unpaired > 0 {
+        log_info!(
+            "[smoke-settings-layout] {unpaired} sidebar row(s) have a title but no icon, so alignment cannot be decided"
+        );
+        return false;
+    }
+    if rows.is_empty() {
+        log_info!("[smoke-settings-layout] no sidebar label/icon pair is registered to measure");
+        return false;
+    }
+    let mut checked = 0;
+    for (label, icon) in rows {
+        // Each view's ink is measured in its own space and then placed in the row through its own
+        // frame: both frames are subviews of the same button, so their origins are comparable.
+        // A row that cannot be measured is a failure, not a skip: the label falls back to plain
+        // box-centring when the measurement cannot read it, so skipping would let the very regression
+        // this asserts away report a pass. "Cannot decide" must never read as "aligned".
+        //
+        // Parent-rendered on purpose. A label rendered *by itself* reports an ink position the window
+        // does not honour -- it sits too high on the real settings window -- so a correction and
+        // an assertion that both used the solo render would agree with each other while the screen
+        // disagreed with both. That is exactly the self-confirming loop this replaced.
+        let (Some((icon_lo, icon_hi)), Some((label_lo, label_hi))) = (
+            child_ink_span_in_parent(icon),
+            child_ink_span_in_parent(label),
+        ) else {
+            log_info!(
+                "[smoke-settings-layout] sidebar ink is not measurable for one row, so alignment cannot be decided (label {:?})",
+                sidebar_label_title(label)
+            );
+            return false;
+        };
+        // Both spans are already measured in the button's space, which is the space the row's
+        // children are laid out in, so their mid-points are directly comparable.
+        let icon_mid = (icon_lo + icon_hi) / 2.0;
+        let label_mid = (label_lo + label_hi) / 2.0;
+        let delta = (label_mid - icon_mid).abs();
+        if delta > 1.0 {
+            log_info!(
+                "[smoke-settings-layout] sidebar ink misaligned for {:?}: icon mid {icon_mid:.2} (ink {icon_lo:.2}..{icon_hi:.2}), label mid {label_mid:.2} (ink {label_lo:.2}..{label_hi:.2}), delta {delta:.2}pt",
+                sidebar_label_title(label)
+            );
+            return false;
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        log_info!("[smoke-settings-layout] no sidebar row produced measurable ink");
+        return false;
+    }
+    log_info!(
+        "[smoke-settings-layout] sidebar icon and title ink share one mid-line ({checked} rows)"
+    );
+    true
+}
+
+/// Frame the sidebar label so its *inked* glyphs centre on the same line as the icon beside them.
+///
+/// Centring the label's frame is not enough, and no constant closes the gap: `cellSizeForBounds`
+/// returns the paragraph line box, whose height the style sets independently of the font
+/// (`theme::line_height(FONT_CONTROL, LINE_HEIGHT_BODY_RATIO)` = 19.6pt against a 16.49pt natural
+/// line), and AppKit pins the *baseline* near the box bottom, so every extra point of line height is
+/// empty space above the glyphs. Centring that box therefore draws the ink low -- measured on the real
+/// control low, and the error is content-dependent -- larger once a title has a descender such as `g`
+/// or `p` -- so a fixed compensation would misalign whole locales: exactly the class of bug this
+/// replaces.
+///
+/// The ink position is therefore measured from the rendered control, not derived.
+/// `child_ink_span_in_parent` renders the button and returns the label's ink inside it, which is the
+/// position the window actually draws; centring that mid-line on the row is then arithmetic. The rule
+/// is the same for a one-line and a wrapped title -- it centres whatever was drawn -- and it falls
+/// back to the plain box-centred position when the measurement is unavailable, which is the previous
+/// behaviour rather than a wrong guess.
 unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
     if label.is_null() {
         return;
@@ -2473,6 +2786,46 @@ unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
         return;
     }
     let bounds: NSRect = msg_send![label, bounds];
+    // The cache key is computed before anything is measured. A colour-only caller (page switch, hover)
+    // passes the same title, font and row height as last time, so the resolved frame below is still
+    // correct and the bitmap measurement can be skipped entirely.
+    let title = sidebar_label_title(label);
+    let font: *mut AnyObject = msg_send![label, font];
+    let font_size: f64 = if font.is_null() {
+        0.0
+    } else {
+        msg_send![font, pointSize]
+    };
+    // The result is read off a bitmap, so it depends on the backing store. A label with no window yet
+    // reports no scale; that case still resolves correctly (verified: the frame it produces is where
+    // the attached, displayed window draws the ink), and it is keyed apart from any attached pass so
+    // the two can never be confused for each other.
+    let window: *mut AnyObject = msg_send![label, window];
+    let backing_scale: f64 = if window.is_null() {
+        0.0
+    } else {
+        msg_send![window, backingScaleFactor]
+    };
+    let key = SidebarLabelGeometry {
+        row_h,
+        width: bounds.size.width,
+        title,
+        font_size,
+        backing_scale,
+    };
+    let cached = SIDEBAR_LABEL_GEOMETRY
+        .lock()
+        .unwrap()
+        .get(&(label as usize))
+        .filter(|c| c.key == key)
+        .map(|c| (c.origin_y, c.height));
+    if let Some((origin_y, height)) = cached {
+        let mut frame: NSRect = msg_send![label, frame];
+        frame.origin.y = origin_y;
+        frame.size.height = height;
+        let _: () = msg_send![label, setFrame: frame];
+        return;
+    }
     let bounds = NSRect::new(
         bounds.origin,
         NSSize::new(bounds.size.width, row_h.max(1.0)),
@@ -2482,9 +2835,49 @@ unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
         return;
     }
     let mut frame: NSRect = msg_send![label, frame];
-    frame.origin.y = (row_h - measured.height).max(0.0) / 2.0;
+    frame.origin.y = sidebar_label_frame_y(row_h, measured.height);
     frame.size.height = measured.height;
     let _: () = msg_send![label, setFrame: frame];
+    // The ink is only measurable with the frame settled, so the correction is a second pass: measure
+    // what this frame actually draws, then move the frame by the difference. The measurement renders
+    // the *button* and scans the label's columns, because the position a label reports when rendered
+    // alone is not the position the window draws it at; correcting against the
+    // solo render would move the text to a place the screen never agrees with. The returned span is
+    // in the button's space, so the label's own frame origin is already included in it.
+    SIDEBAR_INK_MEASUREMENTS.fetch_add(1, Ordering::SeqCst);
+    if let Some((ink_lo, ink_hi)) = child_ink_span_in_parent(label) {
+        let ink_mid = (ink_lo + ink_hi) / 2.0;
+        let shift = row_h / 2.0 - ink_mid;
+        if shift.is_finite() && shift.abs() > 0.01 {
+            // Keep the label inside its row: a shift larger than the ink's own room would be a
+            // measurement artefact, not a correction.
+            let room = (row_h - frame.size.height).max(0.0) / 2.0;
+            let clamped = shift.clamp(-room - 1.0, room + 1.0);
+            frame.origin.y += clamped;
+            let _: () = msg_send![label, setFrame: frame];
+        }
+    } else {
+        // Not measurable: leave the frame box-centred and do not cache it, so a later call with the
+        // same inputs tries again instead of pinning a position that was never verified.
+        return;
+    }
+    SIDEBAR_LABEL_GEOMETRY.lock().unwrap().insert(
+        label as usize,
+        ResolvedSidebarLabel {
+            key,
+            origin_y: frame.origin.y,
+            height: frame.size.height,
+        },
+    );
+}
+
+/// Frame origin for a label of `frame_h` inside a `row_h` row, before the ink correction: the box
+/// centred in the row, never above it.
+fn sidebar_label_frame_y(row_h: f64, frame_h: f64) -> f64 {
+    if !row_h.is_finite() || !frame_h.is_finite() || frame_h <= 0.0 {
+        return 0.0;
+    }
+    (row_h - frame_h).max(0.0) / 2.0
 }
 
 /// Show or hide the small update marker attached to a sidebar button's icon.
@@ -3585,9 +3978,10 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 #[cfg(test)]
 mod tests {
     use super::{
-        derived_label_width, html_switch_knob_radius, html_switch_track_radius, rect_inside,
-        rects_overlap, sidebar_hover_fill, slider_should_reset, switch_hit_bounds, HTML_SWITCH_H,
-        HTML_SWITCH_KNOB_D, HTML_SWITCH_W, SIDEBAR_HOVERED,
+        derived_label_width, html_switch_knob_radius, html_switch_track_radius,
+        pixel_rows_to_parent_span, rect_inside, rects_overlap, sidebar_hover_fill,
+        sidebar_label_frame_y, slider_should_reset, switch_hit_bounds, SidebarLabelGeometry,
+        HTML_SWITCH_H, HTML_SWITCH_KNOB_D, HTML_SWITCH_W, SIDEBAR_HOVERED,
     };
     // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
     use crate::ffi::release_obj;
@@ -3595,6 +3989,186 @@ mod tests {
     use objc2::{class, msg_send, sel};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::ffi::c_void;
+
+    /// The sidebar label is centred by its *inked* glyphs, not by its line box. This is the pure half
+    /// of that fix, asserted against the real metrics of the control (`--smoke-settings-layout`
+    /// provides the other half, on the live frames).
+    ///
+    /// The first case is the defect: centring the box alone (the old `(row_h - frame_h) / 2`) draws the
+    /// ink low for the app's 14pt control font at a 1.4 line-height ratio, which is what read as a
+    /// misaligned icon/label pair.
+    #[test]
+    /// The sidebar label is centred by its *inked* glyphs, not by its line box.
+    ///
+    /// This covers the pure half: the box-centred origin the label starts from, and the degenerate
+    /// inputs that must not move it out of its row. The ink measurement itself and the shift it
+    /// produces are asserted on the live view tree by `debug_validate_sidebar_ink_alignment`, which
+    /// `--smoke-settings-layout` runs -- a unit test cannot render AppKit text meaningfully.
+    ///
+    /// The counter-example is the defect: centring the box alone was the shipped behaviour, and it is
+    /// what left the ink ~1.7-2.9pt low. Any implementation whose origin for a taller-than-natural
+    /// line box differs from the centred box would change the alignment this test pins.
+    /// The geometry cache must be sensitive to every input that can move the resolved ink.
+    ///
+    /// Its whole purpose is to say "nothing that determines the frame changed", so a key that misses an
+    /// input silently reuses a frame resolved under different conditions. The backing scale is the case
+    /// that is easy to forget: the measurement reads a bitmap, so its result is quantised to the
+    /// backing store, and a window moved between a 1x and a 2x display must resolve again rather than
+    /// inherit the other display's answer. A label with no window yet reports scale 0, which must still
+    /// be distinguishable from any attached pass.
+    #[test]
+    fn sidebar_label_geometry_cache_key_covers_the_backing_scale_and_identity() {
+        // The cache resolves a hit with `c.key == key`, so comparing the key type *is* the production
+        // decision. Asserting on a hand-written field-by-field comparison instead would let the real
+        // filter drift from the test -- which it did: a version that ignored the backing scale passed
+        // this test until it was made to exercise the equality the cache actually uses.
+        let base = SidebarLabelGeometry {
+            row_h: 40.0,
+            width: 140.0,
+            title: String::from("General Settings"),
+            font_size: 14.0,
+            backing_scale: 2.0,
+        };
+        // The same label resolved twice compares equal: this is what a cache hit depends on, and
+        // putting a result field back into the key would break it (the cache would never hit).
+        assert_eq!(base, base.clone());
+
+        for (what, changed) in [
+            (
+                "backing scale",
+                SidebarLabelGeometry {
+                    backing_scale: 0.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "backing scale 1x",
+                SidebarLabelGeometry {
+                    backing_scale: 1.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "row height",
+                SidebarLabelGeometry {
+                    row_h: 44.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "label width",
+                SidebarLabelGeometry {
+                    width: 160.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "font size",
+                SidebarLabelGeometry {
+                    font_size: 20.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "title",
+                SidebarLabelGeometry {
+                    title: String::from("關於"),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            assert_ne!(base, changed, "a different {what} must not hit the cache");
+        }
+    }
+
+    /// The pixel-row -> parent-space conversion, asserted against independent expectations.
+    ///
+    /// This is the instrument that failed once: the correction and the assertion shared it, so both
+    /// agreed while the screen disagreed. A flipped parent treated as y-up mirrors the ink span about
+    /// the box; the assert below fails on exactly that, which is the counter-example this instrument
+    /// needs to be a gate rather than a self-confirmation.
+    #[test]
+    fn pixel_rows_convert_to_parent_space_with_flippedness_and_half_pixels() {
+        // A 40pt-tall parent at scale 2 -> 80 pixel rows. Ink occupies rows 20..39 inclusive, so its
+        // pixel centre is (20 + 0.5 + 39 + 0.5) / 2 = 30 rows, i.e. 30 / 2 = 15pt from the top.
+        let (top, bottom, ph, scale_y) = (20isize, 39isize, 80isize, 2.0);
+
+        // Flipped (the sidebar button): y grows downward, so the span keeps that order.
+        let (lo, hi) = pixel_rows_to_parent_span(top, bottom, ph, scale_y, 0.0, true);
+        assert!((lo - 10.25).abs() < 1e-9, "flipped lo: got {lo}");
+        assert!((hi - 19.75).abs() < 1e-9, "flipped hi: got {hi}");
+        assert!(
+            ((lo + hi) / 2.0 - 15.0).abs() < 1e-9,
+            "flipped mid: got {}",
+            (lo + hi) / 2.0
+        );
+
+        // Not flipped: the same rows mirror about the bitmap, so the ink sits 40-15 = 25pt from the top.
+        let (lo2, hi2) = pixel_rows_to_parent_span(top, bottom, ph, scale_y, 0.0, false);
+        assert!((lo2 - 20.25).abs() < 1e-9, "unflipped lo: got {lo2}");
+        assert!((hi2 - 29.75).abs() < 1e-9, "unflipped hi: got {hi2}");
+        assert!(
+            ((lo2 + hi2) / 2.0 - 25.0).abs() < 1e-9,
+            "unflipped mid: got {}",
+            (lo2 + hi2) / 2.0
+        );
+
+        // THE COUNTER-EXAMPLE: the defect was converting a flipped parent as if it were y-up. That is
+        // exactly the unflipped result, and it must differ from the flipped one by the mirror --
+        // otherwise this test would pass on the broken implementation too.
+        assert!(
+            (lo2 - lo).abs() > 1.0,
+            "ignoring flippedness must change the span; got {lo2} vs {lo}"
+        );
+
+        // A parent origin offsets the result without changing the span.
+        let (lo3, hi3) = pixel_rows_to_parent_span(top, bottom, ph, scale_y, 100.0, true);
+        assert!((lo3 - 110.25).abs() < 1e-9 && (hi3 - 119.75).abs() < 1e-9);
+
+        // Scale 1: one pixel row is one point, and the half-pixel still applies.
+        let (lo4, hi4) = pixel_rows_to_parent_span(3, 3, 10, 1.0, 0.0, true);
+        assert!(
+            (lo4 - 3.5).abs() < 1e-9 && (hi4 - 3.5).abs() < 1e-9,
+            "single row: {lo4}..{hi4}"
+        );
+    }
+
+    #[test]
+    fn sidebar_label_frame_y_centres_the_box_and_survives_degenerate_metrics() {
+        let row_h = 40.0;
+        let frame_h = crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        ); // 19.6, taller than the font's 16.49 natural line
+
+        let box_centred = (row_h - frame_h) / 2.0;
+        assert!((sidebar_label_frame_y(row_h, frame_h) - box_centred).abs() < 1e-9);
+        // The real row leaves the label room above and below, which is what lets the ink correction
+        // move it; a row no taller than the box has nothing to centre.
+        assert!(box_centred > 0.0, "the real row must leave the label room");
+        assert!(sidebar_label_frame_y(frame_h, frame_h).abs() < 1e-9);
+        assert!(
+            sidebar_label_frame_y(10.0, frame_h).abs() < 1e-9,
+            "a row shorter than the box must not push the label down"
+        );
+
+        // Degenerate metrics must not place the label outside its row or produce a NaN origin.
+        for (r, h) in [
+            (row_h, 0.0),
+            (row_h, -1.0),
+            (row_h, f64::NAN),
+            (row_h, f64::INFINITY),
+            (f64::NAN, frame_h),
+            (f64::INFINITY, frame_h),
+        ] {
+            let y = sidebar_label_frame_y(r, h);
+            assert!(y.is_finite(), "degenerate metrics ({r}, {h}) produced {y}");
+            assert!(
+                (0.0..=row_h).contains(&y),
+                "degenerate metrics ({r}, {h}) put the label at {y}"
+            );
+        }
+    }
 
     #[test]
     fn slider_double_click_reset_only_applies_to_double_clicks_with_a_default() {

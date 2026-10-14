@@ -1606,6 +1606,38 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
+        // The icon and its title must share one vertical mid-line. Its own check, with its own
+        // message: folded into the geometry check above it would report a fit failure for an
+        // alignment defect. Asserted from rendered pixels because the label's *frame* can be centred
+        // while its ink is not -- which is the defect this replaced, and why a frame-only check
+        // passed while the rows were visibly off.
+        if !widgets::debug_validate_sidebar_ink_alignment() {
+            log_info!(
+                "[smoke-settings-layout] a sidebar icon and its title ink do not share a mid-line"
+            );
+            hide_settings();
+            return false;
+        }
+        // Switching pages re-applies every sidebar title, but only the accent colour moves: the
+        // titles, fonts and row height are unchanged, so the resolved geometry still holds and the
+        // bitmap measurement must not run again. That measurement renders the button and scans it on
+        // the main thread, so seven of them per page switch is the difference between an instant tab
+        // and a visible stall.
+        let before_switch = widgets::sidebar_ink_measurement_count();
+        select_sidebar(if SIDEBAR_SELECTED.load(Ordering::SeqCst) == 0 {
+            1
+        } else {
+            0
+        });
+        let after_switch = widgets::sidebar_ink_measurement_count();
+        if after_switch != before_switch {
+            log_info!(
+                "[smoke-settings-layout] switching pages re-measured the sidebar ink {} time(s); a colour-only change must reuse the resolved geometry",
+                after_switch - before_switch
+            );
+            hide_settings();
+            return false;
+        }
         let clipboard_shortcut_layout_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             if ui.clipboard_shortcut.is_null()

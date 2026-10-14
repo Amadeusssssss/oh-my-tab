@@ -178,3 +178,26 @@ so a later reader does not re-derive them. The fixes are in the tree, with their
   and passed with the call removed from the tap path -- falsified after moving it). Only the pure rule
   and its placement are covered; a real keyboard sequence (Command tap, Command+C, Command again
   inside 350ms) is not, because it needs a live tap. Trigger: the next change to gesture handling.
+
+- **The sidebar ink measurement's render-and-scan half is not unit-tested** (2026-10-14, sidebar
+  alignment review R4, LOW — coverage gap). `pixel_rows_to_parent_span` (the pixel-row -> parent-space
+  conversion, including the flipped branch and the half-pixel) is asserted against independent
+  expectations, and its counter-example fails on the implementation this task replaced. What is still
+  uncovered by a unit test is the half that renders the button and decides which pixels are ink: that
+  needs a real AppKit session, so it is exercised only by `--smoke-settings-layout` across three
+  locales. The reviewer noted the scan still contains decision logic rather than being pure I/O.
+  Trigger: the next change to sidebar rendering or to `child_ink_span_in_parent`, or the next time a
+  smoke run reports no measurable ink on a row that clearly draws one.
+
+- **A display-backing change does not re-resolve the sidebar label geometry** (2026-10-14, sidebar
+  alignment review R7, MEDIUM — deferred by user decision). `center_sidebar_label` caches its resolved
+  frame keyed on the row height, label width, title, font size and backing scale, so a re-query after a
+  screen change resolves correctly and a colour-only caller reuses the cache. What is missing is the
+  *trigger*: nothing observes `NSWindowDidChangeBackingProperties`, so a window moved to a display with
+  a different scale keeps the frame resolved on the old one until some other action re-runs the
+  positioning (a page switch does). The measurement was taken on one 2x display only, so the
+  cross-display size of the error is unverified; the same label rendered at 1x and 2x differed by at most
+  0.25pt in point space (0.0000pt for three of four titles), which is below both the 1pt assertion
+  tolerance and one display pixel. Trigger: a report of misaligned sidebar text after moving the
+  settings window between displays, or the next change to `center_sidebar_label`, the settings window's
+  observers, or `rebuild_settings_content`.
