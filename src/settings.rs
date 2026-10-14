@@ -108,6 +108,31 @@ static REC_COMPLETED_DESC: Mutex<String> = Mutex::new(String::new());
 /// device changes).
 static MAPPING_EDITS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Mapping-row control address -> the physical button number it acts on, for the same reason the key
+/// bindings page keeps `ROW_CONTROLS`: a `SettingsButton`'s `tag` selects its hover/normal palette
+/// (AGENTS.md), so the button number must never travel in `setTag:`. Writing it there both froze the
+/// row buttons' hover colour and left the handlers reading a value the component owns; the registry
+/// is cleared in the same pass that tears the rows down, so a click can never reach a freed address.
+static MAPPING_ROW_CONTROLS: LazyLock<Mutex<HashMap<usize, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Map a mapping row's control to the button number it edits/deletes.
+fn register_mapping_control(view: *mut AnyObject, button: u32) {
+    if view.is_null() {
+        return;
+    }
+    if let Ok(mut controls) = MAPPING_ROW_CONTROLS.lock() {
+        controls.insert(view as usize, button);
+    }
+}
+
+/// The button number a mapping-row control belongs to, or `None` when the sender is not one of ours.
+pub(super) fn mapping_control_button(sender: *mut AnyObject) -> Option<u32> {
+    MAPPING_ROW_CONTROLS
+        .lock()
+        .ok()
+        .and_then(|controls| controls.get(&(sender as usize)).copied())
+}
 /// The recording tap thread handle (short-lived; replaced on each recording session).
 static RECORD_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 /// The recording thread's RunLoop (stopped on completion/cancel).

@@ -863,19 +863,31 @@ impl SettingsMappingActionIcon {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsButtonRole {
     Action,
-    Compact,
     Footer,
     Primary,
     Destructive,
 }
 
 impl SettingsButtonRole {
+    /// The role for a list row's trailing Edit / Delete buttons.
+    ///
+    /// It is the design system's **secondary** action surface (`button_bg` + `card_border`), which is
+    /// what style doc §6 assigns to a button and what the pages' references draw for these two.
+    ///
+    /// It exists as its own name because the surface it replaced was wrong in a way the role list did
+    /// not show: those buttons used a field-family role whose normal (`field_bg`) and hover
+    /// (`hover_bg`) tokens differ by five alpha steps, so over `card_bg` they composited to 1.02:1 --
+    /// a hover the user could not see, leaving §10's "every custom-drawn control needs a hover state"
+    /// silently unmet. `field_bg` is the documented surface for text fields and read-only value boxes
+    /// (§3), not for a button. Naming the role here is what lets the gate assert the resulting pixels
+    /// instead of the role's name.
+    pub(crate) const ROW_ACTION: Self = Self::Action;
+
     /// The role's (normal fill, text, palette-slot tag). `widgets` reads the tag back to resolve
     /// hover/exit fills, so the two mappings must stay in one place.
     pub(super) fn style(self, palette: crate::theme::UiPalette) -> (u32, u32, isize) {
         match self {
             Self::Action => (palette.button_bg, palette.button_text, -3),
-            Self::Compact => (palette.field_bg, palette.button_text, 0),
             Self::Footer => (palette.footer_button_bg, palette.button_text, -1),
             Self::Primary => (palette.accent, palette.accent_text, -2),
             Self::Destructive => (palette.destructive, palette.accent_text, -4),
@@ -2243,10 +2255,6 @@ mod tests {
                 (palette.button_bg, palette.button_text, -3)
             );
             assert_eq!(
-                SettingsButtonRole::Compact.style(palette),
-                (palette.field_bg, palette.button_text, 0)
-            );
-            assert_eq!(
                 SettingsButtonRole::Footer.style(palette),
                 (palette.footer_button_bg, palette.button_text, -1)
             );
@@ -2259,5 +2267,98 @@ mod tests {
                 (palette.destructive, palette.accent_text, -4)
             );
         }
+    }
+
+    /// A row's Edit / Delete buttons must show a hover state the user can actually see.
+    ///
+    /// The original defect: they used a field-family role whose normal (`field_bg`) and hover
+    /// (`hover_bg`) tokens differ by five alpha steps of the same neutral. Over `card_bg` they composite to
+    /// **1.024:1** (light) / **1.108:1** (dark) -- a hover nobody can perceive, which style doc §10
+    /// requires every custom-drawn control to have. The role check next door could not catch it: it
+    /// only asserts a role's hover token differs from its normal token, and those two tokens *are*
+    /// different values. Asserting the composited result is what makes the gate fail on the defect.
+    ///
+    /// The floor is 1.05:1, the same one `theme`'s `hover_and_selection_fills_are_visible_against_the_surface_in_both_modes`
+    /// uses to rule out a fill that is *effectively invisible*; the defect's 1.024:1 sits below it
+    /// while the shipped secondary surface clears it in both modes.
+    #[test]
+    fn row_action_buttons_have_a_visible_hover_state() {
+        const MIN_HOVER_CONTRAST: f64 = 1.05;
+        for dark in [false, true] {
+            let palette = crate::theme::ui_palette_for_mode(dark);
+            let (normal, _text, tag) = SettingsButtonRole::ROW_ACTION.style(palette);
+            let hover = super::widgets::action_button_hover_color(tag, palette);
+            // The surfaces are washes over the card, so compare them composited the way they render.
+            let normal_rgb = crate::theme::composite_over(normal, palette.card_bg);
+            let hover_rgb = crate::theme::composite_over(hover, palette.card_bg);
+            let contrast = crate::theme::contrast_ratio(hover_rgb, normal_rgb);
+            assert!(
+                contrast >= MIN_HOVER_CONTRAST,
+                "row action buttons' hover is invisible in {} mode: {contrast:.3}:1 (min {MIN_HOVER_CONTRAST})",
+                if dark { "dark" } else { "light" }
+            );
+        }
+    }
+
+    /// Every role the settings pages actually ask for must have a hover the user can see.
+    ///
+    /// The defect was call-site-shaped, not role-shaped: the row buttons and both "Add" bands sat on
+    /// `card_bg` yet asked for a field-family role whose hover composites to 1.024:1 there. Asserting
+    /// only the role this change introduces would let the next button pick the same trap, so this
+    /// reads the pages' role arguments and holds each named role to the floor on the surface those
+    /// pages put buttons on. A future field-family role would have to argue for itself here.
+    #[test]
+    fn every_role_the_settings_pages_ask_for_has_a_visible_hover_on_the_card() {
+        const MIN_HOVER_CONTRAST: f64 = 1.05;
+        let sources = [
+            ("bindings.rs", include_str!("bindings.rs")),
+            ("mapping.rs", include_str!("mapping.rs")),
+            ("page_builder.rs", include_str!("page_builder.rs")),
+        ];
+        let palette = crate::theme::ui_palette_for_mode(false);
+        let mut checked = 0usize;
+        for (name, source) in sources {
+            for (index, line) in source.lines().enumerate() {
+                let trimmed = line.trim();
+                // A call site passes the role as a bare `SettingsButtonRole::X,` argument. Comments
+                // and the test module's own references are not call sites.
+                if !trimmed.starts_with("SettingsButtonRole::") || !trimmed.ends_with(',') {
+                    continue;
+                }
+                let role_name = trimmed
+                    .trim_start_matches("SettingsButtonRole::")
+                    .trim_end_matches(',');
+                // `ROW_ACTION` is an alias for `Action`; both spellings are accepted, and the alias
+                // exists so a page states *why* it wants that surface.
+                let Some(role) = [
+                    SettingsButtonRole::Action,
+                    SettingsButtonRole::Footer,
+                    SettingsButtonRole::Primary,
+                    SettingsButtonRole::Destructive,
+                ]
+                .into_iter()
+                .find(|role| format!("{role:?}") == role_name)
+                .or((role_name == "ROW_ACTION").then_some(SettingsButtonRole::ROW_ACTION)) else {
+                    panic!("{name}:{} names an unknown role {role_name:?}", index + 1);
+                };
+                let (normal, _text, tag) = role.style(palette);
+                let contrast = crate::theme::contrast_ratio(
+                    crate::theme::composite_over(
+                        super::widgets::action_button_hover_color(tag, palette),
+                        palette.card_bg,
+                    ),
+                    crate::theme::composite_over(normal, palette.card_bg),
+                );
+                assert!(
+                    contrast >= MIN_HOVER_CONTRAST,
+                    "{name}:{} builds a {role_name} button whose hover is invisible on the card: \
+                     {contrast:.3}:1 (min {MIN_HOVER_CONTRAST})",
+                    index + 1
+                );
+                checked += 1;
+            }
+        }
+        // A source scan that matches nothing would pass vacuously.
+        assert!(checked >= 8, "only {checked} role arguments were found");
     }
 }

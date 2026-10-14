@@ -79,6 +79,11 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             }
             let _: () = msg_send![row.separator, removeFromSuperview];
         }
+        // The controls are gone: clear the address map in the same pass, so a later click can never
+        // be resolved against a freed address.
+        if let Ok(mut controls) = MAPPING_ROW_CONTROLS.lock() {
+            controls.clear();
+        }
         let doc = u.mapping_doc;
         // The list shows bound rows plus freshly added unconfigured ones (in-row config
         // from scheme A, but dynamic rows).
@@ -221,12 +226,12 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                 &t("settings.mapping_edit"),
                 target,
                 sel!(handleMappingEdit:),
-                SettingsButtonRole::Compact,
+                SettingsButtonRole::ROW_ACTION,
             );
-            let _: () = msg_send![edit, setTag: btn as isize];
             let _: () = msg_send![edit, setEnabled: mappings_on];
             let _: () = msg_send![doc, addSubview: edit];
             release_obj(edit);
+            register_mapping_control(edit, btn);
             // The delete button (text style, same look as Edit).
             let delete = SettingsButton::action(
                 NSRect::new(
@@ -236,12 +241,12 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                 &t("settings.mapping_delete"),
                 target,
                 sel!(handleDeleteMapping:),
-                SettingsButtonRole::Compact,
+                SettingsButtonRole::ROW_ACTION,
             );
-            let _: () = msg_send![delete, setTag: btn as isize];
             let _: () = msg_send![delete, setEnabled: mappings_on];
             let _: () = msg_send![doc, addSubview: delete];
             release_obj(delete);
+            register_mapping_control(delete, btn);
             // Keycap pills: one rounded square per modifier symbol + the main key (like
             // real keyboard keycaps).
             let mut caps: Vec<*mut AnyObject> = Vec::new();
@@ -737,7 +742,6 @@ pub(super) unsafe fn recording_thread() {
     log_debug!("[mouse] recording tap stopped");
 }
 
-/// The delete button (tag = button number): removes that mapping.
 /// The "Add mapping" button: opens the mapping edit panel (trigger/action/combo configured
 /// in one place, LinearMouse style).
 pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
@@ -749,15 +753,21 @@ pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _send
     log_debug!("[mouse] mapping panel opened (new mapping)");
 }
 
-/// The row "Edit" callback (tag = button number): opens the panel prefilled.
+/// The row "Edit" callback: opens the panel prefilled for the sender's button number.
+///
+/// The number comes from the address-keyed registry, never from `tag`: the tag selects the shared
+/// component's hover/normal palette (AGENTS.md), so carrying the button number in it both froze the
+/// button's colour after the pointer left and made the handler read a field it does not own.
 pub(crate) extern "C" fn handle_mapping_edit(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     // Panel already open: close it first (the user expects a fresh panel, not silence).
     if EDIT_PANEL.lock().unwrap().is_some() {
         close_mapping_panel();
     }
-    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    open_mapping_panel(Some(tag as u32));
-    log_debug!("[mouse] mapping panel opened (edit button {})", tag);
+    let Some(btn) = super::mapping_control_button(sender as *mut AnyObject) else {
+        return;
+    };
+    open_mapping_panel(Some(btn));
+    log_debug!("[mouse] mapping panel opened (edit button {})", btn);
 }
 
 /// The panel "Record trigger" button: records the side button.
@@ -1201,13 +1211,16 @@ pub(super) fn close_mapping_panel() {
     EDIT_COMBO.lock().unwrap().clear();
 }
 
-/// The delete button (tag = button number): removes that mapping.
+/// The row "Delete" callback: removes the sender's mapping (its button number comes from the
+/// address-keyed registry, not from `tag` -- see `handle_mapping_edit`).
 pub(crate) extern "C" fn handle_delete_mapping(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    MAPPING_EDITS.lock().unwrap().remove(&tag.to_string());
+    let Some(btn) = super::mapping_control_button(sender as *mut AnyObject) else {
+        return;
+    };
+    MAPPING_EDITS.lock().unwrap().remove(&btn.to_string());
     commit_mapping_edits();
     render_mapping_rows();
-    log_debug!("[mouse] removed mapping for button {}", tag);
+    log_debug!("[mouse] removed mapping for button {}", btn);
 }
 
 pub(crate) extern "C" fn handle_recording_finished(

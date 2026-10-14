@@ -309,8 +309,7 @@ pub(super) fn action_button_normal_color(tag: isize, palette: crate::theme::UiPa
         -4 => palette.destructive,
         // The transparent role's normal state is no fill at all (see `action_button_hover_color`).
         -5 => 0x0000_0000,
-        // `Compact` uses tag 0 as its normal, non-negative slot.
-        _ if tag >= 0 => palette.field_bg,
+        // Every remaining role uses a negative slot; `button_bg` is the neutral fallback.
         _ => palette.button_bg,
     }
 }
@@ -4136,7 +4135,6 @@ mod tests {
         ] {
             for role in [
                 SettingsButtonRole::Action,
-                SettingsButtonRole::Compact,
                 SettingsButtonRole::Footer,
                 SettingsButtonRole::Primary,
                 SettingsButtonRole::Destructive,
@@ -4162,7 +4160,6 @@ mod tests {
         ] {
             for role in [
                 SettingsButtonRole::Action,
-                SettingsButtonRole::Compact,
                 SettingsButtonRole::Footer,
                 SettingsButtonRole::Primary,
                 SettingsButtonRole::Destructive,
@@ -4178,8 +4175,8 @@ mod tests {
     }
 
     /// Pins *which* hover token each role resolves to, not merely that it differs from its normal
-    /// color. Distinctness alone is too weak: pointing `Compact` at `accent` still differs from
-    /// `field_bg`, yet repaints a subtle field button in accent blue on hover.
+    /// color. Distinctness alone is too weak: pointing a subtle field-family role at `accent` still
+    /// differs from its normal, yet repaints the button in accent blue on hover.
     #[test]
     fn action_button_hover_uses_the_expected_token_per_role() {
         use crate::settings::components::SettingsButtonRole;
@@ -4191,7 +4188,6 @@ mod tests {
             // tint over whatever surface their normal color provides.
             let expected = [
                 (SettingsButtonRole::Action, palette.hover_bg),
-                (SettingsButtonRole::Compact, palette.hover_bg),
                 (SettingsButtonRole::Footer, palette.hover_bg),
                 (SettingsButtonRole::Primary, palette.accent_hover),
                 (SettingsButtonRole::Destructive, palette.destructive_hover),

@@ -1288,7 +1288,10 @@ pub(super) unsafe fn build_mouse_page(
         &t("settings.row_add_mapping"),
         target,
         sel!(handleAddMapping:),
-        SettingsButtonRole::Compact,
+        // A full-width row action on the card surface, not a field: it needs the doc's secondary
+        // button surface (and with it a perceptible hover). `Compact`'s field-family wash would leave
+        // the hover at 1.02:1 on `card_bg` (see `SettingsButtonRole::ROW_ACTION`).
+        SettingsButtonRole::ROW_ACTION,
     );
     let _: () = msg_send![card_bg, addSubview: add_btn];
     release_obj(add_btn);

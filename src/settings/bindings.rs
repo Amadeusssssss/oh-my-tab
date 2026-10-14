@@ -640,7 +640,7 @@ unsafe fn render_row(
         &t("settings.binding_edit"),
         target,
         sel!(handleBindingEdit:),
-        SettingsButtonRole::Compact,
+        SettingsButtonRole::ROW_ACTION,
     );
     let _: () = msg_send![doc, addSubview: edit];
     release_obj(edit);
@@ -659,7 +659,7 @@ unsafe fn render_row(
         &t("settings.binding_delete"),
         target,
         sel!(handleBindingDelete:),
-        SettingsButtonRole::Compact,
+        SettingsButtonRole::ROW_ACTION,
     );
     let _: () = msg_send![doc, addSubview: delete];
     release_obj(delete);
@@ -737,7 +737,9 @@ unsafe fn render_footer(
         &t("settings.binding_add"),
         target,
         sel!(handleBindingAdd:),
-        SettingsButtonRole::Compact,
+        // A full-width row action, so it takes the doc's secondary button surface (§6) like the row
+        // buttons above it. `Compact`'s field-family wash would leave its hover at 1.02:1 on the card.
+        SettingsButtonRole::ROW_ACTION,
     );
     if add.is_null() {
         log_debug!("[keybind] footer add button unavailable");
