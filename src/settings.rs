@@ -68,19 +68,186 @@ const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
 const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
 pub(super) const SETTINGS_PAGE_COUNT: usize = 7;
-pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize = 5;
+/// A page's identity, independent of its position. `SETTINGS_PAGES` holds the sidebar order and
+/// pairs each identity with its name; every control array is keyed by this identity, so a reorder
+/// cannot leave a hand-written index order pointing at the wrong control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum SettingsPageId {
+    General,
+    Switcher,
+    Mouse,
+    Clipboard,
+    KeyBindings,
+    KeystrokeDisplay,
+    About,
+}
+
+impl SettingsPageId {
+    /// The sidebar title key. Lives with the identity so the sidebar build and the selection
+    /// refresh read one list, not two.
+    pub(super) fn title_key(self) -> &'static str {
+        match self {
+            SettingsPageId::General => "settings.sidebar_general",
+            SettingsPageId::Switcher => "settings.sidebar_switcher",
+            SettingsPageId::Mouse => "settings.sidebar_mouse",
+            SettingsPageId::Clipboard => "settings.sidebar_clipboard",
+            SettingsPageId::KeyBindings => "settings.sidebar_key_bindings",
+            SettingsPageId::KeystrokeDisplay => "settings.sidebar_keystroke_display",
+            SettingsPageId::About => "settings.sidebar_about",
+        }
+    }
+}
+/// A settings page in sidebar order: its stable identity plus its script-facing name. The position
+/// in `SETTINGS_PAGES` *is* the sidebar index, and the identity is what every control array (sidebar
+/// buttons, page scroll views, page documents, icons, titles) is keyed by. Putting the identity in
+/// the same list as the order is the point: a reorder moves the page, its name, and every control
+/// that belongs to it together, so there is no second hand-written order to fall out of step.
+///
+/// The names are the stable, user- and script-facing spelling (kebab-case). Numeric forms are still
+/// accepted as raw indices, but they are positional and will mean something else once a page moves.
+pub(crate) struct SettingsPageSpec {
+    /// What the page *is*. Control lookup switches on this, never on the number.
+    pub(crate) id: SettingsPageId,
+    /// Name used by --open-settings=<name>, the view-root names and the debug validation labels.
+    pub(crate) name: &'static str,
+}
+
+pub(crate) const SETTINGS_PAGES: [SettingsPageSpec; SETTINGS_PAGE_COUNT] = [
+    SettingsPageSpec {
+        id: SettingsPageId::General,
+        name: "general",
+    },
+    SettingsPageSpec {
+        id: SettingsPageId::Switcher,
+        name: "switcher",
+    },
+    SettingsPageSpec {
+        id: SettingsPageId::Mouse,
+        name: "mouse",
+    },
+    SettingsPageSpec {
+        id: SettingsPageId::Clipboard,
+        name: "clipboard",
+    },
+    SettingsPageSpec {
+        id: SettingsPageId::KeyBindings,
+        name: "key-bindings",
+    },
+    SettingsPageSpec {
+        id: SettingsPageId::KeystrokeDisplay,
+        name: "keystroke-display",
+    },
+    SettingsPageSpec {
+        id: SettingsPageId::About,
+        name: "about",
+    },
+];
+
+/// The page's name in the sidebar's spelling, for the --open-settings parser and scripts.
+pub(crate) fn settings_page_name(index: usize) -> &'static str {
+    SETTINGS_PAGES[index].name
+}
+
+/// The page identity at a sidebar index. The table position is the index, so this is a lookup, not
+/// a second ordering.
+pub(super) fn settings_page_identity(index: usize) -> SettingsPageId {
+    SETTINGS_PAGES[index].id
+}
+
+/// Whether two identities are the same page: the const-time counterpart of `PartialEq`, which cannot
+/// be used in the const evaluation that derives the page-index constants.
+const fn same_page(a: SettingsPageId, b: SettingsPageId) -> bool {
+    match (a, b) {
+        (SettingsPageId::General, SettingsPageId::General) => true,
+        (SettingsPageId::Switcher, SettingsPageId::Switcher) => true,
+        (SettingsPageId::Mouse, SettingsPageId::Mouse) => true,
+        (SettingsPageId::Clipboard, SettingsPageId::Clipboard) => true,
+        (SettingsPageId::KeyBindings, SettingsPageId::KeyBindings) => true,
+        (SettingsPageId::KeystrokeDisplay, SettingsPageId::KeystrokeDisplay) => true,
+        (SettingsPageId::About, SettingsPageId::About) => true,
+        _ => false,
+    }
+}
+
+/// The sidebar index of a page, evaluated at const time so the index constants below are DERIVED
+/// from `SETTINGS_PAGES` rather than repeated as literals. A table reorder moves them with the page.
+const fn page_index_const(id: SettingsPageId) -> usize {
+    let mut index = 0;
+    while index < SETTINGS_PAGE_COUNT {
+        if same_page(SETTINGS_PAGES[index].id, id) {
+            return index;
+        }
+        index += 1;
+    }
+    panic!("every page identity is in SETTINGS_PAGES")
+}
+/// The sidebar index a page identity occupies.
+pub(super) fn settings_page_index(page: SettingsPageId) -> usize {
+    SETTINGS_PAGES
+        .iter()
+        .position(|spec| spec.id == page)
+        .expect("every page identity is in SETTINGS_PAGES")
+}
+
+/// Identities in sidebar order.
+pub(super) fn settings_page_ids() -> [SettingsPageId; SETTINGS_PAGE_COUNT] {
+    std::array::from_fn(settings_page_identity)
+}
+
+/// The A2 view-root names, in sidebar order: `sidebar_<i>_<stem>` and `page_<i>_<stem>`. Pure so the
+/// anchor spellings `scripts/e2e/*.sh` look up are assertable without a live window. The stem is the
+/// switch name with dashes spelled as underscores (`key_bindings`), which is what those scripts were
+/// written against; deriving it from `SETTINGS_PAGES` keeps a page move from leaving a stale index
+/// behind in a script.
+pub(super) fn view_root_names() -> ([String; SETTINGS_PAGE_COUNT], [String; SETTINGS_PAGE_COUNT]) {
+    let stem = |index: usize| settings_page_name(index).replace('-', "_");
+    let sidebar = std::array::from_fn(|index| format!("sidebar_{index}_{}", stem(index)));
+    let page = std::array::from_fn(|index| format!("page_{index}_{}", stem(index)));
+    (sidebar, page)
+}
+
+/// Which page --open-settings=<spec> selects, or None when the value names no page.
+///
+/// A bare switch and the boolean truthy spelling (plus the pre-existing 1/true) select About, which is
+/// where an update notice lands. A page is named by its table name or alias, or by a raw index; an
+/// out-of-range index is refused rather than clamped, because silently opening a different page than
+/// the one asked for is a verification trap.
+pub(crate) fn parse_settings_page_spec(spec: &str) -> Option<usize> {
+    let spec = spec.trim().to_ascii_lowercase();
+    match spec.as_str() {
+        "" | "1" | "true" | "yes" => return Some(SETTINGS_ABOUT_PAGE_INDEX),
+        // Alias kept from the switch's first form, before the table named the pages.
+        "bindings" => return Some(SETTINGS_KEY_BINDINGS_PAGE_INDEX),
+        _ => {}
+    }
+    // A name resolves to the position it occupies: the table position is the sidebar index.
+    if let Some(index) = SETTINGS_PAGES.iter().position(|page| page.name == spec) {
+        return Some(index);
+    }
+    spec.parse::<usize>()
+        .ok()
+        .filter(|&page| page < SETTINGS_PAGE_COUNT)
+}
+
+// Each constant is DERIVED from `SETTINGS_PAGES` through its identity, so a table reorder moves the
+// page and every caller that navigates by name together. The literals this replaces were a second
+// copy of the sidebar order that the first review showed could drift from the table unnoticed.
+pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize =
+    page_index_const(SettingsPageId::KeystrokeDisplay);
 /// The App Switcher page. The switcher overlay's own footer control opens HERE; the index stays
 /// private to this module so the overlay asks for "the switcher settings", not a sidebar position.
-pub(super) const SETTINGS_SWITCHER_PAGE_INDEX: usize = 1;
+pub(super) const SETTINGS_GENERAL_PAGE_INDEX: usize = page_index_const(SettingsPageId::General);
+pub(super) const SETTINGS_SWITCHER_PAGE_INDEX: usize = page_index_const(SettingsPageId::Switcher);
 /// The clipboard history page. `pub(crate)` because the clipboard module's smoke runner asserts that
 /// its header button navigates HERE -- the page is named once, and the assertion cannot drift from it.
-pub(crate) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = 3;
+pub(crate) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = page_index_const(SettingsPageId::Clipboard);
 /// The Mouse page. Its controls are the only ones that cost real time to fill (they resolve the selected
 /// device and its mappings), so they are filled on demand rather than on every settings open.
-pub(super) const SETTINGS_MOUSE_PAGE_INDEX: usize = 2;
+pub(super) const SETTINGS_MOUSE_PAGE_INDEX: usize = page_index_const(SettingsPageId::Mouse);
 /// The merged Key Bindings page (window control + quick actions in one list).
-pub(super) const SETTINGS_KEY_BINDINGS_PAGE_INDEX: usize = 4;
-pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = 6;
+pub(super) const SETTINGS_KEY_BINDINGS_PAGE_INDEX: usize =
+    page_index_const(SettingsPageId::KeyBindings);
+pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = page_index_const(SettingsPageId::About);
 
 /// Fixed width of the settings navigation pane, shared by layout and transient feedback.
 pub(crate) const SETTINGS_SIDEBAR_WIDTH: f64 = 220.0;
@@ -753,52 +920,19 @@ pub(crate) fn resync_page_layout_for_scroller() {
 /// A2 E2E: exposes the view roots whose geometry must be asserted (name → view); `e2e_state`
 /// walks them into JSON. Only semantic roots (highlight, the sidebar buttons, the page containers)
 /// are listed -- this is not a generic traversal entry point.
-pub(crate) fn e2e_view_roots() -> Vec<(&'static str, *mut AnyObject)> {
-    const SIDEBAR_NAMES: [&str; SETTINGS_PAGE_COUNT] = [
-        "sidebar_0_general",
-        "sidebar_1_switcher",
-        "sidebar_2_mouse",
-        "sidebar_3_clipboard",
-        "sidebar_4_key_bindings",
-        "sidebar_5_keystroke_display",
-        "sidebar_6_about",
-    ];
-    const PAGE_NAMES: [&str; SETTINGS_PAGE_COUNT] = [
-        "page_0_general",
-        "page_1_switcher",
-        "page_2_mouse",
-        "page_3_clipboard",
-        "page_4_key_bindings",
-        "page_5_keystroke_display",
-        "page_6_about",
-    ];
+pub(crate) fn e2e_view_roots() -> Vec<(String, *mut AnyObject)> {
+    let (sidebar_names, page_names) = view_root_names();
     with_settings_ui(|ui| match ui {
         Some(ui) => {
-            let mut roots: Vec<(&'static str, *mut AnyObject)> =
-                vec![("sidebar_highlight", ui.sidebar_highlight)];
-            let buttons = [
-                ui.sidebar_general,
-                ui.sidebar_switcher,
-                ui.sidebar_mouse,
-                ui.sidebar_clipboard,
-                ui.sidebar_key_bindings,
-                ui.sidebar_keystroke_display,
-                ui.sidebar_about,
-            ];
-            let pages = [
-                ui.general_view,
-                ui.switcher_view,
-                ui.mouse_view,
-                ui.clipboard_view,
-                ui.key_bindings_view,
-                ui.keystroke_display_view,
-                ui.about_view,
-            ];
+            let mut roots: Vec<(String, *mut AnyObject)> =
+                vec![("sidebar_highlight".to_string(), ui.sidebar_highlight)];
+            let buttons = window::sidebar_buttons(ui);
+            let pages = window::page_scroll_views(ui);
             for (index, view) in buttons.into_iter().enumerate() {
-                roots.push((SIDEBAR_NAMES[index], view));
+                roots.push((sidebar_names[index].clone(), view));
             }
             for (index, view) in pages.into_iter().enumerate() {
-                roots.push((PAGE_NAMES[index], view));
+                roots.push((page_names[index].clone(), view));
             }
             roots.retain(|(_, view)| !view.is_null());
             roots
@@ -820,7 +954,8 @@ pub(crate) fn about_page_is_visible() -> bool {
         && SIDEBAR_SELECTED.load(Ordering::SeqCst) == SETTINGS_ABOUT_PAGE_INDEX
 }
 
-/// Development-switch helper: open the settings window on a specific page (0=General .. 7=About).
+/// Development-switch helper: open the settings window on a specific page (`0=General` ..
+/// `SETTINGS_ABOUT_PAGE_INDEX=About`; `SETTINGS_PAGES` is the list).
 /// Unlike `open_about_updates` it triggers no update check; it only parks the window on a page.
 pub(crate) fn show_settings_page(page: usize) {
     // Present directly on the requested page: `show_settings_inner` selects it (twice, for the pill
@@ -1972,15 +2107,7 @@ unsafe fn grow_short_page_documents() {
         let Some(ui) = ui.as_ref() else {
             return;
         };
-        let scrolls = [
-            ui.general_view,
-            ui.switcher_view,
-            ui.mouse_view,
-            ui.clipboard_view,
-            ui.key_bindings_view,
-            ui.keystroke_display_view,
-            ui.about_view,
-        ];
+        let scrolls = window::page_scroll_views(ui);
         let selected = widgets::SIDEBAR_SELECTED.load(Ordering::SeqCst);
         for (index, &scroll) in scrolls.iter().enumerate() {
             if scroll.is_null() {
@@ -2110,6 +2237,140 @@ mod tests {
         // before this setting existed).
         assert_eq!(pointer_accel_display(1.0), "1.00");
         assert_eq!(pointer_accel_display(0.6875), "0.69");
+    }
+
+    use super::{
+        parse_settings_page_spec, settings_page_identity, settings_page_index, settings_page_name,
+        SettingsPageId, SETTINGS_ABOUT_PAGE_INDEX, SETTINGS_CLIPBOARD_PAGE_INDEX,
+        SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX, SETTINGS_KEY_BINDINGS_PAGE_INDEX,
+        SETTINGS_MOUSE_PAGE_INDEX, SETTINGS_PAGES, SETTINGS_PAGE_COUNT,
+        SETTINGS_SWITCHER_PAGE_INDEX,
+    };
+
+    /// The table is the single source of truth for the sidebar order: each entry claims the index it
+    /// actually occupies, the names are unique, and the page-index constants agree with their names.
+    /// A reorder that forgets one of those silently opens the wrong page for a script.
+    #[test]
+    fn the_page_table_matches_the_sidebar_order_it_indexes() {
+        let mut names = std::collections::HashSet::new();
+        for (position, page) in SETTINGS_PAGES.iter().enumerate() {
+            assert_eq!(settings_page_identity(position), page.id);
+            assert!(names.insert(page.name), "duplicate page name {}", page.name);
+            assert_eq!(settings_page_name(position), page.name);
+        }
+        assert_eq!(names.len(), SETTINGS_PAGE_COUNT);
+        // The named constants are what the rest of the app navigates by; each must land on the page
+        // its name promises, or the switch and the overlay agree on a wrong number.
+        assert_eq!(
+            settings_page_name(SETTINGS_KEY_BINDINGS_PAGE_INDEX),
+            "key-bindings"
+        );
+        assert_eq!(
+            settings_page_name(SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX),
+            "keystroke-display"
+        );
+        assert_eq!(settings_page_name(SETTINGS_MOUSE_PAGE_INDEX), "mouse");
+        assert_eq!(
+            settings_page_name(SETTINGS_CLIPBOARD_PAGE_INDEX),
+            "clipboard"
+        );
+        assert_eq!(settings_page_name(SETTINGS_SWITCHER_PAGE_INDEX), "switcher");
+        assert_eq!(settings_page_name(SETTINGS_ABOUT_PAGE_INDEX), "about");
+    }
+
+    /// The table and the identity list are two hand-written orders that must agree, and the identity
+    /// is what every control array is keyed by. This is the counter-example the first review asked
+    /// for: a table whose order no longer matches the identities would still pass the name/index
+    /// tests, but this one fails because the identity at each index is wrong.
+    #[test]
+    fn the_page_identities_match_the_table_at_every_index() {
+        let mut seen = std::collections::HashSet::new();
+        for (index, page) in SETTINGS_PAGES.iter().enumerate() {
+            // The identity at an index is the one the table put there, and it round-trips. A
+            // control array keyed by identity therefore cannot be indexed by a different page.
+            assert_eq!(settings_page_identity(index), page.id);
+            assert_eq!(settings_page_index(page.id), index);
+            assert!(seen.insert(page.id), "{:?} appears twice", page.id);
+        }
+        // Every identity appears exactly once, so the table names every page.
+        assert_eq!(seen.len(), SETTINGS_PAGE_COUNT);
+        // The identities are distinct pages, not interchangeable numbers.
+        assert_ne!(
+            settings_page_index(SettingsPageId::Switcher),
+            settings_page_index(SettingsPageId::Clipboard)
+        );
+        assert_ne!(SettingsPageId::General, SettingsPageId::About);
+    }
+
+    /// Every page must be reachable by its name, and nothing that names no page may resolve. The
+    /// rejected values are the counter-examples: a typo and an out-of-range index used to be silent
+    /// no-ops or a clamp onto a different page, which is exactly what a script cannot detect.
+    #[test]
+    fn the_page_switch_names_every_page_and_refuses_the_rest() {
+        for (index, page) in SETTINGS_PAGES.iter().enumerate() {
+            assert_eq!(parse_settings_page_spec(page.name), Some(index));
+            // Case and surrounding whitespace are normalized, because the switch arrives as typed.
+            assert_eq!(
+                parse_settings_page_spec(&format!("  {}  ", page.name.to_uppercase())),
+                Some(index)
+            );
+        }
+        // A bare switch and the boolean truthy spellings keep their pre-table meaning: About.
+        for spec in ["", "1", "true", "yes", "TRUE", " about "] {
+            assert_eq!(
+                parse_settings_page_spec(spec),
+                Some(SETTINGS_ABOUT_PAGE_INDEX)
+            );
+        }
+        // The historical alias, kept from the switch's first form.
+        assert_eq!(
+            parse_settings_page_spec("bindings"),
+            Some(SETTINGS_KEY_BINDINGS_PAGE_INDEX)
+        );
+        // A raw index inside the range is a page; one past either end names nothing.
+        assert_eq!(parse_settings_page_spec("0"), Some(0));
+        assert_eq!(
+            parse_settings_page_spec(&(SETTINGS_PAGE_COUNT - 1).to_string()),
+            Some(SETTINGS_PAGE_COUNT - 1)
+        );
+        assert_eq!(
+            parse_settings_page_spec(&SETTINGS_PAGE_COUNT.to_string()),
+            None
+        );
+        assert_eq!(parse_settings_page_spec("99"), None);
+        // A near miss must not resolve to a different page.
+        for spec in ["key-binding", "keybindings", "keystroke", "generall"] {
+            assert_eq!(
+                parse_settings_page_spec(spec),
+                None,
+                "{spec} must not resolve"
+            );
+        }
+    }
+
+    /// The A2 view-root names are what `scripts/e2e/*.sh` look up by, so they are derived from the
+    /// same table the switch uses. This pins the spelling without needing a live window: the root
+    /// name is `sidebar_<i>_<name>` / `page_<i>_<name>`.
+    #[test]
+    fn the_view_root_names_follow_the_page_table() {
+        let (sidebar, page) = super::view_root_names();
+        let roots: Vec<&str> = sidebar
+            .iter()
+            .chain(page.iter())
+            .map(String::as_str)
+            .collect();
+        // The spellings the A2 scripts already assert (settings-layout.sh / scrollbar-style-flip.sh).
+        for expected in [
+            "sidebar_0_general",
+            "sidebar_4_key_bindings",
+            "sidebar_5_keystroke_display",
+            "sidebar_6_about",
+            "page_0_general",
+            "page_2_mouse",
+            "page_6_about",
+        ] {
+            assert!(roots.contains(&expected), "{expected} is missing");
+        }
     }
 
     use super::settings_effective_corner_radius;

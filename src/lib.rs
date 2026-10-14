@@ -2449,24 +2449,23 @@ fn prompt_accessibility_if_needed() {
     }
 }
 
-/// Parses the development switch `--open-settings[=<general|about|key-bindings|0..6|1>]`,
-/// forwarded by `scripts/dev-restart.sh` (argv is the only channel; see the dev_flags module).
-/// Returns a sidebar page index (0=General .. 6=About); None when absent or unparsable, so a normal
-/// launch is unaffected.
+/// Resolves the development switch `--open-settings[=<name|index>]`, forwarded by
+/// `scripts/dev-restart.sh` (argv is the only channel; see the dev_flags module). Returns a sidebar
+/// page index, or None when the switch is absent or names no page, so a normal launch is unaffected.
 ///
-/// The numeric form is a page index and follows the sidebar: 5 is Keystroke Display and 6 is About
-/// since `window control` and `quick actions` merged into one page.
+/// The name and the index both come from `settings::SETTINGS_PAGES`, so this switch cannot drift from
+/// the sidebar it addresses; a bad value is refused rather than clamped to a different page, and the
+/// refusal is logged because a typo would otherwise look exactly like a switch that did nothing.
 fn open_settings_page_request() -> Option<usize> {
     let spec = crate::dev_flags::value("open-settings")?;
-    match spec.trim().to_ascii_lowercase().as_str() {
-        "" | "1" | "true" | "about" => Some(crate::settings::SETTINGS_ABOUT_PAGE_INDEX),
-        "general" | "0" => Some(0),
-        "key-bindings" | "bindings" => Some(crate::settings::SETTINGS_KEY_BINDINGS_PAGE_INDEX),
-        "keystroke-display" => Some(crate::settings::SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX),
-        other => other
-            .parse::<usize>()
-            .ok()
-            .map(|page| page.min(crate::settings::SETTINGS_PAGE_COUNT - 1)),
+    match crate::settings::parse_settings_page_spec(&spec) {
+        Some(page) => Some(page),
+        None => {
+            log_info!(
+                "[dev] --open-settings={spec} names no page; the settings window stays closed"
+            );
+            None
+        }
     }
 }
 

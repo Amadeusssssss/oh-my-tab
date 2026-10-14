@@ -1183,14 +1183,17 @@ fn smooth_slider_value(value: f64, minimum: f64, maximum: f64) -> f64 {
 /// while off.
 pub(super) unsafe fn update_pointer_accel_visibility(ui: &SettingsUi) {
     let state: isize = msg_send![ui.disable_pointer_accel, state];
-    ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, state == 1);
+    ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX]
+        .set_group_visible(RowGroup::PointerAccel, state == 1);
 }
 
 /// Refresh the conditional line and smooth controls from the selected mode.
 pub(super) unsafe fn update_mode_dependent_visibility(ui: &SettingsUi) {
     let mode = selected_scroll_mode(ui);
-    ui.page_canvases[2].set_group_visible(RowGroup::LineCount, mode == ScrollMode::Line);
-    ui.page_canvases[2].set_group_visible(RowGroup::SmoothScrolling, mode == ScrollMode::Smooth);
+    ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX]
+        .set_group_visible(RowGroup::LineCount, mode == ScrollMode::Line);
+    ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX]
+        .set_group_visible(RowGroup::SmoothScrolling, mode == ScrollMode::Smooth);
     let mouse_enabled: isize = msg_send![ui.enable_mouse, state];
     if mouse_enabled == 1 {
         SettingsRow::set_enabled(ui.line_count, mode == ScrollMode::Line);
@@ -1205,7 +1208,8 @@ unsafe fn update_display_mode_dependent_visibility(ui: &SettingsUi) {
     let idx: isize = msg_send![ui.thumbnails_enabled, indexOfSelectedItem];
     // Popup index 0 = icons only, 1 = icons and thumbnails (same as the layout.thumbnails_enabled
     // boolean).
-    ui.page_canvases[1].set_group_visible(RowGroup::ThumbnailOnly, idx == 1);
+    ui.page_canvases[SETTINGS_SWITCHER_PAGE_INDEX]
+        .set_group_visible(RowGroup::ThumbnailOnly, idx == 1);
 }
 
 /// Show the "clear the matching system-pasteboard entry" row only while "delete entry after
@@ -1215,7 +1219,8 @@ fn clipboard_delete_dependent_visibility_from_config(cfg: &Config) -> bool {
 }
 
 unsafe fn set_clipboard_delete_dependent_visibility(ui: &SettingsUi, visible: bool) {
-    ui.page_canvases[3].set_group_visible(RowGroup::ClipboardDeleteChild, visible);
+    ui.page_canvases[SETTINGS_CLIPBOARD_PAGE_INDEX]
+        .set_group_visible(RowGroup::ClipboardDeleteChild, visible);
 }
 
 /// Refresh the settings window's top warning banner for the current storage state. The state is

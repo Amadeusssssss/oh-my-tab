@@ -549,7 +549,7 @@ struct Card {
 /// One node of the view tree. `frame` is in the parent's coordinate space, so cross-level
 /// comparisons are meaningless: scripts must only compare nodes sharing a `parent`.
 struct ViewNode {
-    root: &'static str,
+    root: String,
     parent: i64,
     depth: usize,
     class: String,
@@ -561,7 +561,7 @@ struct ViewNode {
 /// content) and stays null when the view has none.
 unsafe fn walk_views(
     view: *mut AnyObject,
-    root: &'static str,
+    root: &str,
     parent: i64,
     depth: usize,
     out: &mut Vec<ViewNode>,
@@ -592,7 +592,7 @@ unsafe fn walk_views(
     };
     let index = out.len() as i64;
     out.push(ViewNode {
-        root,
+        root: root.to_string(),
         parent,
         depth,
         class: class_name,
@@ -620,7 +620,7 @@ unsafe fn walk_views(
 /// so the right column gets clipped). All three levels are recorded so nothing assumes which level
 /// is the scroll view. `scroller_style`: 0 = legacy, 1 = overlay, -1 = not a scroll view / unknown.
 struct PageGeometry {
-    root: &'static str,
+    root: String,
     self_frame: NSRect,
     parent_frame: NSRect,
     grandparent_frame: NSRect,
@@ -744,7 +744,7 @@ fn collect_pages() -> Vec<PageGeometry> {
 fn collect_views() -> Vec<ViewNode> {
     let mut nodes = Vec::new();
     for (root, view) in crate::settings::e2e_view_roots() {
-        unsafe { walk_views(view, root, -1, 0, &mut nodes) };
+        unsafe { walk_views(view, &root, -1, 0, &mut nodes) };
     }
     nodes
 }
@@ -1402,7 +1402,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         }
         json.push_str(&format!(
             "\n    {{\"root\": {}, \"self\": [{}, {}, {}, {}], \"parent\": [{}, {}, {}, {}], \"grandparent\": [{}, {}, {}, {}], \"clip\": [{}, {}, {}, {}], \"styles\": [{}, {}, {}], \"doc\": [{}, {}, {}]}}",
-            json_string(page.root),
+            json_string(&page.root),
             page.self_frame.origin.x,
             page.self_frame.origin.y,
             page.self_frame.size.width,
@@ -1435,7 +1435,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         }
         json.push_str(&format!(
             "\n    {{\"root\": {}, \"parent\": {}, \"depth\": {}, \"class\": {}, \"frame\": [{}, {}, {}, {}], \"text\": {}}}",
-            json_string(node.root),
+            json_string(&node.root),
             node.parent,
             node.depth,
             json_string(&node.class),

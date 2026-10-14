@@ -5,17 +5,31 @@ use crate::clipboard::{
     record_applied_about_status, record_applied_action, AppliedAction, NoticeSurface,
 };
 
-/// The page scroll views, indexed by sidebar order.
-fn page_scroll_views(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
-    [
-        ui.general_view,
-        ui.switcher_view,
-        ui.mouse_view,
-        ui.clipboard_view,
-        ui.key_bindings_view,
-        ui.keystroke_display_view,
-        ui.about_view,
-    ]
+/// The sidebar buttons, indexed by sidebar order. The order is `SETTINGS_PAGES`; the identity
+/// chooses the control, so the two cannot drift.
+pub(super) fn sidebar_buttons(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
+    settings_page_ids().map(|page| match page {
+        SettingsPageId::General => ui.sidebar_general,
+        SettingsPageId::Switcher => ui.sidebar_switcher,
+        SettingsPageId::Mouse => ui.sidebar_mouse,
+        SettingsPageId::Clipboard => ui.sidebar_clipboard,
+        SettingsPageId::KeyBindings => ui.sidebar_key_bindings,
+        SettingsPageId::KeystrokeDisplay => ui.sidebar_keystroke_display,
+        SettingsPageId::About => ui.sidebar_about,
+    })
+}
+
+/// The page scroll views, indexed by sidebar order. Same rule as [`sidebar_buttons`].
+pub(super) fn page_scroll_views(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
+    settings_page_ids().map(|page| match page {
+        SettingsPageId::General => ui.general_view,
+        SettingsPageId::Switcher => ui.switcher_view,
+        SettingsPageId::Mouse => ui.mouse_view,
+        SettingsPageId::Clipboard => ui.clipboard_view,
+        SettingsPageId::KeyBindings => ui.key_bindings_view,
+        SettingsPageId::KeystrokeDisplay => ui.keystroke_display_view,
+        SettingsPageId::About => ui.about_view,
+    })
 }
 
 /// Which warning a page's top strip carries.
@@ -259,44 +273,18 @@ pub(super) fn select_sidebar(idx: usize) {
                 Some(u) => u,
                 None => return,
             };
-            let buttons = [
-                ui.sidebar_general,
-                ui.sidebar_switcher,
-                ui.sidebar_mouse,
-                ui.sidebar_clipboard,
-                ui.sidebar_key_bindings,
-                ui.sidebar_keystroke_display,
-                ui.sidebar_about,
-            ];
-            let views = [
-                ui.general_view,
-                ui.switcher_view,
-                ui.mouse_view,
-                ui.clipboard_view,
-                ui.key_bindings_view,
-                ui.keystroke_display_view,
-                ui.about_view,
-            ];
+            let buttons = sidebar_buttons(ui);
+            let views = page_scroll_views(ui);
             // align the highlight to the selected button's frame
             let frame: NSRect = msg_send![buttons[idx], frame];
             SettingsSidebar::move_highlight(ui.sidebar_highlight, frame);
             // Selected items use an accent-colored bold title; unselected items use the system label color.
-            // Shares the sidebar's order: the index is the page index, so one entry per page.
-            let titles = [
-                t("settings.sidebar_general"),
-                t("settings.sidebar_switcher"),
-                t("settings.sidebar_mouse"),
-                t("settings.sidebar_clipboard"),
-                t("settings.sidebar_key_bindings"),
-                t("settings.sidebar_keystroke_display"),
-                t("settings.sidebar_about"),
-            ];
             for (i, &b) in buttons.iter().enumerate() {
                 let layer: *mut AnyObject = msg_send![b, layer];
                 if !layer.is_null() {
                     layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000000u32));
                 }
-                set_sidebar_title(b, &titles[i], i == idx);
+                set_sidebar_title(b, &t(settings_page_identity(i).title_key()), i == idx);
             }
             // Toggle every page's visibility.
             for (i, &v) in views.iter().enumerate() {
@@ -314,16 +302,7 @@ pub(super) fn select_sidebar(idx: usize) {
                 document: msg_send![views[idx], documentView],
             };
             page.scroll_to_top();
-            let page_names: [&str; SETTINGS_PAGE_COUNT] = [
-                "general",
-                "switcher",
-                "mouse",
-                "clipboard",
-                "key-bindings",
-                "keystroke-display",
-                "about",
-            ];
-            page.validate(page_names[idx]);
+            page.validate(settings_page_name(idx));
         });
     }
     // Landing on the Mouse page has to fill it: the value load skipped it when this open came in on
@@ -679,18 +658,7 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
         let Some(ui) = ui.as_ref() else {
             return;
         };
-        for (index, scroll) in [
-            ui.general_view,
-            ui.switcher_view,
-            ui.mouse_view,
-            ui.clipboard_view,
-            ui.key_bindings_view,
-            ui.keystroke_display_view,
-            ui.about_view,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (index, scroll) in page_scroll_views(ui).into_iter().enumerate() {
             if scroll.is_null() || !ui.page_canvases[index].is_bound() {
                 continue;
             }
@@ -715,15 +683,7 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
 }
 
 unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; SETTINGS_PAGE_COUNT] {
-    let scrolls = [
-        ui.general_view,
-        ui.switcher_view,
-        ui.mouse_view,
-        ui.clipboard_view,
-        ui.key_bindings_view,
-        ui.keystroke_display_view,
-        ui.about_view,
-    ];
+    let scrolls = page_scroll_views(ui);
     scrolls.map(|scroll| {
         let clip: *mut AnyObject = msg_send![scroll, contentView];
         let bounds: NSRect = msg_send![clip, bounds];
@@ -849,15 +809,7 @@ fn show_settings_inner(
                 let _: () = msg_send![u.window, layoutIfNeeded];
                 reposition_traffic_lights(u.window);
                 if let Some(offsets) = preserved_scroll_offsets {
-                    let scrolls = [
-                        u.general_view,
-                        u.switcher_view,
-                        u.mouse_view,
-                        u.clipboard_view,
-                        u.key_bindings_view,
-                        u.keystroke_display_view,
-                        u.about_view,
-                    ];
+                    let scrolls = page_scroll_views(u);
                     for (scroll, origin) in scrolls.into_iter().zip(offsets) {
                         restore_settings_scroll_offset(scroll, origin);
                     }
@@ -894,15 +846,7 @@ fn show_settings_inner(
                 .min(SETTINGS_PAGE_COUNT - 1);
             with_settings_ui(|ui| {
                 if let Some(u) = ui.as_ref() {
-                    let scrolls = [
-                        u.general_view,
-                        u.switcher_view,
-                        u.mouse_view,
-                        u.clipboard_view,
-                        u.key_bindings_view,
-                        u.keystroke_display_view,
-                        u.about_view,
-                    ];
+                    let scrolls = page_scroll_views(u);
                     widgets::scroll_page_to_top(scrolls[selected]);
                 }
             });
@@ -1455,22 +1399,9 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 );
             }
         }
-        let Some((window, pages)) = with_settings_ui(|ui| {
-            ui.as_ref().map(|ui| {
-                (
-                    ui.window,
-                    [
-                        ui.general_view,
-                        ui.switcher_view,
-                        ui.mouse_view,
-                        ui.clipboard_view,
-                        ui.key_bindings_view,
-                        ui.keystroke_display_view,
-                        ui.about_view,
-                    ],
-                )
-            })
-        }) else {
+        let Some((window, pages)) =
+            with_settings_ui(|ui| ui.as_ref().map(|ui| (ui.window, page_scroll_views(ui))))
+        else {
             return false;
         };
         let sidebar_heading_absent = with_settings_ui(|ui| {
@@ -1495,21 +1426,10 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
-        // One name per page, in sidebar order: the index is the page index.
-        let page_names: [&str; SETTINGS_PAGE_COUNT] = [
-            "general",
-            "switcher",
-            "mouse",
-            "clipboard",
-            "key-bindings",
-            "keystroke-display",
-            "about",
-        ];
-        if pages
-            .iter()
-            .zip(page_names.iter())
-            .any(|(page, page_name)| !settings_style_tree_is_valid(*page, false, page_name))
-        {
+        // One name per page, in sidebar order, from the page table the sidebar itself is built from.
+        if pages.iter().enumerate().any(|(index, page)| {
+            !settings_style_tree_is_valid(*page, false, settings_page_name(index))
+        }) {
             log_info!(
                 "[smoke-settings-layout] font tokens, slider ticks, or card elevation are invalid"
             );
@@ -1560,15 +1480,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         log_info!("[smoke-settings-layout] hover tooltip renders its captions in full");
         let sidebar_layout_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
-            let buttons = [
-                ui.sidebar_general,
-                ui.sidebar_switcher,
-                ui.sidebar_mouse,
-                ui.sidebar_clipboard,
-                ui.sidebar_key_bindings,
-                ui.sidebar_keystroke_display,
-                ui.sidebar_about,
-            ];
+            let buttons = sidebar_buttons(ui);
             if buttons.iter().any(|button| button.is_null()) {
                 return Some(false);
             }
@@ -1631,6 +1543,23 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             log_info!(
                 "[smoke-settings-layout] a sidebar icon and its title ink do not share a mid-line"
             );
+            hide_settings();
+            return false;
+        }
+        // Each sidebar button must carry its own page's title. The accessors key controls by page
+        // identity; this is the live counter-example for a mismatched binding, because a wrong arm
+        // would put one page's title (and its selection) on another page's button.
+        let buttons_match_pages = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            let buttons = sidebar_buttons(ui);
+            let identities = settings_page_ids();
+            Some(buttons.iter().zip(identities.iter()).all(|(button, page)| {
+                widgets::sidebar_button_title(*button) == t(page.title_key())
+            }))
+        })
+        .unwrap_or(false);
+        if !buttons_match_pages {
+            log_info!("[smoke-settings-layout] a sidebar button does not carry its page's title");
             hide_settings();
             return false;
         }
@@ -1794,20 +1723,11 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
-        let names: [&str; SETTINGS_PAGE_COUNT] = [
-            "general",
-            "switcher",
-            "mouse",
-            "clipboard",
-            "key-bindings",
-            "keystroke-display",
-            "about",
-        ];
         for (index, page) in pages.iter().enumerate() {
             select_sidebar(index);
             let _: () = msg_send![window, layoutIfNeeded];
             scroll_page_to_top(*page);
-            debug_validate_settings_page(*page, names[index]);
+            debug_validate_settings_page(*page, settings_page_name(index));
         }
         // The About page's keychain row reads its state from the clipboard session and must follow it
         // WITHOUT a page switch or an app activation (a keychain grant can be silent, and a load can
@@ -2519,8 +2439,10 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         // state sync belongs to the settings state-sync smoke.
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
-                ui.page_canvases[2].set_group_visible(RowGroup::LineCount, false);
-                ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, false);
+                ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX]
+                    .set_group_visible(RowGroup::LineCount, false);
+                ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX]
+                    .set_group_visible(RowGroup::PointerAccel, false);
             }
         });
         let mouse_collapsed = with_settings_ui(|ui| {
@@ -2534,7 +2456,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         // Reopen only the upper group.
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
-                ui.page_canvases[2].set_group_visible(RowGroup::LineCount, true);
+                ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX]
+                    .set_group_visible(RowGroup::LineCount, true);
             }
         });
         let mouse_after_upper = with_settings_ui(|ui| {
@@ -2564,7 +2487,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         // the height it started with.
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
-                ui.page_canvases[2].set_group_visible(RowGroup::PointerAccel, true);
+                ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX]
+                    .set_group_visible(RowGroup::PointerAccel, true);
             }
         });
         let mouse_document_restored = with_settings_ui(|ui| {
@@ -2992,76 +2916,99 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let keystroke_display_doc_h = 650.0;
         let about_doc_h = 1300.0;
 
-        let general_page = SettingsPage::new(content, page_frame, general_doc_h, false);
-        let general_root = general_page.scroll;
-        let general_view = general_page.document;
-        ui.general_view = general_root;
-        let switcher_page = SettingsPage::new(content, page_frame, switcher_doc_h, true);
-        let switcher_root = switcher_page.scroll;
-        let switcher_view = switcher_page.document;
-        ui.switcher_view = switcher_root;
-        let mouse_page = SettingsPage::new(content, page_frame, mouse_doc_h, true);
-        let mouse_root = mouse_page.scroll;
-        let mouse_view = mouse_page.document;
-        ui.mouse_view = mouse_root;
-        let clipboard_page = SettingsPage::new(content, page_frame, clipboard_doc_h, true);
-        let clipboard_root = clipboard_page.scroll;
-        let clipboard_view = clipboard_page.document;
-        ui.clipboard_view = clipboard_root;
-        let key_bindings_page = SettingsPage::new(content, page_frame, key_bindings_doc_h, true);
-        let key_bindings_root = key_bindings_page.scroll;
-        let key_bindings_view = key_bindings_page.document;
-        ui.key_bindings_view = key_bindings_root;
-        let keystroke_display_page =
-            SettingsPage::new(content, page_frame, keystroke_display_doc_h, true);
-        let keystroke_display_root = keystroke_display_page.scroll;
-        let keystroke_display_view = keystroke_display_page.document;
-        ui.keystroke_display_view = keystroke_display_root;
-        let about_page = SettingsPage::new(content, page_frame, about_doc_h, true);
-        let about_root = about_page.scroll;
-        ui.about_view = about_root;
+        // One page per identity, in `SETTINGS_PAGES` order. The provisional height is looked up by
+        // identity, so a table reorder moves the page with its height instead of pairing one page
+        // with another page's provisional document height.
+        let provisional_doc_h = |page: SettingsPageId| match page {
+            SettingsPageId::General => general_doc_h,
+            SettingsPageId::Switcher => switcher_doc_h,
+            SettingsPageId::Mouse => mouse_doc_h,
+            SettingsPageId::Clipboard => clipboard_doc_h,
+            SettingsPageId::KeyBindings => key_bindings_doc_h,
+            SettingsPageId::KeystrokeDisplay => keystroke_display_doc_h,
+            SettingsPageId::About => about_doc_h,
+        };
+        let mut page_roots = [std::ptr::null_mut::<AnyObject>(); SETTINGS_PAGE_COUNT];
+        let mut page_documents = [std::ptr::null_mut::<AnyObject>(); SETTINGS_PAGE_COUNT];
+        for (index, page) in settings_page_ids().into_iter().enumerate() {
+            // Only General is built visible; every other page is hidden until selected.
+            let built = SettingsPage::new(
+                content,
+                page_frame,
+                provisional_doc_h(page),
+                page != SettingsPageId::General,
+            );
+            page_roots[index] = built.scroll;
+            page_documents[index] = built.document;
+            match page {
+                SettingsPageId::General => ui.general_view = built.scroll,
+                SettingsPageId::Switcher => ui.switcher_view = built.scroll,
+                SettingsPageId::Mouse => ui.mouse_view = built.scroll,
+                SettingsPageId::Clipboard => ui.clipboard_view = built.scroll,
+                SettingsPageId::KeyBindings => ui.key_bindings_view = built.scroll,
+                SettingsPageId::KeystrokeDisplay => ui.keystroke_display_view = built.scroll,
+                SettingsPageId::About => ui.about_view = built.scroll,
+            }
+        }
         // Record this page's measured footprint for the next build (0 = overlay).
-        crate::scroller::note_reserved(crate::scroller::reserved_width(about_root));
-        let about_view = about_page.document;
-        let general_content_bottom =
+        crate::scroller::note_reserved(crate::scroller::reserved_width(
+            page_roots[settings_page_index(SettingsPageId::About)],
+        ));
+
+        let page_view = |page: SettingsPageId| page_documents[settings_page_index(page)];
+        let general_view = page_view(SettingsPageId::General);
+        let switcher_view = page_view(SettingsPageId::Switcher);
+        let mouse_view = page_view(SettingsPageId::Mouse);
+        let clipboard_view = page_view(SettingsPageId::Clipboard);
+        let key_bindings_view = page_view(SettingsPageId::KeyBindings);
+        let keystroke_display_view = page_view(SettingsPageId::KeystrokeDisplay);
+        let about_view = page_view(SettingsPageId::About);
+        // Each builder's content bottom lands at its own identity's slot, so the layout owner a
+        // page is handed cannot be another page's.
+        let mut page_bottoms = [0.0f64; SETTINGS_PAGE_COUNT];
+        page_bottoms[settings_page_index(SettingsPageId::General)] =
             page_builder::build_general_page(&page_context, general_view, general_doc_h, &mut ui);
 
-        let switcher_content_bottom = page_builder::build_switcher_page(
-            &page_context,
-            switcher_view,
-            switcher_doc_h,
-            &mut ui,
-        );
+        page_bottoms[settings_page_index(SettingsPageId::Switcher)] =
+            page_builder::build_switcher_page(
+                &page_context,
+                switcher_view,
+                switcher_doc_h,
+                &mut ui,
+            );
 
-        let mouse_content_bottom =
+        page_bottoms[settings_page_index(SettingsPageId::Mouse)] =
             page_builder::build_mouse_page(&page_context, mouse_view, mouse_doc_h, &mut ui);
 
         // The storage state can be decided before OR after this build (the load runs off the main
         // thread), so the banner is settled from the state after the views exist: reading it inside
         // the builder would miss a state that arrives while the page is being laid out.
         super::dispatch::refresh_clipboard_unavailable_notice();
-        let clipboard_options_card_bottom = page_builder::build_clipboard_page(
-            &page_context,
-            clipboard_view,
-            clipboard_doc_h,
-            &mut ui,
-        );
+        page_bottoms[settings_page_index(SettingsPageId::Clipboard)] =
+            page_builder::build_clipboard_page(
+                &page_context,
+                clipboard_view,
+                clipboard_doc_h,
+                &mut ui,
+            );
 
-        let key_bindings_card_bottom = page_builder::build_key_bindings_page(
-            &page_context,
-            key_bindings_view,
-            key_bindings_doc_h,
-            &mut ui,
-        );
+        page_bottoms[settings_page_index(SettingsPageId::KeyBindings)] =
+            page_builder::build_key_bindings_page(
+                &page_context,
+                key_bindings_view,
+                key_bindings_doc_h,
+                &mut ui,
+            );
 
-        let keystroke_display_card_bottom = page_builder::build_keystroke_display_page(
-            &page_context,
-            keystroke_display_view,
-            keystroke_display_doc_h,
-            &mut ui,
-        );
+        page_bottoms[settings_page_index(SettingsPageId::KeystrokeDisplay)] =
+            page_builder::build_keystroke_display_page(
+                &page_context,
+                keystroke_display_view,
+                keystroke_display_doc_h,
+                &mut ui,
+            );
 
-        let compact_card_bottom =
+        page_bottoms[settings_page_index(SettingsPageId::About)] =
             page_builder::build_about_page(&page_context, about_view, about_doc_h, window, &mut ui);
 
         page_builder::finalize_settings_pages(
@@ -3071,33 +3018,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             content_w,
             target,
             page_builder::SettingsPageFinalization {
-                roots: [
-                    general_root,
-                    switcher_root,
-                    mouse_root,
-                    clipboard_root,
-                    key_bindings_root,
-                    keystroke_display_root,
-                    about_root,
-                ],
-                documents: [
-                    general_view,
-                    switcher_view,
-                    mouse_view,
-                    clipboard_view,
-                    key_bindings_view,
-                    keystroke_display_view,
-                    about_view,
-                ],
-                bottoms: [
-                    general_content_bottom,
-                    switcher_content_bottom,
-                    mouse_content_bottom,
-                    clipboard_options_card_bottom,
-                    key_bindings_card_bottom,
-                    keystroke_display_card_bottom,
-                    compact_card_bottom,
-                ],
+                roots: page_roots,
+                documents: page_documents,
+                bottoms: page_bottoms,
             },
             &mut ui,
         );

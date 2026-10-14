@@ -95,7 +95,9 @@ pub(crate) extern "C" fn handle_page_restore_defaults_confirm(
     _sender: *mut c_void,
 ) {
     set_page_restore_confirmation_expanded(false, false);
-    restore_tab_defaults(SIDEBAR_SELECTED.load(Ordering::SeqCst));
+    restore_page_defaults(settings_page_identity(
+        SIDEBAR_SELECTED.load(Ordering::SeqCst),
+    ));
     show_restore_success(true);
 }
 
@@ -207,20 +209,23 @@ fn restore_all_defaults() {
     apply_config_change(&old, &defaults, ConfigChangeSource::RestoreDefaults);
 }
 
-/// Restore every default of the current tab in one atomic update (other tabs untouched).
-fn restore_tab_defaults(tab: usize) {
+/// Restore every default of one page in one atomic update (other pages untouched).
+///
+/// Keyed by the page's IDENTITY, not its sidebar number: the scope of a restore has to follow the
+/// page the user is on when a page moves, or Clipboard's restore resets the Switcher.
+fn restore_page_defaults(page: SettingsPageId) {
     let old = CONFIG.read().unwrap().clone();
     let mut cfg = old.clone();
     let d = Config::default();
-    // Per-tab config scope: partitioned by page ownership, strictly limited to this tab.
-    match tab {
-        0 => {
+    // Per-page config scope: partitioned by page ownership, strictly limited to this page.
+    match page {
+        SettingsPageId::General => {
             // General: appearance + locale + logging. launch_at_login (system-level) is kept.
             cfg.appearance = d.appearance;
             cfg.i18n = d.i18n;
             cfg.logging = d.logging;
         }
-        1 => {
+        SettingsPageId::Switcher => {
             // Switcher page: windows/layout/fonts/keyboard + corner radius (lives on this page).
             cfg.windows = d.windows;
             cfg.layout = d.layout;
@@ -228,7 +233,7 @@ fn restore_tab_defaults(tab: usize) {
             cfg.keyboard = d.keyboard;
             cfg.appearance.corner_radius = d.appearance.corner_radius;
         }
-        2 => {
+        SettingsPageId::Mouse => {
             // Mouse page: master switch + every field of the selected device's profile (an
             // explicit default profile is created when absent, so this page's visible and
             // effective values return to defaults without touching other devices).
@@ -247,29 +252,28 @@ fn restore_tab_defaults(tab: usize) {
                 prof.button_mappings_enabled = dp.button_mappings_enabled;
             }
         }
-        3 => {
+        SettingsPageId::Clipboard => {
             cfg.clipboard = d.clipboard;
         }
-        SETTINGS_KEY_BINDINGS_PAGE_INDEX => {
+        SettingsPageId::KeyBindings => {
             // One page, one section: restoring it puts the factory bindings and both group
             // switches back, which is also what drops every binding the user added.
             cfg.key_bindings = d.key_bindings;
         }
-        SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX => {
+        SettingsPageId::KeystrokeDisplay => {
             cfg.keystroke_display = d.keystroke_display;
         }
-        SETTINGS_ABOUT_PAGE_INDEX => {
+        SettingsPageId::About => {
             cfg.updates = d.updates;
         }
-        _ => {}
     }
     if let Ok(mut w) = CONFIG.write() {
         *w = cfg.clone();
     }
     log_config_changes(&old, &CONFIG.read().unwrap());
     persist_config_now();
-    log_debug!("[settings] tab {} restored to defaults", tab);
-    if tab == 0 {
+    log_debug!("[settings] page {page:?} restored to defaults");
+    if page == SettingsPageId::General {
         // The General page involves theme/locale defaults: apply effects, then rebuild the
         // settings window in place.
         apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);

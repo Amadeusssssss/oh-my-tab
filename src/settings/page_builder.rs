@@ -392,7 +392,7 @@ pub(super) unsafe fn build_switcher_page(
     canvas.card(&t("settings.header_keyboard"));
 
     let content_bottom = canvas.finish();
-    ui.page_canvases[1] = canvas;
+    ui.page_canvases[SETTINGS_SWITCHER_PAGE_INDEX] = canvas;
     content_bottom
 }
 
@@ -901,7 +901,7 @@ pub(super) unsafe fn build_general_page(
     canvas.card(&t("settings.header_backup"));
 
     let content_bottom = canvas.finish();
-    ui.page_canvases[0] = canvas;
+    ui.page_canvases[SETTINGS_GENERAL_PAGE_INDEX] = canvas;
     content_bottom
 }
 
@@ -1388,7 +1388,7 @@ pub(super) unsafe fn build_mouse_page(
     // Settle the page and publish it before the mapping rows render: the table's block has to be
     // part of the layout for `render_mapping_rows` to hand over its height.
     let content_bottom = canvas.finish();
-    ui.page_canvases[2] = canvas;
+    ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX] = canvas;
     // Render the current device's mappings initially.
     render_mapping_rows();
 
@@ -1650,7 +1650,7 @@ pub(super) unsafe fn build_clipboard_page(
     canvas.card(&t("settings.header_clipboard_options"));
 
     let content_bottom = canvas.finish();
-    ui.page_canvases[3] = canvas;
+    ui.page_canvases[SETTINGS_CLIPBOARD_PAGE_INDEX] = canvas;
     content_bottom
 }
 
@@ -2193,15 +2193,6 @@ pub(super) unsafe fn finalize_settings_pages(
         );
     }
 
-    let page_names: [&str; SETTINGS_PAGE_COUNT] = [
-        "general",
-        "switcher",
-        "mouse",
-        "clipboard",
-        "key_bindings",
-        "keystroke_display",
-        "about",
-    ];
     for (index, (root, document)) in page_roots.iter().zip(page_documents.iter()).enumerate() {
         // Settle the page *before* validating it: the restore control is part of the page content
         // (it hangs below the last card) and therefore decides the document height. Every page is
@@ -2214,6 +2205,6 @@ pub(super) unsafe fn finalize_settings_pages(
             scroll: *root,
             document: *document,
         }
-        .validate(page_names[index]);
+        .validate(settings_page_name(index));
     }
 }

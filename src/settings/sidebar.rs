@@ -163,20 +163,21 @@ pub(super) unsafe fn build_settings_sidebar(
     ui.sidebar_highlight = highlight;
 
     // Sidebar buttons are created in page-index order; each tag selects the matching content view.
+    // The slot each button lands in is chosen by page identity, so a table reorder moves the button
+    // and the field it is stored in together instead of binding one page's field to another page.
     let sidebar_buttons =
         SettingsSidebar::build(sidebar_content, target, 12.0, btn_y0, btn_w, btn_h);
-    [
-        &mut ui.sidebar_general,
-        &mut ui.sidebar_switcher,
-        &mut ui.sidebar_mouse,
-        &mut ui.sidebar_clipboard,
-        &mut ui.sidebar_key_bindings,
-        &mut ui.sidebar_keystroke_display,
-        &mut ui.sidebar_about,
-    ]
-    .iter_mut()
-    .zip(sidebar_buttons)
-    .for_each(|(slot, button)| **slot = button);
+    for (index, button) in sidebar_buttons.into_iter().enumerate() {
+        match settings_page_identity(index) {
+            SettingsPageId::General => ui.sidebar_general = button,
+            SettingsPageId::Switcher => ui.sidebar_switcher = button,
+            SettingsPageId::Mouse => ui.sidebar_mouse = button,
+            SettingsPageId::Clipboard => ui.sidebar_clipboard = button,
+            SettingsPageId::KeyBindings => ui.sidebar_key_bindings = button,
+            SettingsPageId::KeystrokeDisplay => ui.sidebar_keystroke_display = button,
+            SettingsPageId::About => ui.sidebar_about = button,
+        }
+    }
     widgets::set_sidebar_update_indicator(
         ui.sidebar_about,
         UPDATE_AVAILABLE.load(Ordering::SeqCst) || crate::restart::restart_required(),

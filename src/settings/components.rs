@@ -11,7 +11,10 @@ use std::sync::{LazyLock, Mutex};
 use crate::ffi::release_obj;
 use crate::i18n::t;
 
-use super::{tooltip::SettingsTooltip, widgets, SETTINGS_PAGE_COUNT};
+use super::{
+    settings_page_identity, settings_page_ids, tooltip::SettingsTooltip, widgets, SettingsPageId,
+    SETTINGS_PAGE_COUNT,
+};
 
 /// Shared dimensions for in-row action buttons.
 pub(crate) const ROW_ACTION_BTN_W: f64 = 110.0;
@@ -1900,6 +1903,20 @@ pub(super) enum SettingsSidebarIcon {
 }
 
 impl SettingsSidebarIcon {
+    /// The icon for a page identity. Keyed by identity, never by sidebar index: the order lives in
+    /// `SETTINGS_PAGES` alone, so moving a page moves its icon with it.
+    pub(super) fn for_page(page: SettingsPageId) -> Self {
+        match page {
+            SettingsPageId::General => Self::General,
+            SettingsPageId::Switcher => Self::Switcher,
+            SettingsPageId::Mouse => Self::Mouse,
+            SettingsPageId::Clipboard => Self::Clipboard,
+            SettingsPageId::KeyBindings => Self::KeyBindings,
+            SettingsPageId::KeystrokeDisplay => Self::KeystrokeDisplay,
+            SettingsPageId::About => Self::About,
+        }
+    }
+
     fn symbol_name(self) -> &'static str {
         match self {
             Self::General => "gearshape",
@@ -1949,15 +1966,12 @@ fn sidebar_tracking_rect(x: f64, y_top: f64, w: f64, row_h: f64, row_count: usiz
 impl SettingsSidebar {
     /// Measure one shared row height for every localized sidebar title.
     pub(super) unsafe fn row_height(w: f64) -> f64 {
-        let titles = [
-            t("settings.sidebar_general"),
-            t("settings.sidebar_switcher"),
-            t("settings.sidebar_mouse"),
-            t("settings.sidebar_clipboard"),
-            t("settings.sidebar_key_bindings"),
-            t("settings.sidebar_keystroke_display"),
-            t("settings.sidebar_about"),
-        ];
+        // The titles come from the page identities, so a new page cannot be missing from the
+        // measurement and silently under-size every row.
+        let titles: Vec<String> = settings_page_ids()
+            .iter()
+            .map(|page| t(page.title_key()))
+            .collect();
         widgets::settings_sidebar_required_row_height(w, &titles)
     }
 
@@ -1988,34 +2002,20 @@ impl SettingsSidebar {
         w: f64,
         row_h: f64,
     ) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
-        // Add new sidebar entries here: the component owns title keys, icons, tags, and spacing.
-        // Keystroke Display follows Quick Actions; About remains last.
-        let entries = [
-            ("settings.sidebar_general", SettingsSidebarIcon::General),
-            ("settings.sidebar_switcher", SettingsSidebarIcon::Switcher),
-            ("settings.sidebar_mouse", SettingsSidebarIcon::Mouse),
-            ("settings.sidebar_clipboard", SettingsSidebarIcon::Clipboard),
-            (
-                "settings.sidebar_key_bindings",
-                SettingsSidebarIcon::KeyBindings,
-            ),
-            (
-                "settings.sidebar_keystroke_display",
-                SettingsSidebarIcon::KeystrokeDisplay,
-            ),
-            ("settings.sidebar_about", SettingsSidebarIcon::About),
-        ];
+        // The entries come from the page identity table: title key, icon and tag order all follow
+        // `SETTINGS_PAGES`, so a page move cannot leave a hand-written sidebar behind.
         let row_step = row_h + 4.0;
         widgets::make_sidebar_hover_tracking(
             parent,
-            sidebar_tracking_rect(x, y0, w, row_h, entries.len()),
+            sidebar_tracking_rect(x, y0, w, row_h, SETTINGS_PAGE_COUNT),
         );
         std::array::from_fn(|index| {
-            let (title_key, icon) = entries[index];
+            let identity = settings_page_identity(index);
+            let icon = SettingsSidebarIcon::for_page(identity);
             SettingsSidebarTab::attach(
                 parent,
                 target,
-                &t(title_key),
+                &t(identity.title_key()),
                 icon,
                 index as isize,
                 x,

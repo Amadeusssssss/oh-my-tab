@@ -2656,6 +2656,22 @@ unsafe fn sidebar_label_title(label: *mut AnyObject) -> String {
         .into_owned()
 }
 
+/// A sidebar button's current title, for diagnostics. The title lives on a registered label
+/// subview, not on the button itself, so reading the button's `title` would compare against the
+/// wrong object (it is empty).
+pub(super) unsafe fn sidebar_button_title(btn: *mut AnyObject) -> String {
+    if btn.is_null() {
+        return String::from("<unreadable>");
+    }
+    let label = SIDEBAR_TITLE_LABELS
+        .lock()
+        .unwrap()
+        .get(&(btn as usize))
+        .map(|pointer| pointer.0)
+        .unwrap_or(btn);
+    sidebar_label_title(label)
+}
+
 /// The RGBA components of a colour read back out of an RGB bitmap.
 unsafe fn color_components(color: *mut AnyObject) -> (f64, f64, f64, f64) {
     let r: f64 = msg_send![color, redComponent];
