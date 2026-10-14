@@ -855,6 +855,51 @@ pub(super) unsafe fn build_general_page(
     bind_control(target, ui.launch_at_login);
     canvas.card(&t("settings.header_startup"));
 
+    // Backup: export the whole configuration to a file, or restore it on this or another Mac.
+    // `captioned`, not `described`: the latter's subtitle is never rendered, and the import row has
+    // to carry the "this replaces your settings" warning in place of a confirmation dialog.
+    canvas.next_section();
+    let y = canvas.next_row(described_row_h);
+    let export_settings_btn = row_action_button(
+        ctrl_x,
+        ctrl_w,
+        y,
+        &t("settings.btn_export_settings"),
+        target,
+        sel!(handleExportSettings:),
+    );
+    SettingsRow::captioned(
+        general_view,
+        label_x,
+        y,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+        described_row_h,
+        &t("settings.row_export_settings"),
+        &t("settings.desc_export_settings"),
+        export_settings_btn,
+    );
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(general_view, y, described_row_h, content_w);
+    let import_settings_btn = row_action_button(
+        ctrl_x,
+        ctrl_w,
+        y,
+        &t("settings.btn_import_settings"),
+        target,
+        sel!(handleImportSettings:),
+    );
+    SettingsRow::captioned(
+        general_view,
+        label_x,
+        y,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+        described_row_h,
+        &t("settings.row_import_settings"),
+        &t("settings.desc_import_settings"),
+        import_settings_btn,
+    );
+    canvas.card(&t("settings.header_backup"));
+
     let content_bottom = canvas.finish();
     ui.page_canvases[0] = canvas;
     content_bottom

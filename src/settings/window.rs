@@ -1065,11 +1065,13 @@ fn page_restored(before: &AboutPanelSnapshot, after: &AboutPanelSnapshot) -> boo
             .all(|(before, after)| (after - before).abs() <= 1.0)
 }
 
-/// Whether the clipboard page shows the disable warning as a visible label: the row that turns the
-/// feature off has to state that doing so deletes the records (a `described` row's subtitle is not
-/// rendered, so this walks the view tree for an actually-visible label with that string).
-unsafe fn clipboard_disable_warning_is_visible(page: *mut AnyObject) -> bool {
-    let expected = crate::i18n::t("settings.desc_clipboard_enabled");
+/// Whether a page shows `text` as an actually-visible label.
+///
+/// A `described` row's subtitle is never rendered, so a consequence line handed to one silently
+/// does not exist. Both captions that carry a promise the user cannot otherwise see (the clipboard
+/// disable warning, the import overwrite warning) are asserted this way, against the real view tree
+/// rather than the call that was supposed to draw them.
+unsafe fn page_shows_visible_caption(page: *mut AnyObject, expected: &str) -> bool {
     fn find(view: *mut AnyObject, expected: &str) -> bool {
         unsafe {
             if view.is_null() {
@@ -1095,7 +1097,7 @@ unsafe fn clipboard_disable_warning_is_visible(page: *mut AnyObject) -> bool {
             })
         }
     }
-    find(page, &expected)
+    find(page, expected)
 }
 
 unsafe fn settings_style_tree_is_valid(
@@ -1519,12 +1521,26 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // its consequence line has to be a visible label in the real view tree. It was previously
         // handed to a `described` row, whose subtitle this app never renders, and the warning
         // silently did not exist.
-        if !clipboard_disable_warning_is_visible(pages[3]) {
+        if !page_shows_visible_caption(pages[3], &t("settings.desc_clipboard_enabled")) {
             log_info!("[smoke-settings-layout] the clipboard disable warning is not visible");
             hide_settings();
             return false;
         }
         log_info!("[smoke-settings-layout] clipboard disable warning visible");
+        // Same requirement for the import row: the confirmation dialog was deliberately dropped, so
+        // the row's own warning line is the only thing telling the user the import overwrites their
+        // settings. It has to be a visible label, and the General page is index 0.
+        for key in [
+            "settings.desc_import_settings",
+            "settings.desc_export_settings",
+        ] {
+            if !page_shows_visible_caption(pages[0], &t(key)) {
+                log_info!("[smoke-settings-layout] backup caption {key} is not visible");
+                hide_settings();
+                return false;
+            }
+        }
+        log_info!("[smoke-settings-layout] backup captions visible");
         // The hover tooltip is the outlet for a caption that cannot fit its row (design-style §9).
         // Assert it on the real view tree: the bubble must render the longest shipped caption in full,
         // not truncate it a second time -- the fixed 288pt bubble with its 220pt text budget did
@@ -2963,7 +2979,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // frames are assigned: the pages use manual top-anchored coordinates, so post-hoc
         // shrinking would let AppKit move the children a second time. Every height includes
         // SettingsPageHeader's 42pt top padding (18 more than the old 24pt inset).
-        let general_doc_h = 1138.0;
+        // Includes the Backup section: two described rows plus its header.
+        let general_doc_h = 1320.0;
         let switcher_doc_h = 1432.0;
         let mouse_doc_h = 1620.0;
         let clipboard_doc_h = 978.0;

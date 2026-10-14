@@ -1999,6 +1999,30 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handleExportSettings:),
+                handle_export_settings as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleImportSettings:),
+                handle_import_settings as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleImportSettingsReady:),
+                handle_import_settings_ready as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleExportSettingsReady:),
+                handle_export_settings_ready as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleOpenOfficialWebsite:),
                 handle_open_official_website as *mut c_void,
                 types.as_ptr(),

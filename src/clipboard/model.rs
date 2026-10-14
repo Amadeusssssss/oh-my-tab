@@ -379,25 +379,11 @@ pub(super) fn format_copied_at(unix_secs: u64) -> String {
     }
 }
 
-/// Copy timestamp -> "YYYY-MM-DD HH.MM.SS" (local time; the save-as suggested-filename
-/// suffix). The time part deliberately uses dots instead of colons -- colons are
-/// illegal/reserved in HFS+/Finder names (macOS screenshot naming style). Pure function;
-/// the format is unit-tested.
+/// Copy timestamp -> "YYYY-MM-DD HH.MM.SS" (local time; the save-as suggested-filename suffix).
+/// The format itself lives in `ffi` so the settings export's filename stamp is the same string; the
+/// format is unit-tested.
 pub(super) fn format_save_stamp(unix_secs: u64) -> String {
-    unsafe {
-        let mut tm: Tm = std::mem::zeroed();
-        let s = unix_secs as i64;
-        localtime_r(&s, &mut tm);
-        format!(
-            "{:04}-{:02}-{:02} {:02}.{:02}.{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
-    }
+    crate::ffi::format_local_timestamp(unix_secs)
 }
 
 /// The save-as suggested-filename stamp: the entry's copy time (copied_at); legacy

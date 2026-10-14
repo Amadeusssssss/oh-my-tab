@@ -2159,7 +2159,14 @@ fn sanitize_config_value(
 /// Parse and sanitize one config file. The boolean says whether the repaired/migrated value
 /// should be persisted back to disk; TOML syntax or whole-document deserialization failures
 /// return Err so the original file remains available for diagnosis.
-fn parse_config_content(content: &str) -> Result<(Config, Vec<String>, bool), Vec<String>> {
+///
+/// This is the loader the running app uses, and the settings import deliberately reuses it
+/// instead of deserializing the export on its own: field-by-field fallback, the migration hooks
+/// and the legacy-section seeding are exactly the compatibility the import needs (see
+/// `crate::settings::portability`).
+pub(crate) fn parse_config_content(
+    content: &str,
+) -> Result<(Config, Vec<String>, bool), Vec<String>> {
     let actual = match content.parse::<toml::Value>() {
         Ok(value) => value,
         Err(error) => {
@@ -2248,7 +2255,10 @@ static ATOMIC_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write through a same-directory temp file, fsync, and atomically rename it into place so a
 /// reader never observes a partial file and stale writers cannot truncate a newer file.
-fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+///
+/// Shared with the settings export: overwriting an existing backup through a plain write would
+/// truncate it first, so a failed write would destroy the very file it was meant to replace.
+pub(crate) fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
@@ -2294,7 +2304,7 @@ fn atomic_write(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
 
 impl Config {
     /// Serialize to a given path (pure logic; tests inject a temp dir).
-    fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+    pub(crate) fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
         let toml_str =
             toml::to_string_pretty(self).map_err(|e| format!("serialize config: {}", e))?;
         atomic_write(path, toml_str.as_bytes())
@@ -2627,6 +2637,46 @@ pub fn persist_config_now() {
     }) {
         eprintln!("[config] persist request failed: {}", e);
     }
+}
+
+/// Install `candidate` only when its write actually succeeded.
+///
+/// Split out from [`commit_config`] so the ordering rule is assertable without a disk: a failed
+/// write must leave the running configuration exactly as it was, or the app reports an import that
+/// silently reverts on the next launch.
+pub(crate) fn publish_after_write(
+    current: &mut Config,
+    candidate: Config,
+    write: Result<(), String>,
+) -> Result<(), String> {
+    write?;
+    *current = candidate;
+    Ok(())
+}
+
+/// Write and publish a whole candidate configuration as one transaction.
+///
+/// Order matters and is the whole point of this entry point: the candidate goes to disk through
+/// the same monotonic-revision writer every other change uses, and only a durable write publishes
+/// it to `CONFIG`.
+///
+/// The synchronous wait exists because the caller reports the outcome to the user; every other
+/// path stays fire-and-forget on the background thread.
+pub fn commit_config(candidate: Config) -> Result<(), String> {
+    let revision = CONFIG_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
+    let (ack_tx, ack_rx) = mpsc::channel();
+    PERSIST_TX.send(PersistMsg::Flush {
+        snapshot: candidate.clone(),
+        revision,
+        ack: Some(ack_tx),
+    })?;
+    let write = ack_rx
+        .recv()
+        .map_err(|_| "config persistence writer stopped".to_string())?;
+    let mut current = CONFIG
+        .write()
+        .map_err(|_| "config lock poisoned".to_string())?;
+    publish_after_write(&mut current, candidate, write)
 }
 
 /// Synchronously wait until the newest configuration snapshot is durable, used before quitting.

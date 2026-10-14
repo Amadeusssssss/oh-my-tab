@@ -1709,6 +1709,562 @@ fn suggested_export_log_name() -> String {
     }
 }
 
+// MARK: - Settings export / import
+
+/// The export's local-time stamp: `YYYY-MM-DD HH.MM.SS`. A point-in-time snapshot, so repeated
+/// exports never clobber each other.
+fn local_timestamp_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    crate::ffi::format_local_timestamp(secs)
+}
+
+/// Suggested export filename: the app's own name plus the local timestamp, e.g.
+/// `Oh-My-Tab 2026-10-14 11.54.20.toml`.
+///
+/// The name comes from the bundle so a dev build names its files after itself, and the stamp is the
+/// shared local-time format the clipboard's save-as uses, so a saved file reads correctly next to
+/// Finder's own clock.
+fn suggested_export_config_name() -> String {
+    export_file_name(EXPORT_FILE_APP_NAME, &local_timestamp_stamp())
+}
+
+/// The name the export file is named after.
+///
+/// A fixed string rather than the bundle's own name: the file is meant to be recognized and shared,
+/// and a bundle-derived name would rename it in the development bundle ("Oh-My-Tab Dev") and in any
+/// localized build, so the same user would get differently named backups from different builds.
+const EXPORT_FILE_APP_NAME: &str = "Oh-My-Tab";
+
+/// The export filename for an app name and stamp. Pure, so the shape is asserted without FFI; the
+/// live path only supplies the two inputs.
+fn export_file_name(app_name: &str, stamp: &str) -> String {
+    format!("{app_name} {stamp}.toml")
+}
+
+/// The settings "Export settings" button: write the whole live configuration to a user-chosen
+/// NSSavePanel destination.
+///
+/// The snapshot is taken and rendered before the panel opens, so a config edit made while the
+/// panel is up cannot land half-written in the file. The write itself runs on a worker: the
+/// destination is wherever the user pointed, which may be a network volume or a slow external disk,
+/// and an atomic write there includes an fsync that can take seconds. The outcome comes back
+/// through `handleExportSettingsReady:`.
+pub(crate) extern "C" fn handle_export_settings(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    let config = CONFIG.read().unwrap().clone();
+    let version = unsafe { bundle_info_string("CFBundleShortVersionString") };
+    let content = portability::export_toml(&config, &version, &local_timestamp_stamp());
+    // A cancelled save panel is a silent no-op.
+    let Some(destination) = (unsafe { run_save_panel(&suggested_export_config_name()) }) else {
+        return;
+    };
+    // No single-flight gate here: the exported bytes and the destination are both private to this
+    // call, so two exports cannot interfere and the later completion simply wins the toast.
+    if !spawn_worker("settings-export", move || {
+        let outcome =
+            crate::config::atomic_write(std::path::Path::new(&destination), content.as_bytes())
+                .map(|()| destination);
+        *PENDING_EXPORT.lock().unwrap() = Some(outcome);
+        notify_main(sel!(handleExportSettingsReady:));
+    }) {
+        show_alert(
+            &t("settings.export_settings_failed_title"),
+            &t("settings.worker_unavailable"),
+        );
+    }
+}
+
+/// Main-thread continuation of "Export settings": report where the file landed, or why it did not.
+pub(crate) extern "C" fn handle_export_settings_ready(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    let Some(outcome) = PENDING_EXPORT.lock().unwrap().take() else {
+        return;
+    };
+    match outcome {
+        Ok(destination) => {
+            log_info!("[settings] exported configuration to {}", destination);
+            show_settings_toast(&t("settings.toast_settings_exported"));
+        }
+        Err(reason) => show_alert(
+            &t("settings.export_settings_failed_title"),
+            &tf(
+                "settings.export_settings_failed_msg",
+                &[("reason", &reason)],
+            ),
+        ),
+    }
+}
+
+/// Start a background worker, reporting a spawn failure instead of panicking.
+///
+/// `.expect()` is not an option here: every one of these callers runs inside an `extern "C"`
+/// AppKit callback, where a panic cannot unwind and would abort the whole app. A spawn failure is a
+/// reportable error like any other.
+fn spawn_worker(name: &str, work: impl FnOnce() + Send + 'static) -> bool {
+    match std::thread::Builder::new().name(name.into()).spawn(work) {
+        Ok(_) => true,
+        Err(error) => {
+            log_info!("[settings] could not start the {} worker: {}", name, error);
+            false
+        }
+    }
+}
+
+/// The export result, handed from the worker to the main thread.
+static PENDING_EXPORT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
+
+/// The settings "Import settings" button: ask for a file, then hand the reading to a worker.
+///
+/// Reading and parsing happen off the main thread: the user can pick a file on a network volume or
+/// a slow disk, and doing that inside the AppKit callback would freeze the settings window for as
+/// long as the read takes. The parsed result comes back through `handleImportSettingsReady:`.
+pub(crate) extern "C" fn handle_import_settings(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    // One import at a time, held from before the panel opens until the result has been applied and
+    // reported. Without this, two clicks start two workers that share one result slot: the slower
+    // one would overwrite the faster one's outcome, and whatever applied last would win rather than
+    // whichever the user chose last.
+    if IMPORT_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // The flag is released in exactly one place, the ready callback, which also covers "the user
+    // cancelled the panel" and every failure between here and the worker finishing.
+    // The panel runs its own modal loop; no CONFIG lock is held across it.
+    let Some(path) = (unsafe { run_open_panel() }) else {
+        IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
+        return;
+    };
+    if !spawn_worker("settings-import", move || {
+        // Read, parse and persist all happen here, off the main thread: the picked file may be on a
+        // slow volume, and committing waits for an fsync.
+        let outcome = match read_import_file(&path) {
+            Ok(content) => match portability::parse_export(&content) {
+                Ok(parsed) => match commit_imported_config(parsed, "file") {
+                    Ok((old, next, repaired)) => ImportOutcome::Committed {
+                        old: Box::new(old),
+                        next: Box::new(next),
+                        repaired,
+                    },
+                    Err(reason) => ImportOutcome::CommitFailed(reason),
+                },
+                Err(error) => ImportOutcome::Refused(error),
+            },
+            Err(error) => ImportOutcome::Unreadable(error),
+        };
+        *PENDING_IMPORT.lock().unwrap() = Some(outcome);
+        // Wake the main thread; the outcome is picked up there. Reading MENU_TARGET off-main
+        // would trip the main-thread assertion, so this goes through the dispatch handle.
+        notify_main(sel!(handleImportSettingsReady:));
+    }) {
+        IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
+        show_alert(
+            &t("settings.import_settings_failed_title"),
+            &t("settings.worker_unavailable"),
+        );
+    }
+}
+
+/// Whether an import is currently in flight. A plain flag rather than a counter: the second
+/// request is refused outright, so there is never more than one worker to account for.
+static IMPORT_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// What the import worker found. Every variant is Send: it is produced off the main thread and
+/// consumed on it.
+enum ImportOutcome {
+    /// Already persisted. Carries the config that was replaced so the main thread can replay the
+    /// runtime change. Boxed: a whole `Config` is about a kilobyte, and every other variant is a few
+    /// dozen bytes, so storing them inline would make the enum that size on the failure paths too.
+    Committed {
+        old: Box<Config>,
+        next: Box<Config>,
+        repaired: bool,
+    },
+    /// The file parsed but could not be written to disk; nothing was published.
+    CommitFailed(String),
+    Refused(portability::ImportError),
+    Unreadable(ImportReadError),
+}
+
+/// The worker's result, handed from the import thread to the main thread. A mutex rather than a
+/// main-thread slot because the producer is off-main.
+static PENDING_IMPORT: Mutex<Option<ImportOutcome>> = Mutex::new(None);
+
+/// Main-thread continuation of "Import settings": report a refusal, or install the configuration.
+///
+/// `apply_imported_config` first compares the candidate against the live config, but it still
+/// persists: "the candidate equals the live config" says nothing about the file on disk (a hand
+/// edit that has not been reloaded is exactly that case), so skipping the write would report success
+/// for an import that reverts on the next launch.
+pub(crate) extern "C" fn handle_import_settings_ready(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    // Release the single-flight gate at the top, before any early return: the flag must not
+    // outlive this callback, or every later import would be refused as "already in flight".
+    IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
+    let Some(outcome) = PENDING_IMPORT.lock().unwrap().take() else {
+        return;
+    };
+    match outcome {
+        ImportOutcome::Refused(error) => show_alert(
+            &t("settings.import_settings_failed_title"),
+            &import_error_message(&error),
+        ),
+        ImportOutcome::Unreadable(error) => show_alert(
+            &t("settings.import_settings_failed_title"),
+            &read_error_message(&error),
+        ),
+        ImportOutcome::CommitFailed(reason) => show_alert(
+            &t("settings.import_settings_failed_title"),
+            &tf(
+                "settings.import_settings_failed_msg",
+                &[("reason", &reason)],
+            ),
+        ),
+        ImportOutcome::Committed {
+            old,
+            next,
+            repaired,
+        } => {
+            // The disk write already succeeded on the worker; only the runtime side effects and the
+            // window refresh are left for the main thread.
+            apply_imported_runtime(&old, &next);
+            // Partial success: the loader keeps every valid field and falls back on the rest, which
+            // the user has to be told. It gets the alert rather than the toast because the
+            // explanation does not fit the toast's fixed single line.
+            if repaired {
+                show_alert(
+                    &t("settings.import_settings_partial_title"),
+                    &t("settings.import_settings_partial_msg"),
+                );
+            } else {
+                show_settings_toast(&t("settings.toast_settings_imported"));
+            }
+        }
+    }
+}
+
+/// Upper bound on an imported file. A settings export is a few kilobytes; anything far past that
+/// is not one, and reading it whole would put an arbitrary file into memory.
+pub(super) const MAX_IMPORT_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ImportReadError {
+    /// The path is not a regular file (a directory, a device, a socket).
+    NotAFile,
+    /// The file grew past [`MAX_IMPORT_BYTES`], whenever it was measured.
+    TooLarge,
+    /// The bytes are not valid UTF-8 text.
+    NotText,
+    Io(String),
+}
+
+/// Read an import file with the bound applied to the bytes actually read.
+///
+/// The file is opened once and read through a `take` of one byte past the cap, so a file that grows
+/// (or that is swapped) after any earlier size check is still refused instead of read whole. The
+/// handle's own metadata decides the file type, which is what tells a directory or a device from a
+/// document.
+pub(super) fn read_import_file(path: &str) -> Result<String, ImportReadError> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| ImportReadError::Io(e.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ImportReadError::Io(e.to_string()))?;
+    if !metadata.is_file() {
+        return Err(ImportReadError::NotAFile);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_IMPORT_BYTES) as usize + 1);
+    file.take(MAX_IMPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| ImportReadError::Io(e.to_string()))?;
+    if bytes.len() as u64 > MAX_IMPORT_BYTES {
+        return Err(ImportReadError::TooLarge);
+    }
+    String::from_utf8(bytes).map_err(|_| ImportReadError::NotText)
+}
+
+/// The user-facing message for a file that could not be read.
+fn read_error_message(error: &ImportReadError) -> String {
+    match error {
+        ImportReadError::NotAFile => t("settings.import_settings_not_a_file"),
+        ImportReadError::TooLarge => t("settings.import_settings_too_large"),
+        // A binary file is not something the user can act on differently from a corrupt one.
+        ImportReadError::NotText => t("settings.import_settings_unreadable"),
+        ImportReadError::Io(reason) => {
+            tf("settings.import_settings_failed_msg", &[("reason", reason)])
+        }
+    }
+}
+
+/// The user-facing message for a refused file. Deliberately built from i18n keys rather than the
+/// parser error: the loader's own errors name internal field paths and internal enum values, and
+/// those must never be shown.
+fn import_error_message(error: &portability::ImportError) -> String {
+    match error {
+        portability::ImportError::NotAnExport => t("settings.import_settings_not_an_export"),
+        portability::ImportError::UnsupportedFormat(version) => tf(
+            "settings.import_settings_newer_format",
+            &[("version", &version.to_string())],
+        ),
+        portability::ImportError::Unreadable => t("settings.import_settings_unreadable"),
+    }
+}
+
+/// Install a parsed export: keep the machine-local fields, write and publish the result as one
+/// transaction, then replay every runtime side effect and refresh the open window.
+///
+/// Returns whether the loader repaired anything (the caller reports a partial success).
+/// Commit an imported configuration on the calling (worker) thread, returning the previous config so
+/// the main thread can replay the change.
+///
+/// Persisting here rather than on the main thread matters: `commit_config` waits for an fsync, and
+/// the destination config directory can sit on slow or network storage. Doing it in the reader
+/// thread keeps the settings window responsive.
+///
+/// The candidate is derived from the live config read at this moment, so the machine-local fields
+/// are taken from the config the import is actually about to replace.
+fn commit_imported_config(
+    parsed: portability::ImportedConfig,
+    source: &str,
+) -> Result<(Config, Config, bool), String> {
+    let old = CONFIG.read().unwrap().clone();
+    let mut next = parsed.config;
+    portability::restore_local_fields(&mut next, &old);
+    // Persist FIRST and unconditionally: "the candidate equals the live config" does not mean the
+    // file on disk agrees. A hand-edited config.toml that has not been reloaded is exactly that
+    // case, and skipping the write there would report success for an import that reverts on the
+    // next launch. The write also has to succeed before anything is published or applied.
+    crate::config::commit_config(next.clone())?;
+    log_info!("[settings] imported configuration from {}", source);
+    Ok((old, next, parsed.repaired))
+}
+
+/// Replay the runtime side effects of an import on the main thread.
+fn apply_imported_runtime(old: &Config, next: &Config) {
+    if next == old {
+        // Nothing observable changed, so no runtime side effect has to be replayed and the window
+        // does not need rebuilding -- the disk write was the whole point.
+        return;
+    }
+    apply_config_change(old, next, ConfigChangeSource::Reload);
+    // apply_config_change already rebuilt the window when the theme, the palette or the locale
+    // changed; only the other fields need the in-place refill, and rebuilding twice animates twice.
+    let window_rebuilt =
+        next.appearance != old.appearance || next.colors != old.colors || next.i18n != old.i18n;
+    if !window_rebuilt {
+        refresh_system_appearance();
+    }
+}
+
+/// Show a transient success bubble in whichever settings window is open.
+fn show_settings_toast(text: &str) {
+    let window =
+        with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window)).unwrap_or(std::ptr::null_mut());
+    if window.is_null() {
+        return;
+    }
+    unsafe { tooltip::SettingsTooltip::show_success_bubble(window, text) };
+}
+
+#[cfg(test)]
+mod portability_ui_tests {
+
+    /// The import path must never hand a raw loader error to the user: those name internal field
+    /// paths and internal enum values. Each refusal has its own message, and the unsupported
+    /// version names the version it saw.
+    #[test]
+    fn every_import_refusal_has_its_own_message() {
+        let not_an_export =
+            super::import_error_message(&super::portability::ImportError::NotAnExport);
+        let unreadable = super::import_error_message(&super::portability::ImportError::Unreadable);
+        let newer =
+            super::import_error_message(&super::portability::ImportError::UnsupportedFormat(2));
+        for message in [&not_an_export, &unreadable, &newer] {
+            assert!(!message.is_empty(), "a refusal must say something");
+            assert!(
+                !message.starts_with("settings."),
+                "a missing locale key must not reach the user: {message}"
+            );
+        }
+        assert_ne!(
+            not_an_export, unreadable,
+            "the two refusals must be distinguishable"
+        );
+        assert!(
+            newer.contains("2"),
+            "the unsupported version must be named: {newer}"
+        );
+    }
+
+    /// The filename is the app's name plus the local timestamp, and the extension is what the save
+    /// panel shows and what a user later recognizes.
+    #[test]
+    fn the_export_name_is_the_app_name_plus_a_local_stamp() {
+        // A pure example pins the shape and the separator...
+        assert_eq!(
+            super::export_file_name("Oh-My-Tab", "2026-10-14 11.54.20"),
+            "Oh-My-Tab 2026-10-14 11.54.20.toml"
+        );
+        // ...and the stamp itself is the shared local-time format, never a bare epoch or a UTC
+        // rendering: `YYYY-MM-DD HH.MM.SS` (dots, because colons are reserved in Finder names).
+        let stamp = super::local_timestamp_stamp();
+        assert_eq!(stamp.len(), 19, "got {stamp}");
+        assert_eq!(stamp.as_bytes()[4], b'-', "got {stamp}");
+        assert_eq!(stamp.as_bytes()[7], b'-', "got {stamp}");
+        assert_eq!(stamp.as_bytes()[10], b' ', "got {stamp}");
+        assert_eq!(stamp.as_bytes()[13], b'.', "got {stamp}");
+        assert_eq!(stamp.as_bytes()[16], b'.', "got {stamp}");
+    }
+
+    /// The live filename really goes through the app name and the stamp, so a caller cannot
+    /// regress to a hardcoded slug without this failing.
+    #[test]
+    fn the_live_export_name_carries_the_app_name_and_a_stamp() {
+        let name = super::suggested_export_config_name();
+        // The stamp is the tail of the name, so stripping it leaves exactly the app name. This
+        // fails on the hardcoded slug the feature started with, which had neither.
+        let suffix = format!(" {}.toml", super::local_timestamp_stamp());
+        let app = name
+            .strip_suffix(&suffix)
+            .unwrap_or_else(|| panic!("{name} must end with the local stamp {suffix}"));
+        assert!(!app.is_empty(), "the app name must name the file: {name}");
+        assert_eq!(
+            app,
+            super::EXPORT_FILE_APP_NAME,
+            "the app name must name the file"
+        );
+    }
+
+    /// The single-flight gate is what keeps two imports from fighting over one result slot: the
+    /// second request is refused outright, so a slower first import can never be overwritten by a
+    /// faster second one.
+    #[test]
+    fn a_second_import_is_refused_while_one_is_in_flight() {
+        // Claiming is an atomic test-and-set, exactly as the button handler does it.
+        assert!(!super::IMPORT_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            super::IMPORT_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst),
+            "a second click must see the gate already taken"
+        );
+        // Releasing lets the next import through: a cancelled panel, a refused file and a failed
+        // commit all release it, or the feature would be dead after the first failure.
+        super::IMPORT_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !super::IMPORT_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst),
+            "the gate must reopen after the previous import finished"
+        );
+        super::IMPORT_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A worker that cannot start is reported, never panicked on: these handlers run inside
+    /// `extern "C"` AppKit callbacks, where a panic aborts the process instead of unwinding.
+    #[test]
+    fn a_worker_that_cannot_start_is_reported_not_panicked() {
+        assert!(super::spawn_worker("omt-test-worker", || {}));
+        let handle = std::thread::Builder::new()
+            .name("omt-test-worker".into())
+            .spawn(|| {})
+            .expect("the first worker must start");
+        handle.join().unwrap();
+    }
+
+    /// The publish gate is the whole point of the import transaction: a failed write must leave the
+    /// running configuration exactly as it was.
+    #[test]
+    fn a_failed_write_never_publishes_the_candidate() {
+        use crate::config::Config;
+        let mut current = Config::default();
+        current.appearance.theme = "dark".into();
+        let mut candidate = current.clone();
+        candidate.appearance.theme = "light".into();
+        let failed = crate::config::publish_after_write(
+            &mut current,
+            candidate.clone(),
+            Err("disk full".into()),
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            current.appearance.theme, "dark",
+            "the live config must not adopt a candidate that failed to persist"
+        );
+        let ok = crate::config::publish_after_write(&mut current, candidate, Ok(()));
+        assert!(ok.is_ok());
+        assert_eq!(current.appearance.theme, "light");
+    }
+
+    /// The read bound is applied to the bytes actually read, not to a size measured beforehand.
+    /// A file that grows between the two, or that is not a regular file at all, must be refused
+    /// instead of pulled into memory.
+    #[test]
+    fn an_import_never_reads_past_its_bound() {
+        let dir = std::env::temp_dir().join(format!("omt-import-bound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A directory is not an import file.
+        assert_eq!(
+            super::read_import_file(&dir.to_string_lossy()),
+            Err(super::ImportReadError::NotAFile)
+        );
+
+        // A file one byte past the cap is refused; one at the cap is read.
+        let over = dir.join("over.toml");
+        std::fs::write(&over, vec![b'a'; super::MAX_IMPORT_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            super::read_import_file(&over.to_string_lossy()),
+            Err(super::ImportReadError::TooLarge)
+        );
+
+        let at = dir.join("at.toml");
+        std::fs::write(&at, vec![b'a'; super::MAX_IMPORT_BYTES as usize]).unwrap();
+        assert_eq!(
+            super::read_import_file(&at.to_string_lossy()).map(|s| s.len()),
+            Ok(super::MAX_IMPORT_BYTES as usize)
+        );
+
+        // Non-UTF-8 bytes are a refusal, never a lossy decode into a half-valid document.
+        let binary = dir.join("binary.toml");
+        std::fs::write(&binary, [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(
+            super::read_import_file(&binary.to_string_lossy()),
+            Err(super::ImportReadError::NotText)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every read failure has a message of its own, so the user is told which thing went wrong.
+    #[test]
+    fn every_read_failure_has_its_own_message() {
+        let not_a_file = super::read_error_message(&super::ImportReadError::NotAFile);
+        let too_large = super::read_error_message(&super::ImportReadError::TooLarge);
+        let not_text = super::read_error_message(&super::ImportReadError::NotText);
+        let io = super::read_error_message(&super::ImportReadError::Io("nope".into()));
+        for message in [&not_a_file, &too_large, &not_text, &io] {
+            assert!(!message.is_empty());
+            assert!(
+                !message.starts_with("settings."),
+                "a missing locale key must not reach the user: {message}"
+            );
+        }
+        assert_ne!(not_a_file, too_large);
+        assert_ne!(not_a_file, not_text);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

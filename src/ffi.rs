@@ -287,6 +287,31 @@ extern "C" {
     pub(crate) fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
 }
 
+/// A UNIX timestamp as a local-time filename stamp: `YYYY-MM-DD HH.MM.SS`.
+///
+/// Local, not UTC: a saved file is something the user looks at next to Finder's own clock, so it
+/// has to name the time they made it. The time separators are dots rather than colons because
+/// colons are reserved in HFS+/Finder names -- this is macOS's own convention for a saved file.
+///
+/// It lives beside `Tm`/`localtime_r` so the clipboard's save-as and the settings export share one
+/// implementation and the two user-facing save paths cannot drift apart.
+pub(crate) fn format_local_timestamp(unix_secs: u64) -> String {
+    unsafe {
+        let mut tm: Tm = std::mem::zeroed();
+        let s = unix_secs as i64;
+        localtime_r(&s, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02} {:02}.{:02}.{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}
+
 /// The kernel `task_vm_info` C data layout is 372 bytes (93 u32 words). Rust's `repr(C)`
 /// adds 4 bytes of trailing 8-byte alignment padding, so the Mach count must be based on
 /// the C layout rather than `size_of::<TaskVmInfo>()`. The buffer has extra tail space and
@@ -963,6 +988,35 @@ pub(crate) unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
     let name_ns = make_nsstring(suggested_name);
     let _: () = msg_send![panel, setNameFieldStringValue: name_ns];
     CFRelease(name_ns as *const c_void);
+    let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
+    let result = if resp == 1 {
+        let url: *mut AnyObject = msg_send![panel, URL];
+        if !url.is_null() {
+            let path_ns: *mut AnyObject = msg_send![url, path];
+            let path = nsstring_to_rust(path_ns);
+            (!path.is_empty()).then_some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _: () = msg_send![pool, drain];
+    result
+}
+
+/// Present an NSOpenPanel (runModal) and return the chosen filesystem path; None on cancel.
+/// The read-only sibling of the save-panel helper, sharing its lifetime rules: the URL/path
+/// getters return +0 (autoreleased) values on the surrounding pool, so the Rust string is copied
+/// out before anything is released.
+pub(crate) unsafe fn run_open_panel() -> Option<String> {
+    // Wrap in a pool to reclaim temporaries; objects autoreleased inside runModal's nested event
+    // loop are managed by AppKit's own pools and stay untouched.
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    let panel: *mut AnyObject = msg_send![class!(NSOpenPanel), openPanel];
+    let _: () = msg_send![panel, setCanChooseFiles: true];
+    let _: () = msg_send![panel, setCanChooseDirectories: false];
+    let _: () = msg_send![panel, setAllowsMultipleSelection: false];
     let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
     let result = if resp == 1 {
         let url: *mut AnyObject = msg_send![panel, URL];

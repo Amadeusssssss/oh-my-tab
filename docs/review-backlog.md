@@ -206,3 +206,12 @@ so a later reader does not re-derive them. The fixes are in the tree, with their
   tolerance and one display pixel. Trigger: a report of misaligned sidebar text after moving the
   settings window between displays, or the next change to `center_sidebar_label`, the settings window's
   observers, or `rebuild_settings_content`.
+
+- **The success toast is not asserted against the strings it actually shows** (2026-10-14, settings
+  import/export review R3, LOW — coverage gap, deferred). `bubble_metrics` is unit-tested for the
+  shape of `BubbleKind::Success`, and the two settings toasts ("Settings exported." / "Settings
+  imported.") are far shorter than the 220pt single-line budget in all three locales, but nothing
+  measures those specific strings on the live cell — a future longer translation or a bubble-width
+  change would truncate silently. The partial-import explanation deliberately avoids this path (it
+  uses an NSAlert precisely because it does not fit). Trigger: the next change to the success-toast
+  copy, the tooltip font, or `bubble_metrics`.

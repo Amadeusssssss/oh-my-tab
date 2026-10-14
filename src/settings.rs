@@ -533,6 +533,7 @@ mod dispatch;
 pub(crate) mod mapping;
 mod page_builder;
 pub(crate) mod page_canvas;
+pub(crate) mod portability;
 pub(crate) mod restore;
 mod select;
 mod sidebar;
@@ -569,10 +570,11 @@ use window::*;
 // consumes them through use settings::*).
 pub(crate) use dispatch::{
     handle_clipboard_enabled_toggle, handle_device_changed, handle_enable_mouse_toggle,
-    handle_export_logs, handle_key_bindings_toggle, handle_windows_enabled_toggle,
-    on_control_changed, on_control_text_did_change, on_control_text_did_end_editing,
-    on_sidebar_select, refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
-    refresh_service_controls_from_config,
+    handle_export_logs, handle_export_settings, handle_export_settings_ready,
+    handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
+    handle_windows_enabled_toggle, on_control_changed, on_control_text_did_change,
+    on_control_text_did_end_editing, on_sidebar_select, refresh_clipboard_unavailable_notice,
+    refresh_device_popup_if_open, refresh_service_controls_from_config,
     refresh_switcher_keystroke_and_mouse_controls_from_config,
 };
 pub(crate) use window::{
