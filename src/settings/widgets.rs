@@ -1850,10 +1850,10 @@ pub(super) unsafe fn html_switch_apply_visual(
 
     if let Some(from_x) = from_x.filter(|x| *x != to_x) {
         if crate::theme::reduce_motion_enabled() {
-            let knob_layer: *mut AnyObject = msg_send![knob, layer];
-            if !knob_layer.is_null() {
-                let _: () = msg_send![knob_layer, removeAllAnimations];
-            }
+            // `knob` is already the CALayer; `[knob layer]` is not a message CALayer implements (only
+            // the class method +layer exists), so the old form trapped with "invalid message send to
+            // -[CALayer layer]" on every switch state change under Reduce Motion.
+            let _: () = msg_send![knob, removeAllAnimations];
             return;
         }
         let key_path = make_nsstring("position.x");
@@ -1924,6 +1924,26 @@ pub(super) extern "C" fn html_switch_set_state(this: *mut c_void, _cmd: Sel, sta
         let send: SetState = std::mem::transmute(objc_msgSendSuper as *const ());
         send(&mut sup, sel!(setState:), state);
         html_switch_apply_visual(button, (previous_state != state).then_some(previous_state));
+    }
+}
+
+/// Set a custom switch's state without the spring transition.
+///
+/// `setState:` is the user gesture's animating path (`html_switch_mouse_down` relies on it). A
+/// programmatic fill that lands on a page the user is already looking at -- the lazily
+/// materialized mouse page is the only one -- must show the value it found, not replay an
+/// off-to-on transition nobody made. Routes through `setState:` so the state and the
+/// accessibility value update, then drops the spring it started and repaints the visual at its
+/// final position.
+pub(super) unsafe fn set_switch_state_immediate(button: *mut AnyObject, on: bool) {
+    if button.is_null() {
+        return;
+    }
+    let _: () = msg_send![button, setState: if on { 1isize } else { 0isize }];
+    html_switch_apply_visual(button, None);
+    let knob = html_switch_knob(button);
+    if !knob.is_null() {
+        let _: () = msg_send![knob, removeAllAnimations];
     }
 }
 

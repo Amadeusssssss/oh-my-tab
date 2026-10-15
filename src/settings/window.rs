@@ -1360,6 +1360,33 @@ unsafe fn page_is_at_top(scroll: *mut AnyObject) -> bool {
     (clip_bounds.origin.y - top).abs() <= 0.5
 }
 
+/// Whether a custom switch's knob layer is mid-transition (has a running animation). Used to prove
+/// the mouse page's lazy fill does not replay a state transition on an already visible page.
+unsafe fn switch_is_animating(button: *mut AnyObject) -> bool {
+    if button.is_null() {
+        return false;
+    }
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return false;
+    }
+    let sublayers: *mut AnyObject = msg_send![layer, sublayers];
+    if sublayers.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![sublayers, count];
+    if count == 0 {
+        return false;
+    }
+    let knob: *mut AnyObject = msg_send![sublayers, objectAtIndex: 0usize];
+    let keys: *mut AnyObject = msg_send![knob, animationKeys];
+    if keys.is_null() {
+        return false;
+    }
+    let key_count: usize = msg_send![keys, count];
+    key_count > 0
+}
+
 /// The inline update flow's ownership state as the layout leaves it: what the flow itself hid,
 /// where its divider sits relative to the row above it, and how the card hugs the host.
 #[derive(Debug)]
@@ -1803,6 +1830,35 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             let _: () = msg_send![window, layoutIfNeeded];
             scroll_page_to_top(*page);
             debug_validate_settings_page(*page, settings_page_name(index));
+        }
+        // The mouse page is filled lazily, *after* the sidebar has shown it, so its switches land on
+        // a page the user is already looking at: the fill must apply the values without replaying the
+        // switch spring. Force the master switch to the opposite value quietly, mark the page dirty,
+        // let select_sidebar's fill restore it, and assert nothing animated.
+        {
+            let forced = with_settings_ui(|ui| {
+                ui.as_ref().map(|ui| {
+                    let enabled = crate::config::CONFIG.read().unwrap().mouse.enabled;
+                    widgets::set_switch_state_immediate(ui.enable_mouse, !enabled);
+                    (ui.enable_mouse, enabled)
+                })
+            });
+            let Some((master, enabled)) = forced else {
+                hide_settings();
+                return false;
+            };
+            crate::settings::note_mouse_page_dirty();
+            select_sidebar(SETTINGS_MOUSE_PAGE_INDEX);
+            let state: isize = msg_send![master, state];
+            let expected: isize = if enabled { 1 } else { 0 };
+            let animating = switch_is_animating(master);
+            if animating || state != expected {
+                log_info!(
+                    "[smoke-settings-layout] the mouse page fill animated its master switch (state={state}, expected={expected}, animating={animating})"
+                );
+                hide_settings();
+                return false;
+            }
         }
         // The About page's keychain row reads its state from the clipboard session and must follow it
         // WITHOUT a page switch or an app activation (a keychain grant can be silent, and a load can

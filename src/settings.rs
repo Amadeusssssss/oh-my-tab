@@ -1862,9 +1862,9 @@ unsafe fn materialize_mouse_page(ui: &mut SettingsUi, cfg: &Config) {
     // Resolve the selected device's effective config from the given cfg (Config::default() during the
     // restore-defaults preview).
     let resolved = resolve_selected_from(cfg);
-    // enable_mouse (master switch) always reads the global flag.
-    let _: () =
-        msg_send![ui.enable_mouse, setState: if cfg.mouse.enabled { 1isize } else { 0isize }];
+    // enable_mouse (master switch) always reads the global flag. The fill lands on a page the
+    // sidebar has already shown (see materialize_mouse_page_if_visible), so it must not animate.
+    widgets::set_switch_state_immediate(ui.enable_mouse, cfg.mouse.enabled);
     // Fill the mouse page's per-device controls (reverse/accel/mode/line count/preset).
     fill_mouse_device_controls(ui, &resolved);
 
@@ -1920,10 +1920,10 @@ unsafe fn fill_mouse_device_controls(
     ui: &SettingsUi,
     resolved: &crate::mouse::resolve::ResolvedMouse,
 ) {
-    // reverse_scroll: effective value.
-    let _: () = msg_send![ui.reverse_scroll, setState: if resolved.reverse_scroll { 1isize } else { 0isize }];
-    // disable_pointer_accel: effective value.
-    let _: () = msg_send![ui.disable_pointer_accel, setState: if resolved.disable_acceleration { 1isize } else { 0isize }];
+    // reverse_scroll / disable_pointer_accel: effective values, applied without the spring (the
+    // fill lands on an already visible page).
+    widgets::set_switch_state_immediate(ui.reverse_scroll, resolved.reverse_scroll);
+    widgets::set_switch_state_immediate(ui.disable_pointer_accel, resolved.disable_acceleration);
     // scroll_mode: effective value.
     let sm_idx: isize = SCROLL_MODE_VALUES
         .iter()
@@ -1935,8 +1935,8 @@ unsafe fn fill_mouse_device_controls(
     let _: () = msg_send![ui.line_count, setIntegerValue: resolved.line_count as isize];
     // Sync the slider's value label.
     set_field(ui.line_count_value_label, resolved.line_count);
-    // The mappings master switch: the effective value (merged across profiles).
-    let _: () = msg_send![ui.mapping_enabled, setState: if resolved.button_mappings_enabled { 1isize } else { 0isize }];
+    // The mappings master switch: the effective value (merged across profiles), filled silently.
+    widgets::set_switch_state_immediate(ui.mapping_enabled, resolved.button_mappings_enabled);
     // Pointer acceleration / tracking speed: the configured value wins; when unset, show the
     // device's live value (same as LinearMouse -- read the device instead of inventing a
     // default); the fallback applies only when that read fails.
@@ -2446,6 +2446,25 @@ mod tests {
 
     /// Exercise the real settings window on the AppKit main thread. This cannot run in the
     /// normal headless suite because NSWindow construction is GUI/session dependent.
+    /// The same layout smoke with the Reduce Motion ask on: a switch state change must take the
+    /// no-animation branch, which used to send `[CALayer layer]` and trap the process.
+    #[test]
+    #[ignore]
+    fn settings_layout_smoke_under_reduce_motion() {
+        let app = settings_smoke_app_binary();
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-settings-layout")
+            .arg("--reduce-motion")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "settings layout smoke under Reduce Motion failed (exit {:?})\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     #[test]
     #[ignore]
     fn settings_layout_smoke() {
