@@ -44,8 +44,10 @@ const GRIP_HIT_LENGTH: f64 = 48.0;
 const GRIP_HIT_THICKNESS: f64 = 20.0;
 /// Inset the vertical-stream handle from the panel's top edge for visible breathing room.
 const GRIP_EDGE_INSET: f64 = 4.0;
-/// Keep the visible dot row near the outer edge of the larger hit area, clear of the first cap.
-const GRIP_MARK_CENTER_INSET: f64 = 5.0;
+/// Distance from the panel's anchored edge to the visible dot row's centre. It lines the handle up
+/// with the panel's own side padding, so the dots read as an inset control instead of hugging the
+/// edge while the reserve keeps the first keycap far away.
+const GRIP_MARK_CENTER_INSET: f64 = PANEL_SIDE_PADDING;
 const GRIP_MARK_WIDTH: f64 = 3.0;
 const GRIP_MARK_HEIGHT: f64 = 3.0;
 const GRIP_MARK_GAP: f64 = 3.0;
@@ -213,10 +215,10 @@ pub(super) fn fade_pending() -> bool {
 
 /// The smallest stream-axis cap the panel may be given, in points. Below this the panel's own
 /// controls (the leading drag handle and the trailing settings button) plus one minimum-width
-/// keycap no longer fit: a 32pt keycap needs 32 + 24 of panel padding + STREAM_BUDGET_DEDUCTION
-/// (72) = 128pt of cap. A percentage that would ask for less is clamped here, so a very small
-/// screen cannot produce a panel whose keycap sits under a control.
-const MIN_PANEL_STREAM_EXTENT: f64 = 128.0;
+/// keycap no longer fit: a 32pt keycap needs 32 + 24 of nominal panel padding +
+/// STREAM_BUDGET_DEDUCTION (56) = 112pt of cap. A percentage that would ask for less is clamped
+/// here, so a very small screen cannot produce a panel whose keycap sits under a control.
+const MIN_PANEL_STREAM_EXTENT: f64 = 112.0;
 
 /// The panel's stream-axis cap in points: the configured percentage of the target screen's
 /// extent along that axis. Both the renderer and the keycap state machine call this, so the two
@@ -731,7 +733,7 @@ pub(super) fn render(
             let panel_length = if pinned {
                 max_extent
             } else {
-                (desired + PANEL_CONTROLS_RESERVE * 2.0)
+                content_sized_panel_length(desired)
                     .min(max_extent)
                     .max(max_extent.min(64.0))
             };
@@ -1655,9 +1657,10 @@ pub(super) fn smoke_runner() -> bool {
         })
     };
     let column_pair_margins_valid = {
-        // A column of two keycaps must sit centered between the panel's ends: the centering unit
-        // test only covers a single keycap, and this stream is two keycaps plus a gap. A panel
-        // pinned by a longer stream is not the shape being measured, hence the hide first.
+        // A column of two keycaps must land on each end's own reserve: the handle's reserve at the
+        // top, the gear's at the bottom. The unit test only covers a single keycap, and this stream
+        // is two keycaps plus a gap. A panel pinned by a longer stream is not the shape being
+        // measured, hence the hide first.
         let chord = Badge {
             text: "⌥q".into(),
             kind: BadgeKind::Chord,
@@ -1715,9 +1718,10 @@ pub(super) fn smoke_runner() -> bool {
                 }
                 let top_margin = bounds.origin.y + bounds.size.height - top;
                 let bottom_margin = bottom - bounds.origin.y;
-                let ok = (top_margin - bottom_margin).abs() < 0.5;
+                let ok = (top_margin - HEAD_STREAM_RESERVE).abs() < 0.5
+                    && (bottom_margin - TAIL_SETTINGS_RESERVE).abs() < 0.5;
                 eprintln!(
-                    "[keystroke-display-smoke] column pair count={count} top_margin={top_margin:.1} bottom_margin={bottom_margin:.1} ok={ok}"
+                    "[keystroke-display-smoke] column pair count={count} top_margin={top_margin:.1} bottom_margin={bottom_margin:.1} expected={HEAD_STREAM_RESERVE:.1}/{TAIL_SETTINGS_RESERVE:.1} ok={ok}"
                 );
                 ok
             }
@@ -1771,10 +1775,12 @@ pub(super) fn smoke_runner() -> bool {
                 let frame: NSRect = msg_send![view, frame];
                 let bounds: NSRect = msg_send![container, bounds];
                 let (leading, trailing) = if state.orientation.is_vertical() {
+                    // Non-flipped: a column counts down from the top, so the handle's end is the top
+                    // edge and the gear's is the bottom one. The leading margin is the top gap.
                     (
-                        frame.origin.y - bounds.origin.y,
                         bounds.origin.y + bounds.size.height
                             - (frame.origin.y + frame.size.height),
+                        frame.origin.y - bounds.origin.y,
                     )
                 } else {
                     (
@@ -1783,9 +1789,12 @@ pub(super) fn smoke_runner() -> bool {
                             - (frame.origin.x + frame.size.width),
                     )
                 };
-                let ok = (leading - trailing).abs() < 0.5;
+                // The two ends carry different reserves by design, so each margin is checked
+                // against its own control's reserve rather than against equality.
+                let ok = (leading - HEAD_STREAM_RESERVE).abs() < 0.5
+                    && (trailing - TAIL_SETTINGS_RESERVE).abs() < 0.5;
                 eprintln!(
-                    "[keystroke-display-smoke] single-key {position} margins={leading:.1}/{trailing:.1} ok={ok}"
+                    "[keystroke-display-smoke] single-key {position} margins={leading:.1}/{trailing:.1} expected={HEAD_STREAM_RESERVE:.1}/{TAIL_SETTINGS_RESERVE:.1} ok={ok}"
                 );
                 ok
             }
@@ -2503,21 +2512,20 @@ pub(super) const TAIL_SETTINGS_RESERVE: f64 =
 /// the first keycap sits under the pointer that opens the drag.
 pub(super) const HEAD_GRIP_RESERVE: f64 = GRIP_HIT_THICKNESS + GRIP_EDGE_INSET;
 
-/// The symmetric stream-axis reserve both ends carry: the larger of the two controls' needs, used on
-/// BOTH sides. A symmetric reserve is what keeps the stream centred in the panel (the property the
-/// existing smoke asserts) while still guaranteeing the trailing gap -- an asymmetric reserve would
-/// shift the keycaps off centre.
-pub(super) const PANEL_CONTROLS_RESERVE: f64 = if TAIL_SETTINGS_RESERVE > HEAD_GRIP_RESERVE {
-    TAIL_SETTINGS_RESERVE
-} else {
-    HEAD_GRIP_RESERVE
-};
+/// Stream-axis gap kept between the handle's hit area and the first keycap, mirroring
+/// `SETTINGS_BTN_GAP` so both ends breathe by the same amount.
+const GRIP_STREAM_GAP: f64 = SETTINGS_BTN_GAP;
+/// Stream-axis distance from the panel's leading edge to where the keycap stream must start: the
+/// handle's hit area plus the gap above. The trailing end uses its own `TAIL_SETTINGS_RESERVE`
+/// instead -- the gear needs more room than the three dots, and reserving the larger of the two on
+/// BOTH sides is what used to leave 24pt of blank space beyond the handle.
+pub(super) const HEAD_STREAM_RESERVE: f64 = HEAD_GRIP_RESERVE + GRIP_STREAM_GAP;
 
-/// The stream-axis budget deduction. The stream is centred, so each end carries PANEL_CONTROLS_RESERVE
-/// of blank space while `estimated_stream_width` already counts PANEL_SIDE_PADDING per end; the
-/// deduction is therefore twice the reserve minus that padding.
+/// The stream-axis budget deduction: both ends' reserves, less the `PANEL_SIDE_PADDING` per end
+/// that `estimated_stream_width` already counts, so a stream trimmed to the budget exactly fills
+/// the content area between the two reserves.
 pub(super) const STREAM_BUDGET_DEDUCTION: f64 =
-    PANEL_CONTROLS_RESERVE * 2.0 - PANEL_SIDE_PADDING * 2.0;
+    HEAD_STREAM_RESERVE + TAIL_SETTINGS_RESERVE - PANEL_SIDE_PADDING * 2.0;
 
 /// Where the settings button sits inside the panel: the stream's TRAILING end -- the trailing edge
 /// of a row, the bottom of a column -- which is the corner a user reaches for.
@@ -3173,6 +3181,14 @@ unsafe fn add_badge_label(parent: *mut AnyObject, frame: NSRect, text: &str, tex
     release_obj(field);
 }
 
+/// The panel's stream-axis length when it sizes to its content: the keycap stream plus each end's
+/// own reserve. `desired` is the stream's estimated width, which already includes
+/// `PANEL_SIDE_PADDING` at both ends; the reserves cover that padding, so it is subtracted here
+/// rather than counted a second time (which is what left 12pt of extra blank per end).
+fn content_sized_panel_length(desired: f64) -> f64 {
+    desired - PANEL_SIDE_PADDING * 2.0 + HEAD_STREAM_RESERVE + TAIL_SETTINGS_RESERVE
+}
+
 /// Where the keycap stream starts along the panel's stream axis.
 ///
 /// The stream is centred in the CONTENT area -- the panel minus the leading drag handle's reserve and
@@ -3202,12 +3218,13 @@ fn centered_stream_cursor(
     }
 }
 
-/// The stream-axis reserve the layout applies to BOTH ends. It is the symmetric
-/// `PANEL_CONTROLS_RESERVE`, not each control's own extent: a symmetric reserve keeps the keycap
-/// stream centred in the panel (the property the panel smoke asserts), while the larger side still
-/// guarantees the trailing gap. Using each side's own extent would shift the stream off centre.
+/// The stream-axis reserve each end applies: the leading handle's own need and the trailing gear's
+/// own need. The two differ, so the keycaps sit nearer the handle than the gear; sizing each end
+/// from its own control keeps the stream on the reserve line instead of carrying the gear's larger
+/// reserve as blank space at the handle. Both ends' reserves come off the panel's length and the
+/// stream budget alike, so the last keycap keeps `SETTINGS_BTN_GAP` from the gear.
 fn stream_axis_reserves(_orientation: Orientation, _panel_size: NSSize) -> (f64, f64) {
-    (PANEL_CONTROLS_RESERVE, PANEL_CONTROLS_RESERVE)
+    (HEAD_STREAM_RESERVE, TAIL_SETTINGS_RESERVE)
 }
 
 unsafe fn rebuild_badges(
@@ -3748,12 +3765,13 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_keycap_surface, centered_stream_cursor, default_edge_frame, max_extent_for_percent,
-        neutral_keycap_surface, opaque_over, preview_badges, resize_frame_preserving_center,
-        resolve_panel_frame, target_screen_index, uses_accent_fill, Badge, BadgeCell, Orientation,
-        ScreenGeometry, BADGE_GAP, BADGE_H, MIN_PANEL_STREAM_EXTENT, PANEL_SIDE_PADDING,
-        PREVIEW_MAX_BADGES, PREVIEW_PHRASE, SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE,
-        STREAM_BUDGET_DEDUCTION,
+        accent_keycap_surface, centered_stream_cursor, content_sized_panel_length,
+        default_edge_frame, max_extent_for_percent, neutral_keycap_surface, opaque_over,
+        preview_badges, resize_frame_preserving_center, resolve_panel_frame, stream_axis_reserves,
+        target_screen_index, uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry,
+        BADGE_GAP, BADGE_H, HEAD_GRIP_RESERVE, HEAD_STREAM_RESERVE, MIN_PANEL_STREAM_EXTENT,
+        PANEL_SIDE_PADDING, PREVIEW_MAX_BADGES, PREVIEW_PHRASE, SETTINGS_BTN_CROSS_INSET,
+        SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE, STREAM_BUDGET_DEDUCTION, TAIL_SETTINGS_RESERVE,
     };
     use crate::config::KeystrokeDisplayPosition;
     use crate::keystroke_display::state::{
@@ -3773,7 +3791,12 @@ mod tests {
         assert_eq!(max_extent_for_percent(1440.0, 100), 1440.0);
         // A very small screen clamps to the floor that keeps a keycap clear of the controls.
         assert_eq!(max_extent_for_percent(200.0, 10), MIN_PANEL_STREAM_EXTENT);
-        assert!(max_extent_for_percent(200.0, 10) >= 32.0 + STREAM_BUDGET_DEDUCTION);
+        // The floor holds one minimum keycap inside both reserves: the keycap, the nominal padding
+        // per end that estimated_stream_width counts, and the reserve deduction.
+        assert_eq!(
+            MIN_PANEL_STREAM_EXTENT,
+            32.0 + PANEL_SIDE_PADDING * 2.0 + STREAM_BUDGET_DEDUCTION
+        );
         // Out-of-range input from a stale caller is clamped, never extrapolated.
         assert_eq!(max_extent_for_percent(1440.0, 0), 144.0);
         assert_eq!(max_extent_for_percent(1440.0, 500), 1440.0);
@@ -3810,41 +3833,57 @@ mod tests {
         assert_eq!(vertical_keycap_start, 64.0 - vertical_cursor);
     }
 
-    /// The stream keeps the promised gap from BOTH controls: the trailing keycap must clear the
-    /// settings button by at least the named gap, and the leading one must clear the handle. The
-    /// previous layout centred the stream in the whole panel while only subtracting the reserves
-    /// from the *budget*, so the last keycap sat exactly on the gear (gap 0).
+    /// Each end's reserve is sized from its own control, and a content-sized panel lands the
+    /// keycaps exactly on those reserve lines: the trailing keycap stops `SETTINGS_BTN_GAP` short of
+    /// the gear (the bug this replaced put it on the gear's edge, gap 0), and the leading one clears
+    /// the handle's hit area. The two margins differ by design -- that asymmetry is what removed the
+    /// gear's larger reserve from the handle's end.
     #[test]
     fn the_stream_keeps_its_gap_from_both_controls() {
-        let head = 20.0; // handle thickness
-        let tail = SETTINGS_BTN_SIZE + SETTINGS_BTN_GAP;
-        let panel = 240.0;
-        // A row: one 32pt keycap, estimated_total includes the 12pt nominal padding per end.
+        // The reserves the layout actually applies: the handle's own need at the leading end, the
+        // gear's at the trailing one.
+        let (head, tail) = stream_axis_reserves(Orientation::Horizontal, NSSize::new(0.0, 0.0));
+        assert_eq!(head, HEAD_STREAM_RESERVE);
+        assert_eq!(tail, TAIL_SETTINGS_RESERVE);
+
+        // A row: one 32pt keycap; estimated_total includes the 12pt nominal padding per end.
         let total = 32.0 + PANEL_SIDE_PADDING * 2.0;
+        let panel = content_sized_panel_length(total);
         let cursor = centered_stream_cursor(panel, total, false, head, tail);
-        let keycap_start = cursor;
-        let keycap_end = cursor + 32.0;
-        assert!(
-            keycap_end <= panel - tail + 1e-9,
-            "the trailing keycap reaches {keycap_end}, past the {:.1}pt reserve (gap \
-             {SETTINGS_BTN_GAP} would be lost)",
-            panel - tail
+        assert_eq!(
+            cursor, head,
+            "the leading keycap sits on the handle's reserve line"
         );
-        assert!(
-            keycap_start >= head - 1e-9,
-            "the leading keycap starts at {keycap_start}, inside the {head}pt handle reserve"
+        assert_eq!(
+            panel - (cursor + 32.0),
+            tail,
+            "the trailing keycap sits on the gear's reserve line"
         );
-        // Column: non-flipped, counted down from the top.
+        // The trailing reserve is the gear's inset, its width and its gap, so the promised gap
+        // survives: the keycap stops SETTINGS_BTN_GAP short of the gear's leading edge.
+        assert_eq!(
+            TAIL_SETTINGS_RESERVE - SETTINGS_BTN_CROSS_INSET - SETTINGS_BTN_SIZE,
+            SETTINGS_BTN_GAP
+        );
+        // The leading reserve clears the handle's hit area, so the first keycap never sits under
+        // the pointer that opens the drag.
+        assert!(cursor >= HEAD_GRIP_RESERVE);
+
+        // A column counts down from the top: the handle's reserve is the top margin, the gear's the
+        // bottom one.
+        let (head, tail) = stream_axis_reserves(Orientation::Vertical, NSSize::new(0.0, 0.0));
         let column_total = 34.0 + PANEL_SIDE_PADDING * 2.0;
-        let column_cursor = centered_stream_cursor(panel, column_total, true, head, tail);
-        let column_keycap_start = column_cursor - 34.0;
-        assert!(
-            column_keycap_start >= tail - 1e-9,
-            "the column's last keycap starts at {column_keycap_start}, inside the {tail}pt reserve"
+        let column_panel = content_sized_panel_length(column_total);
+        let column_cursor = centered_stream_cursor(column_panel, column_total, true, head, tail);
+        assert_eq!(
+            column_panel - column_cursor,
+            head,
+            "the column's first keycap tops out on the handle's reserve line"
         );
-        assert!(
-            column_cursor <= panel - head + 1e-9,
-            "the column's first keycap tops out at {column_cursor}, inside the {head}pt handle reserve"
+        assert_eq!(
+            column_cursor - 34.0,
+            tail,
+            "the column's last keycap starts on the gear's reserve line"
         );
     }
 
@@ -3955,18 +3994,22 @@ mod tests {
         let first_dot = super::grip_marker_frame(Orientation::Vertical, 0);
         let dot_center_from_panel_top = panel_size.height
             - (vertical.origin.y + first_dot.origin.y + first_dot.size.height / 2.0);
-        assert_eq!(dot_center_from_panel_top, 9.0);
+        assert_eq!(
+            dot_center_from_panel_top,
+            super::GRIP_EDGE_INSET + super::GRIP_MARK_CENTER_INSET
+        );
+        // The dots stay inside the transparent hit area, clear of the first keycap.
+        assert!(dot_center_from_panel_top < super::GRIP_EDGE_INSET + vertical.size.height);
 
         let horizontal = super::grip_frame(Orientation::Horizontal, panel_size);
         assert_eq!(horizontal.size, NSSize::new(20.0, 48.0));
         assert_eq!(horizontal.origin.x, 0.0);
         let first_horizontal_dot = super::grip_marker_frame(Orientation::Horizontal, 0);
-        assert_eq!(
-            horizontal.origin.x
-                + first_horizontal_dot.origin.x
-                + first_horizontal_dot.size.width / 2.0,
-            super::GRIP_MARK_CENTER_INSET
-        );
+        let horizontal_dot_center = horizontal.origin.x
+            + first_horizontal_dot.origin.x
+            + first_horizontal_dot.size.width / 2.0;
+        assert_eq!(horizontal_dot_center, super::GRIP_MARK_CENTER_INSET);
+        assert!(horizontal_dot_center < horizontal.origin.x + horizontal.size.width);
     }
 
     /// The column's fixed keycap width must hold every shipped locale's keycap text (the

@@ -547,6 +547,18 @@ impl SettingsRow {
         label_text: &str,
         control: *mut AnyObject,
     ) -> (*mut AnyObject, *mut AnyObject) {
+        // A row must leave its control vertical breathing room. Passing the control's own height
+        // as the row height centers it into nothing -- the control ends up flush against both
+        // dividers -- which is how the keystroke display's slider row shipped 20pt shorter than
+        // its siblings. Fail the debug-build layout smoke instead of shipping it again.
+        if !control.is_null() {
+            let control_frame: NSRect = objc2::msg_send![control, frame];
+            debug_assert!(
+                control_frame.size.height <= 0.0 || row_h > control_frame.size.height,
+                "tall_with_height: a {row_h}pt row gives no padding to a {}pt control",
+                control_frame.size.height
+            );
+        }
         let (label, control) =
             widgets::add_tall_row(parent, label_x, y, label_w, row_h, label_text, control);
         Self::center_label(label, y, row_h);

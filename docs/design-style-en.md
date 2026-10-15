@@ -680,11 +680,14 @@ of. A horizontal stream (bottom/top placement) sizes each keycap to its content
 with a 32pt minimum so single-glyph keys have visual weight comparable to a Command modifier cell,
 and appends a merge count inline with no separator (`A×99`). A vertical stream (side placement)
 draws every keycap independently at ONE fixed width, so the rail — and the panel behind it — never
-changes as keys come and go. The drag handle
-has a transparent 48×20pt hit area (rotated for horizontal streams), larger than its three visible
-dots; it stays localized to the handle rather than making the whole panel draggable. In a column,
-the hit area starts 4pt inside the top edge while the visible dots sit near its outer side, clear
-of the first keycap. The clipboard picker carries the same handle vocabulary in the same place — three dots in a
+changes as keys come and go. Each end of the stream is reserved from its own control — the leading
+handle's hit area plus a gap, the trailing gear's inset, width and gap — so a content-sized panel
+hugs its keycaps instead of carrying the gear's larger reserve as blank space at the handle. The
+drag handle has a transparent 48×20pt hit area (rotated for horizontal streams), larger than its
+three visible dots; it stays localized to the handle rather than making the whole panel draggable.
+In a column, the hit area starts 4pt inside the top edge while the visible dots sit an even inset
+in from the panel's edge, clear of the first keycap. The clipboard picker carries the same handle
+vocabulary in the same place — three dots in a
 transparent band, with the panel never dragging by its background — but its band is the **whole top
 bar**: the header strip's top padding, full width by 28pt tall, which is what §6.1 asks of a control's
 hit target and costs the panel no height it did not already reserve. The three dots sit centered in

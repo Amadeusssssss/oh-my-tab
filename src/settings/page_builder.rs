@@ -564,14 +564,15 @@ pub(super) unsafe fn build_keystroke_display_page(
     // default stop: a full-height rule there pokes out above and below the knob and reads as a
     // stray line, and the stop is already legible while the user drags. The reset gesture itself is
     // announced by the slider's tooltip.
-    let y = canvas.next_row(row_h);
-    SettingsRow::separator_above_row(keystroke_display_view, y, row_h, content_w);
-    ui.keystroke_display_max_extent = SettingsRow::tall_with_height(
+    // A standard single-line row: the slider control keeps its CONTROL_H height, while the row
+    // itself uses the shared SINGLE_LINE_ROW_H like every other row on the page.
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(keystroke_display_view, y, described_row_h, content_w);
+    ui.keystroke_display_max_extent = SettingsRow::tall(
         keystroke_display_view,
         label_x,
         y,
         label_w,
-        row_h,
         &t("settings.row_keystroke_display_max_extent"),
         SettingsControl::stepped_slider(
             ctrl_x,
