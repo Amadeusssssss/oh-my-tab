@@ -548,14 +548,14 @@ fn on_app_activated_inner(notification: *mut c_void) {
         if app.is_null() {
             return;
         }
-        // Non-regular policy = background/helper processes: no windows, icons are
-        // usually the generic placeholder, and extracting would poison the main
-        // app's shared cache key; the thumbnail observer doesn't need them either.
+        // Clipboard target tracking above accepts Accessory apps, which may own input windows.
+        // The switcher's window/MRU and icon paths intentionally handle only Regular apps.
         let policy: i64 = msg_send![app, activationPolicy];
+        let pid: i32 = msg_send![app, processIdentifier];
+        clipboard::note_external_app_activated(pid, policy);
         if policy != 0 {
             return;
         }
-        let pid: i32 = msg_send![app, processIdentifier];
         // Record this app activation's token: newly discovered windows use it as their initial
         // MRU, and async queries use it to reject stale results. Existing windows are never
         // updated together from this app-level timestamp.
@@ -1913,6 +1913,12 @@ fn setup_status_bar() {
             );
             class_addMethod(
                 cls,
+                sel!(handlePinClipboard:),
+                crate::menu::handle_pin_clipboard as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleReloadConfig:),
                 handle_reload_config as *mut c_void,
                 types.as_ptr(),
@@ -2306,6 +2312,11 @@ fn setup_status_bar() {
                 item: thumbnail_item,
             });
         });
+
+        // Clipboard pin item: sits with the service toggles it relates to, but carries its own
+        // state (the pin is in-process, not persisted configuration).
+        let pin_item = build_clipboard_pin_item(menu, menu_target);
+        with_menu_ui(|ui| ui.clipboard_pin = Some(pin_item));
 
         // Reload Config item
         let reload_title = make_nsstring(&t("menu.reload_config"));

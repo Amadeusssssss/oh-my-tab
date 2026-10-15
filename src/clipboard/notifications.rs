@@ -42,6 +42,12 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(clipboardWindowBecameKey:),
+                window_did_become_key as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clearSystemPasteboardIfOwned:),
                 clear_system_pasteboard_if_owned as *mut c_void,
                 types.as_ptr(),
@@ -124,6 +130,24 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 cls,
                 sel!(clearClipboardHistory:),
                 clear_clipboard_history as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(togglePanelPin:),
+                toggle_panel_pin as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(clipboardOutsideClick:),
+                clipboard_outside_click as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(clipboardPasteHandbackTick:),
+                super::paste_handback::paste_handback_tick as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -609,9 +633,217 @@ pub(super) unsafe fn schedule_system_pasteboard_clear() {
     ];
 }
 
+// ---------------------------------------------------------------------------------------------
+// Outside-click monitor (decision C: an unpinned, visible, non-key panel closes on the next click)
+// ---------------------------------------------------------------------------------------------
+
+/// The pinned collection behavior: join every Space, participate in other apps' fullscreen and
+/// Stage Manager, and stay out of window cycling. Transient means Mission Control does not
+/// enumerate it - a temporary display state, never a close or an unpin.
+pub(super) const PINNED_COLLECTION_BEHAVIOR: usize = (1 << 0)  // CanJoinAllSpaces
+    | (1 << 3)  // Transient
+    | (1 << 6)  // IgnoresCycle
+    | (1 << 8)  // FullScreenAuxiliary
+    | (1 << 18); // CanJoinAllApplications (macOS 13+)
+
+struct ClickMonitor {
+    local: *mut AnyObject,
+    global: *mut AnyObject,
+    /// The monitor borrows the block pointer rather than retaining it, so it is kept alive here
+    /// (same ownership discipline as the settings dropdown monitor).
+    #[allow(dead_code)]
+    handler: block2::RcBlock<dyn Fn(*mut AnyObject) -> *mut AnyObject>,
+}
+
+unsafe impl Send for ClickMonitor {}
+unsafe impl Sync for ClickMonitor {}
+
+static CLICK_MONITOR: Mutex<Option<ClickMonitor>> = Mutex::new(None);
+
+/// Install the click monitors when the panel is visible and remove them when it is not.
+///
+/// A global monitor sees only OTHER applications' events, so a click in one of our own windows
+/// (the settings window, the detail panel) is invisible to it; the local monitor covers those. Both
+/// are needed, and mouse monitoring needs no Accessibility grant (that restriction is for key
+/// events). The monitor is NOT tied to the pin: it must stay installed across a pin flip, because
+/// the state that decides whether a click dismisses can change without a new showing.
+/// Returns whether the panel is guarded (always true when hidden, since nothing needs guarding).
+pub(super) unsafe fn sync_outside_click_monitor() -> bool {
+    if super::picker_is_visible() {
+        install_outside_click_monitor()
+    } else {
+        remove_outside_click_monitor();
+        true
+    }
+}
+
+/// Install both monitors. Returns false when the pair cannot be installed, in which case whatever
+/// did install is removed again - a half-installed pair cannot honour the click-outside contract.
+unsafe fn install_outside_click_monitor() -> bool {
+    if CLICK_MONITOR.lock().unwrap().is_some() {
+        return true;
+    }
+    let handler: block2::RcBlock<dyn Fn(*mut AnyObject) -> *mut AnyObject> =
+        block2::RcBlock::new(|event: *mut AnyObject| -> *mut AnyObject {
+            handle_outside_click_event(event);
+            // The local handler must return the event unchanged: swallowing it would break the
+            // target application or our own settings window.
+            event
+        });
+    // LeftMouseDown(1) | RightMouseDown(3) | OtherMouseDown(25); the mask is 1 << type.
+    let mask: u64 = (1u64 << 1) | (1u64 << 3) | (1u64 << 25);
+    let local: *mut AnyObject = msg_send![
+        class!(NSEvent),
+        addLocalMonitorForEventsMatchingMask: mask,
+        handler: &*handler
+    ];
+    let global: *mut AnyObject = msg_send![
+        class!(NSEvent),
+        addGlobalMonitorForEventsMatchingMask: mask,
+        handler: &*handler
+    ];
+    // A half-installed pair cannot honour decision C, so refuse the pin rather than pretend: the
+    // ordinary panel keeps working, and the state is reported and retryable.
+    if local.is_null() || global.is_null() {
+        if !local.is_null() {
+            let _: () = msg_send![class!(NSEvent), removeMonitor: local];
+        }
+        if !global.is_null() {
+            let _: () = msg_send![class!(NSEvent), removeMonitor: global];
+        }
+        log_info!("[clip] outside-click monitor unavailable; refusing to pin");
+        return false;
+    }
+    *CLICK_MONITOR.lock().unwrap() = Some(ClickMonitor {
+        local,
+        global,
+        handler,
+    });
+    true
+}
+
+unsafe fn remove_outside_click_monitor() {
+    let taken = CLICK_MONITOR.lock().unwrap().take();
+    if let Some(installed) = taken {
+        let _: () = msg_send![class!(NSEvent), removeMonitor: installed.local];
+        let _: () = msg_send![class!(NSEvent), removeMonitor: installed.global];
+    }
+}
+
+/// Decide what an outside click means, from the state on screen right now.
+///
+/// Only three outcomes matter: a pinned panel ignores it; an unpinned panel that is still key lets
+/// AppKit's own resign-key path do the dismissal (this monitor must not race it); and an unpinned,
+/// visible, NON-key panel is the state decision C creates, where no second resign-key will ever
+/// arrive and this callback is the only thing that can close it.
+fn handle_outside_click_event(event: *mut AnyObject) {
+    unsafe {
+        if super::is_pinned() || !super::picker_is_visible() {
+            return;
+        }
+        let Some(window) = *super::PICKER_WINDOW.lock().unwrap() else {
+            return;
+        };
+        let is_key: bool = msg_send![window.0, isKeyWindow];
+        if is_key {
+            return;
+        }
+        if let Some(point) = event_screen_location(event) {
+            if panel_group_contains(point) {
+                return;
+            }
+        }
+        // Deferred: orderOut synchronously fires the resign notification, so the dismiss belongs on
+        // the next turn, keyed on the showing it was queued for.
+        super::set_pending_outside_click(super::showing_generation());
+        let _: () = msg_send![
+            observer(),
+            performSelector: sel!(clipboardOutsideClick:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: 0.0f64
+        ];
+    }
+}
+
+/// The deferred half: re-check that the world has not changed under the queued click.
+pub(super) extern "C" fn clipboard_outside_click(_self: *mut c_void, _cmd: Sel) {
+    crate::callback_guard::void("clipboard_outside_click", || {
+        let Some(generation) = super::take_pending_outside_click() else {
+            return;
+        };
+        // A stale click belongs to a showing that is gone; it must never close the one on screen.
+        if !super::showing_is_current(generation) {
+            return;
+        }
+        if super::is_pinned() || !super::picker_is_visible() {
+            return;
+        }
+        hide_picker();
+    });
+}
+
+/// The screen point of a mouse-down event, or None when it cannot be read.
+unsafe fn event_screen_location(event: *mut AnyObject) -> Option<NSPoint> {
+    if event.is_null() {
+        return None;
+    }
+    let window: *mut AnyObject = msg_send![event, window];
+    let point: NSPoint = msg_send![event, locationInWindow];
+    if window.is_null() {
+        // Another application's event: AppKit reports locationInWindow in screen coordinates for
+        // those, and there is no window to convert through.
+        return Some(point);
+    }
+    Some(msg_send![window, convertPointToScreen: point])
+}
+
+/// Whether a screen point lies in the picker's or an open detail panel's VISIBLE rect - never the
+/// padded window rect, which is transparent and must not count as "inside".
+unsafe fn panel_group_contains(point: NSPoint) -> bool {
+    // Only a currently OPEN detail counts. Its window is cached after a close, so its old rect would
+    // otherwise keep swallowing outside clicks at a position where nothing is drawn, and the panel
+    // could no longer be dismissed there.
+    let detail = if super::detail_visible() {
+        *super::DETAIL_WINDOW.lock().unwrap()
+    } else {
+        None
+    };
+    for window in [*super::PICKER_WINDOW.lock().unwrap(), detail]
+        .into_iter()
+        .flatten()
+    {
+        let frame = crate::glass::panel_frame_of(window.0);
+        if point.x >= frame.origin.x
+            && point.x <= frame.origin.x + frame.size.width
+            && point.y >= frame.origin.y
+            && point.y <= frame.origin.y + frame.size.height
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Picker resign-key notification callback (main thread): auto-hide on outside clicks, etc.
+///
+/// This stays alongside the click monitor; it is not replaced by it. The monitor handles the case
+/// no notification can reach (an unpinned panel that is already non-key); this handles losing key
+/// while pinned, which is exactly the event the pin exists to ignore.
 extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    if super::is_pinned() {
+        // A pinned panel can remain open while the user changes apps. Capture the new external app
+        // as focus leaves the panel so a later row click targets the app the user switched to.
+        super::paste_handback::capture_external_target();
+        unsafe { super::set_picker_glass_inactive(true) };
+        return;
+    }
     hide_picker();
+}
+
+/// A pinned picker remains visible after resigning key; remove its passive-look compensation when
+/// it becomes key again so its active material is exactly the configured Liquid Glass.
+extern "C" fn window_did_become_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
+    unsafe { super::set_picker_glass_inactive(false) };
 }
 
 pub(super) extern "C" fn clipboard_window_send_event(
@@ -1269,8 +1501,133 @@ extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c
     clear_clipboard_history_scope(true);
 }
 
+/// The panel-level pin: toggle the whole-panel state and reflect it on the button.
+///
+/// Pinning captures the panel's CURRENT height and freezes it there (design decision E), which is
+/// why the height comes from the live panel rect rather than from the geometry constants. The pin
+/// does not move, resize or re-front the panel, and it never touches the entries.
+pub(super) extern "C" fn toggle_panel_pin(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    crate::callback_guard::void("toggle_panel_pin", || unsafe {
+        if super::is_pinned() {
+            // Decision C: unpinning only flips the state. The panel stays visible and the next
+            // outside click dismisses it. The window properties are NOT restored here: doing so on a
+            // panel that is still meant to be on screen can move it off the current Space or make it
+            // vanish, which is exactly the cross-Space case the design must survive. The restore is
+            // deferred to the actual hide (see `apply_pin_window_properties_on_hide`).
+            super::unpin();
+        } else {
+            let height = match *super::PICKER_WINDOW.lock().unwrap() {
+                Some(window) => crate::glass::panel_frame_of(window.0).size.height,
+                None => return,
+            };
+            if !super::pin(height) {
+                return;
+            }
+            // The click monitor is what makes unpinning meaningful (the next outside click closes
+            // the panel), so a pin that cannot arm it is refused outright rather than left in a state
+            // it cannot honour.
+            if !sync_outside_click_monitor() {
+                super::forget_pin();
+                refresh_pin_button();
+                crate::menu::refresh_clipboard_pin_item();
+                show_toast(&t("clipboard.toast_pin_unavailable"));
+                return;
+            }
+            apply_pin_window_properties();
+        }
+        refresh_pin_button();
+        // The menu item mirrors the pin, so the two surfaces cannot drift apart.
+        crate::menu::refresh_clipboard_pin_item();
+    });
+}
+
+/// Reflect the pin on the corner button.
+pub(super) unsafe fn refresh_pin_button() {
+    if let Some(button) = *super::PICKER_PIN_BUTTON.lock().unwrap() {
+        set_pin_button_style(button.0, super::is_pinned(), false);
+    }
+}
+
+/// Remove the click monitors unconditionally. Used by the hide path, where `picker_is_visible` can
+/// still answer true because the orderOut happens later and outside the state lock.
+pub(super) unsafe fn remove_outside_click_monitor_now() {
+    remove_outside_click_monitor();
+}
+
+/// Give a newly created detail window the properties the PICKER is actually carrying right now.
+///
+/// Deliberately a copy rather than a recomputation from the pin: after unpinning, the still-visible
+/// picker keeps the pinned properties until the panel genuinely hides (that is the transition
+/// decision C requires), so "recompute from is_pinned()" would restore them early - exactly the
+/// defect that broke a cross-Space unpin followed by opening the detail.
+pub(super) unsafe fn inherit_window_properties_from_picker(detail: *mut AnyObject) {
+    let Some(picker) = (*super::PICKER_WINDOW.lock().unwrap()).map(|w| w.0) else {
+        return;
+    };
+    if detail.is_null() {
+        return;
+    }
+    let hides: bool = msg_send![picker, hidesOnDeactivate];
+    let behavior: usize = msg_send![picker, collectionBehavior];
+    let _: () = msg_send![detail, setHidesOnDeactivate: hides];
+    let _: () = msg_send![detail, setCollectionBehavior: behavior];
+}
+
+/// Restore the default window properties for a panel that is actually being hidden.
+///
+/// Separate from `apply_pin_window_properties` so the two moments cannot be confused: this one is
+/// only correct once the panel is genuinely going away, and it deliberately does NOT clear the pin -
+/// a hidden pinned panel is still pinned (the menu item brings it back).
+pub(super) unsafe fn apply_pin_window_properties_for_hidden_panel() {
+    for window in [
+        *super::PICKER_WINDOW.lock().unwrap(),
+        *super::DETAIL_WINDOW.lock().unwrap(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _: () = msg_send![window.0, setHidesOnDeactivate: true];
+        let _: () = msg_send![window.0, setCollectionBehavior: 0usize];
+    }
+}
+
+/// Apply the visible panel's pin properties.
+///
+/// `hidesOnDeactivate` stays disabled while the panel is visible, pinned or not. AppKit can hide a
+/// nonactivating panel as its owner deactivates without sending our resign-key callback; that
+/// bypasses the unpinned outside-click/resign handling and leaves the visibility state out of sync.
+/// Those explicit handlers own dismissal while visible. The pinned collection behavior is what
+/// lets a pinned panel follow the active Space (decision F).
+///
+/// Callers: the pin toggle, menu pin action, and show path. Defaults are restored only after the
+/// panel is actually hidden (see `apply_pin_window_properties_for_hidden_panel`).
+pub(super) unsafe fn apply_pin_window_properties() {
+    let pinned = super::is_pinned();
+    let windows = [
+        *super::PICKER_WINDOW.lock().unwrap(),
+        *super::DETAIL_WINDOW.lock().unwrap(),
+    ];
+    for window in windows.into_iter().flatten() {
+        let _: () = msg_send![window.0, setHidesOnDeactivate: false];
+        if pinned {
+            let _: () = msg_send![window.0, setCollectionBehavior: PINNED_COLLECTION_BEHAVIOR];
+        } else {
+            let _: () = msg_send![window.0, setCollectionBehavior: 0usize];
+        }
+    }
+}
 /// The header's corner close button: the same dismissal as Esc with no query / an outside click.
+///
+/// This is the ONE path that clears the panel pin (design decision A): the x means the user is
+/// done with the panel, while every other dismissal only hides it.
 extern "C" fn picker_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    super::forget_pin();
+    unsafe {
+        refresh_pin_button();
+        apply_pin_window_properties();
+        sync_outside_click_monitor();
+    }
+    crate::menu::refresh_clipboard_pin_item();
     hide_picker();
 }
 
@@ -1326,7 +1683,11 @@ pub(super) extern "C" fn open_clipboard_settings(
     };
     crate::settings::show_clipboard_page();
     let shown = started.elapsed();
-    hide_picker();
+    // A pinned panel stays up and ordered front (decision R1): the gear is a navigation action, not
+    // a dismissal, so it must not take the pinned panel away with it.
+    if !super::is_pinned() {
+        hide_picker();
+    }
     let total = started.elapsed();
     // Debug-level, click-path timing, and the number the A2 latency scenario bounds: from the click the
     // event carries to the moment the panel is down and the window is up. Only the WindowServer's own
@@ -1434,6 +1795,10 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
 /// NSSearchField's Esc (cancelOperation:): a query gets cleared and the full list restored
 /// (scheme A, level one); with no query the picker closes (level two).
 pub(super) extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
+    // Same rule as the list-focus Esc: a pinned panel ignores the key before it can clear a query.
+    if super::is_pinned() {
+        return;
+    }
     let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
     if has_query {
         clear_search();

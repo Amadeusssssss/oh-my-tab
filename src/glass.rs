@@ -13,7 +13,7 @@ use crate::ffi::{
 
 pub(crate) const PANEL_CORNER_RADIUS: f64 = 16.0;
 /// AppKit darkens Liquid Glass in passive panels; this alpha matches the clipboard detail panel.
-pub(crate) const INACTIVE_GLASS_COMPENSATION_ALPHA: u32 = 0x8D;
+pub(crate) const INACTIVE_GLASS_COMPENSATION_ALPHA: u32 = 0x99;
 /// How a panel holds the contrast table for the text it draws.
 ///
 /// Panels sit on the user's material, so their ink is the **system's vibrant label color** rather than

@@ -669,12 +669,12 @@ static AX_SNAPSHOT_CACHE: LazyLock<Mutex<HashMap<i32, CachedAxSnapshot>>> =
 /// NOT inherited: with the timeout set only on the app element, the queries on the window elements
 /// taken from AXWindows (AXTitle/AXRole/...) still use the system default of ~1.5s measured -- one
 /// unresponsive app was enough to stall a whole collection pass by that much.
-const AX_WINDOW_MESSAGING_TIMEOUT: f64 = 0.2;
+const AX_WINDOW_MESSAGING_TIMEOUT: f32 = 0.2;
 
 /// The raise path runs its AX on the main thread, so its timeout is tighter than the collection
 /// path: a timeout only loses the focus backstop (the SLPS fast raise already ran), whereas a
 /// blocked main thread freezes the whole UI, including the next Cmd+Tab.
-const AX_RAISE_MESSAGING_TIMEOUT: f64 = 0.25;
+const AX_RAISE_MESSAGING_TIMEOUT: f32 = 0.25;
 
 /// A window that was observed at a non-normal CG layer must keep that classification while the
 /// same process instance and CGWindowID are alive. Some apps (notably Pixelmator-style helpers)

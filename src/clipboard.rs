@@ -69,9 +69,11 @@ mod keyring_acl;
 mod model;
 mod monitor;
 mod notifications;
+mod paste_handback;
 mod pasteboard;
 mod persist;
 mod picker;
+mod pin;
 mod search;
 mod smoke;
 mod storage;
@@ -86,20 +88,28 @@ use notifications::*;
 use pasteboard::*;
 use persist::*;
 use picker::*;
+use pin::*;
 use search::*;
 use smoke::*;
 use storage::*;
 use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
-pub(crate) use detail::{apply_backdrop_material, apply_theme};
+pub(crate) use detail::{apply_backdrop_material, apply_theme, set_picker_glass_inactive};
 pub(crate) use monitor::{start, stop};
 pub(crate) use notifications::{
     applied_notice_labels, e2e_settings_click_delivery_ms, e2e_settings_click_ms,
     keychain_row_status, record_applied_about_status, record_applied_action, storage_action,
     AppliedAction, NoticeSurface, StorageAction,
 };
+/// Whether a pinned paste is waiting for its target to take keyboard focus (for the smoke runner).
+pub(crate) use paste_handback::handback_in_flight;
+pub(crate) use paste_handback::note_external_app_activated;
 pub(crate) use persist::{clear_on_quit_enabled, discard_history_on_disk};
-pub(crate) use picker::{on_clipboard_toggle, show_picker_for_development};
+pub(crate) use picker::{on_clipboard_toggle, show_and_pin_for_menu, show_picker_for_development};
+/// The frozen panel height while pinned, for the geometry assertions.
+pub(crate) use pin::frozen_height;
+/// Whether the panel-level pin is set, for the menu bar's mirrored check state.
+pub(crate) use pin::is_pinned;
 pub(crate) use smoke::{set_smoke_mode, smoke_runner};
 pub(crate) use text_style::refresh_localized_ui;
 pub(crate) use text_style::update_clear_action_labels;
@@ -394,6 +404,10 @@ const PICKER_CLOSE_BTN_GAP: f64 = 8.0;
 /// follow the button's font), so the corner's second glyph is sized here, a step above the close
 /// button's 12pt text × so the two read as the same weight.
 const PICKER_GEAR_GLYPH_SIZE: f64 = 13.0;
+/// The pin button is the corner row's THIRD glyph, left of the gear: the same 28pt hit target and
+/// family as its two neighbours, so the row reads as one group. Its glyph size matches the gear's
+/// for the same reason (both are SF Symbols, which do not follow the button's font).
+const PICKER_PIN_GLYPH_SIZE: f64 = PICKER_GEAR_GLYPH_SIZE;
 /// The gap under the search bar.
 const SEARCH_GAP_Y: f64 = 8.0;
 /// the filters row's height (the new mockup's 36px).
@@ -842,6 +856,8 @@ static PICKER_CLOSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new
 static PICKER_HEADER_STRIP: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The header's settings button, next to the close button (same persistence).
 static PICKER_SETTINGS_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The panel-level pin button (the corner row's third glyph). Distinct from the per-row entry pin.
+static PICKER_PIN_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
 /// carries NO placeholder property, so the field editor never draws the placeholder
 /// left-aligned on a focused-but-empty field).
@@ -1208,27 +1224,39 @@ mod tests {
         estimated_entry_bytes, fnv1a64, header_strip_h, picker_grip_frame, picker_header_frames,
         rect_contains_point, run_image_cache_job, scroll_indicator_geometry,
         wipe_cache_for_discard, ClipEntry, ImageCacheJob, ImageEntry, CLIP_HISTORY, NO_SELECTION,
-        NSPASTEBOARD_TYPE_PNG, PICKER_W, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE,
-        SEARCH_PAD_X, TOP_PAD_Y,
+        NSPASTEBOARD_TYPE_PNG, PICKER_CLOSE_BTN_GAP, PICKER_W, SCROLL_INDICATOR_CORNER_RESERVE,
+        SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::sync::Arc;
     #[test]
-    fn picker_header_separates_the_search_field_the_settings_button_and_the_close_button() {
-        let (search, gear, close) = picker_header_frames();
-        // The row is inset symmetrically from the strip's edges and both buttons are square.
+    fn picker_header_separates_the_four_corner_controls() {
+        let (search, pin, gear, close) = picker_header_frames();
+        // The row is inset symmetrically from the strip's edges and all three buttons are square.
         assert_eq!(search.origin.x, SEARCH_PAD_X);
         assert_eq!(search.origin.y, TOP_PAD_Y);
         assert_eq!(close.origin.x + close.size.width, PICKER_W - SEARCH_PAD_X);
         assert_eq!(close.size.width, close.size.height);
+        assert_eq!(pin.size, close.size);
         assert_eq!(gear.size, close.size);
-        // Every control is clear of the one before it: the × is never drawn over the gear, the gear
-        // never over the query/⌘F keycap, and the three never overlap whichever label is longest.
-        assert!(search.origin.x + search.size.width < gear.origin.x);
+        // Every control is clear of the one before it: the close button is never drawn over the
+        // gear, the gear never over the pin, the pin never over the query/⌘F keycap, and none of
+        // the four overlap whichever label is longest.
+        assert!(search.origin.x + search.size.width < pin.origin.x);
+        assert!(pin.origin.x + pin.size.width < gear.origin.x);
         assert!(gear.origin.x + gear.size.width < close.origin.x);
-        // All three stay inside the fixed strip (never over the filters row or the list).
+        // The three buttons are evenly spaced by the one gap constant, so the row reads as a group.
+        assert_eq!(
+            gear.origin.x - (pin.origin.x + pin.size.width),
+            PICKER_CLOSE_BTN_GAP
+        );
+        assert_eq!(
+            close.origin.x - (gear.origin.x + gear.size.width),
+            PICKER_CLOSE_BTN_GAP
+        );
+        // All four stay inside the fixed strip (never over the filters row or the list).
         let strip_bottom = header_strip_h();
-        for frame in [search, gear, close] {
+        for frame in [search, pin, gear, close] {
             assert!(frame.origin.y + frame.size.height <= strip_bottom);
         }
         // The drag handle is the WHOLE top bar: it sits in the top padding the strip already reserves

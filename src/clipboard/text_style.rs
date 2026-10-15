@@ -559,6 +559,70 @@ pub(super) unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: 
     }
 }
 
+/// The header's pin button. It is the corner row's third glyph and keeps that family - no bezel,
+/// no border, one faint hover wash - but unlike its two neighbours it has a **persistent selected
+/// state**: the pin is either set or not, so its ink and its glyph both change. That is the
+/// documented exception in `docs/design-style-en.md` §10 (the corner row's first stateful control);
+/// the amendment landed in the same change.
+///
+/// The glyph is replaced per state rather than tinted: an SF Symbol image is not a template here, so
+/// `contentTintColor` would not reach it. Filled = pinned, outline = unpinned.
+pub(super) unsafe fn set_pin_button_style(button: *mut AnyObject, pinned: bool, hovered: bool) {
+    if button.is_null() {
+        return;
+    }
+    let palette = clipboard_palette();
+    // The pinned state and hover share the primary ink; what separates them is the glyph (filled
+    // vs outline) and the hover wash below, never the ink.
+    let (tint, role) = if pinned || hovered {
+        (palette.primary_text, crate::glass::PanelInk::Primary)
+    } else {
+        (palette.secondary_text, crate::glass::PanelInk::Secondary)
+    };
+    // The symbol name carries the state: a filled pin when set, the outline when not.
+    let symbol = if pinned { "pin.fill" } else { "pin" };
+    let symbol_name = make_nsstring(symbol);
+    let image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_name,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_name as *const c_void);
+    if !image.is_null() {
+        let config: *mut AnyObject = msg_send![
+            class!(NSImageSymbolConfiguration),
+            configurationWithPointSize: PICKER_PIN_GLYPH_SIZE,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+        let _: () = msg_send![image, setTemplate: true];
+        let _: () = msg_send![button, setImage: image];
+    }
+    let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        let background = if hovered {
+            panel_hover_wash()
+        } else {
+            0x00000000
+        };
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
+    }
+    // The state must be readable without seeing the glyph: a filled/outline pin is a colour
+    // distinction, so the label is what actually states it (design review, round 1 CONCERN 3).
+    let label_key = if pinned {
+        "clipboard.pin_on"
+    } else {
+        "clipboard.pin_off"
+    };
+    let label = make_nsstring(&t(label_key));
+    let _: () = msg_send![button, setAccessibilityLabel: label];
+    CFRelease(label as *const c_void);
+    let tooltip = make_nsstring(&t("clipboard.pin_tooltip"));
+    let _: () = msg_send![button, setToolTip: tooltip];
+    CFRelease(tooltip as *const c_void);
+}
+
 /// Replace the detail icon for its normal/hover/active state and reuse the single-button
 /// rounded state styling.
 pub(super) unsafe fn set_detail_action_style(button: *mut AnyObject, active: bool, hovered: bool) {
@@ -662,6 +726,12 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             set_settings_button_style(b, true);
             return;
         }
+        if action == sel!(togglePanelPin:) {
+            // The pinned state outranks hover: the wash still shows, but the glyph and ink stay in
+            // the selected form, so hovering cannot make a pinned button read as unpinned.
+            set_pin_button_style(b, super::is_pinned(), true);
+            return;
+        }
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(b, true);
             return;
@@ -712,6 +782,10 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
         }
         if action == sel!(openClipboardSettings:) {
             set_settings_button_style(b, false);
+            return;
+        }
+        if action == sel!(togglePanelPin:) {
+            set_pin_button_style(b, super::is_pinned(), false);
             return;
         }
         if (action == sel!(showItemDetails:)
@@ -1686,6 +1760,10 @@ pub fn refresh_localized_ui() {
             let _: () = msg_send![button.0, setToolTip: tooltip];
             CFRelease(tooltip as *const c_void);
         }
+        // The pin's label states which state the button is in, and the glyph that carries it is
+        // independent of locale, so both are repainted from the live value here.
+        super::notifications::refresh_pin_button();
+        crate::menu::refresh_clipboard_pin_item();
         if let Some(search) = *SEARCH_FIELD.lock().unwrap() {
             let _: () = msg_send![search.0, setNeedsDisplay: true];
         }

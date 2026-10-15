@@ -277,6 +277,10 @@ pub(super) fn polling_active() -> bool {
 
 /// Stop polling (idempotent).
 pub(crate) fn stop() {
+    // A hand-back armed before the feature was switched off must not send a keystroke afterwards: the
+    // panel is going away and the tick's enabled check would already refuse it, but cancelling here
+    // also releases the burn suppression token promptly instead of leaving it for a timer.
+    super::paste_handback::cancel();
     unsafe {
         let timer_holder =
             POLL_TIMER.get_or_init(|| MainThreadSlot::new(ObjPtr::new(std::ptr::null_mut())));

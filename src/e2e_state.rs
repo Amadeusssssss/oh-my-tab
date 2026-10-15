@@ -962,8 +962,9 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {
             Some((x, y, w, h)) => format!(
-                "{{\"visible\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}}}",
+                "{{\"visible\": {}, \"pinned\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}}}",
                 crate::clipboard::picker_is_visible(),
+                crate::clipboard::is_pinned(),
                 x,
                 y,
                 w,

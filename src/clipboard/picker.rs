@@ -568,10 +568,21 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
         log_debug!("[clip] toggle ignored: clipboard history disabled");
         return;
     }
-    if PICKER_VISIBLE.load(Ordering::SeqCst) {
+    // Decision B: while pinned the shortcut does nothing at all - it neither hides nor unpins the
+    // panel. (An earlier design let it re-raise; the user chose a strict no-op.)
+    if is_pinned() {
+        log_debug!("[clip] toggle ignored: the panel is pinned");
+        return;
+    }
+    // `PICKER_VISIBLE` records our intent, but AppKit can hide an unpinned panel as the app loses
+    // activation without delivering the resign-key callback (for example, while it is already
+    // non-key). Treat the actual window state as authoritative so Option+V reopens a hidden panel
+    // instead of consuming the shortcut to hide it again.
+    if picker_is_visible() {
         hide_picker();
         return;
     }
+    PICKER_VISIBLE.store(false, Ordering::SeqCst);
     // Show the picker even with an empty history (the empty-state hint lives in
     // rebuild_rows' empty branch).
     set_picker_selection(0);
@@ -588,10 +599,56 @@ pub(crate) fn show_picker_for_development() {
     show_picker();
 }
 
+/// The menu bar's "show and pin clipboard history": idempotent, never a toggle.
+///
+/// - unpinned or hidden: show the panel, then pin it at the height it actually has;
+/// - pinned and visible: do nothing (the menu is the way BACK to a hidden pinned panel, not a
+///   second toggle that could strand the user);
+/// - pinned and hidden: show it again at the frozen height.
+///
+/// The pin's height is read after the show, so "unpinned" freezes the real panel height rather than
+/// a stale value from a previous showing.
+pub(crate) fn show_and_pin_for_menu() {
+    if !PICKER_VISIBLE.load(Ordering::SeqCst) || !picker_is_visible() {
+        show_picker();
+    }
+    if is_pinned() {
+        return;
+    }
+    let height = unsafe {
+        match *PICKER_WINDOW.lock().unwrap() {
+            Some(window) => crate::glass::panel_frame_of(window.0).size.height,
+            None => return,
+        }
+    };
+    if !pin(height) {
+        return;
+    }
+    unsafe {
+        // The same precondition as the corner button: a pin that cannot arm the click monitor cannot
+        // honour the "next outside click closes it" contract, so it is refused rather than left in a
+        // state the panel cannot keep.
+        if !super::sync_outside_click_monitor() {
+            super::forget_pin();
+            super::refresh_pin_button();
+            crate::menu::refresh_clipboard_pin_item();
+            show_toast(&t("clipboard.toast_pin_unavailable"));
+            return;
+        }
+        super::refresh_pin_button();
+        super::apply_pin_window_properties();
+    }
+    crate::menu::refresh_clipboard_pin_item();
+}
+
 /// Show the picker (built once, reused; the window height follows the visible row count).
 pub(super) fn show_picker() {
     unsafe {
+        // Capture the destination before makeKeyWindow gives the nonactivating panel keyboard
+        // ownership. A row action can run after AppKit has made our own process frontmost.
+        super::paste_handback::capture_external_target();
         let show_started = Instant::now();
+        super::set_picker_glass_inactive(false);
         // Start each summon without a hovered row; the old rows are gone, so their index must
         // never leak into the rebuilt list.
         *HOVER_ROW.lock().unwrap() = NO_SELECTION;
@@ -671,7 +728,11 @@ pub(super) fn show_picker() {
             pitches.iter().take(visible).sum::<f64>()
         };
         // Use the same three-record visual minimum for every state, including one or zero rows.
-        let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(picker_min_height());
+        let computed_h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(picker_min_height());
+        // A pinned panel keeps the height it was pinned at (decision E): the row set can change
+        // underneath it (a new copy, a filter, an expiry) without the panel resizing under the
+        // pointer. The frozen value is a PANEL height, which is what the frame here is built from.
+        let h = frozen_height().unwrap_or(computed_h);
 
         let frame = configured_picker_frame(
             center_on_main,
@@ -755,6 +816,12 @@ pub(super) fn show_picker() {
         }
         let visible_store_started = Instant::now();
         PICKER_VISIBLE.store(true, Ordering::SeqCst);
+        // A new showing invalidates any dismiss queued against the previous one, and the click
+        // monitor now has a panel to guard. Both happen after the window is really up, before any
+        // click can arrive.
+        begin_showing();
+        super::apply_pin_window_properties();
+        super::sync_outside_click_monitor();
         let visible_store_ms = visible_store_started.elapsed().as_millis();
         let order_front_ms = order_front_started.elapsed().as_millis();
         let order_front_residual_ms = order_front_ms.saturating_sub(
@@ -822,6 +889,22 @@ pub(super) fn hide_picker() {
     // has to be popped by hand, and this showing's dragged position dies with the showing.
     super::grip::on_picker_hidden();
     hide_detail();
+    // The showing is over: a dismiss queued against it is stale from here on, the click monitor has
+    // nothing to guard, and this is where the properties pinning changed are restored (never at
+    // unpin, which must leave a still-visible panel exactly where it is).
+    super::begin_showing();
+    // The panel is going away: an armed paste hand-back can never land now, and its burn
+    // suppression token must not outlive it.
+    super::paste_handback::cancel();
+    // The panel is genuinely hidden here, so this is where the properties pinning changed are
+    // restored - not at unpin, which must leave a still-visible panel exactly where it is. The
+    // monitor is removed by force: `picker_is_visible()` can still answer true this early in the
+    // hide (the orderOut is deliberately outside the lock, below).
+    unsafe {
+        super::set_picker_glass_inactive(false);
+        super::apply_pin_window_properties_for_hidden_panel();
+        super::remove_outside_click_monitor_now();
+    }
 
     // Take the pointer under the lock but orderOut outside it: orderOut synchronously fires
     // NSWindowDidResignKeyNotification, whose callback re-enters hide_picker and locks the
@@ -996,6 +1079,12 @@ unsafe fn ensure_detail_window() {
 
     *DETAIL_CONTENT.lock().unwrap() = Some(ObjPtr::new(content));
     *DETAIL_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
+    // A detail created while the panel is pinned must carry the pinned window state too: the property
+    // pass only reaches windows that already exist when it runs. It must copy what the PICKER is
+    // actually carrying rather than recompute from the pin, because after an unpin the picker is
+    // deliberately still holding the pinned properties until the panel actually hides - recomputing
+    // would restore them early and break the unpin transition.
+    super::notifications::inherit_window_properties_from_picker(window);
 }
 
 /// The detail panel never becomes key (keyboard focus stays in the picker's container).

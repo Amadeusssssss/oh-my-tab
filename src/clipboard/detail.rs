@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// Whether the pinned picker has lost key status and needs to counter Liquid Glass's passive look.
+static PICKER_GLASS_INACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn picker_inactive_compensation_alpha() -> u32 {
+    if PICKER_GLASS_INACTIVE.load(Ordering::SeqCst) {
+        crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA
+    } else {
+        0
+    }
+}
+
+/// Follow the picker's key state while pinned. Liquid Glass chooses a passive appearance after the
+/// panel resigns key; the compensation is only present for that interval and never changes the
+/// material while the picker is active.
+pub(crate) unsafe fn set_picker_glass_inactive(inactive: bool) {
+    if PICKER_GLASS_INACTIVE.swap(inactive, Ordering::SeqCst) != inactive {
+        apply_glass_properties();
+    }
+}
+
 pub(super) unsafe fn add_detail_text(
     content: *mut AnyObject,
     text: &str,
@@ -444,11 +464,14 @@ pub(super) fn copy_detail_selection() {
 }
 
 /// The picker's backdrop policy: its rows, group headers and footer bands carry their own text
-/// surfaces, so the material is left honest (design-style §3). No inactive-glass
-/// compensation -- the picker is the panel the user is interacting with.
-pub(crate) const fn picker_backdrop_options() -> crate::glass::BackdropOptions {
+/// surfaces, so the material is left honest (design-style §3). The passive compensation layer is
+/// transparent while key and only tinted while a pinned picker remains visible after resigning key.
+pub(crate) fn picker_backdrop_options() -> crate::glass::BackdropOptions {
     // `high`: the picker floats over another app's content exactly as the switcher does.
-    crate::glass::BackdropOptions::new(None).with_elevation(Some(crate::theme::ELEVATION_HIGH))
+    // Keep a transparent compensation layer available so it can counter the system's passive
+    // Liquid Glass treatment only while a pinned picker is non-key.
+    crate::glass::BackdropOptions::new(Some(picker_inactive_compensation_alpha()))
+        .with_elevation(Some(crate::theme::ELEVATION_HIGH))
 }
 
 /// The detail panel is a passive companion of the picker, so its Liquid Glass takes the inactive
@@ -534,6 +557,9 @@ pub(crate) unsafe fn apply_theme() {
     if let Some(button) = *PICKER_SETTINGS_BUTTON.lock().unwrap() {
         set_settings_button_style(button.0, false);
     }
+    // The pin's ink and glyph both come from the palette, and this is the system-appearance entry
+    // point (the "auto" theme path calls apply_theme directly, without the locale coordinator).
+    super::notifications::refresh_pin_button();
 }
 
 pub(super) unsafe fn ensure_picker_window() {
@@ -805,7 +831,7 @@ pub(super) unsafe fn ensure_picker_window() {
     // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
     // with a 1px inner ring; the placeholder is left-aligned. The corner close button shares the
     // row, so the shared geometry gives the field the remaining width.
-    let (search_frame, gear_frame, close_frame) = picker_header_frames();
+    let (search_frame, pin_frame, gear_frame, close_frame) = picker_header_frames();
     let search_w = search_frame.size.width;
     let search: *mut AnyObject = msg_send![search_cls, alloc];
     let search: *mut AnyObject = msg_send![search, initWithFrame: search_frame];
@@ -984,6 +1010,30 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![header_strip, addSubview: gear_button];
     release_obj(gear_button);
     *PICKER_SETTINGS_BUTTON.lock().unwrap() = Some(ObjPtr::new(gear_button));
+
+    // The pin button, left of the gear: the corner row's third glyph. It toggles the WHOLE-panel
+    // pin (a different thing from the per-row ☆), which is why it lives with the panel-level
+    // controls rather than among the rows. Its stateful glyph is the documented §10 exception.
+    let pin_button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let pin_button: *mut AnyObject = msg_send![pin_button, initWithFrame: pin_frame];
+    let _: () = msg_send![pin_button, setBordered: false];
+    let _: () = msg_send![pin_button, setWantsLayer: true];
+    let pin_layer: *mut AnyObject = msg_send![pin_button, layer];
+    if !pin_layer.is_null() {
+        let _: () = msg_send![pin_layer, setCornerRadius: PICKER_CLOSE_BTN_R];
+        let _: () = msg_send![pin_layer, setMasksToBounds: true];
+    }
+    let pin_title = make_nsstring("");
+    let _: () = msg_send![pin_button, setTitle: pin_title];
+    CFRelease(pin_title as *const c_void);
+    let _: () = msg_send![pin_button, setTarget: observer()];
+    let _: () = msg_send![pin_button, setAction: sel!(togglePanelPin:)];
+    set_pin_button_style(pin_button, false, false);
+    add_hover_tracking(pin_button);
+    let _: () = msg_send![header_strip, addSubview: pin_button];
+    release_obj(pin_button);
+    *PICKER_PIN_BUTTON.lock().unwrap() = Some(ObjPtr::new(pin_button));
+
     release_obj(search);
     *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr::new(search));
     // Text changes (including the system clear button / NSSearchField's Esc clear) filter live.
@@ -1113,6 +1163,15 @@ pub(super) unsafe fn ensure_picker_window() {
         object: window
     ];
     CFRelease(resign_name as *const c_void);
+    let become_key_name = make_nsstring("NSWindowDidBecomeKeyNotification");
+    let _: () = msg_send![
+        center,
+        addObserver: observer(),
+        selector: sel!(clipboardWindowBecameKey:),
+        name: become_key_name,
+        object: window
+    ];
+    CFRelease(become_key_name as *const c_void);
     *PICKER_CONTAINER.lock().unwrap() = Some(ObjPtr::new(container));
     *PICKER_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
 }
@@ -2679,9 +2738,13 @@ fn paste_at(idx: usize) {
 /// from the history right away (Option+Enter/click, one-shot paste). Removal goes through
 /// delete_entry (the image cache file goes too); pinned entries burn all the same.
 fn paste_at_ex(idx: usize, delete_after: bool) {
+    // These guards are unreachable in practice; they still follow the pinned rule rather than
+    // hiding a panel the user is holding open (design decision R3).
     let Some(h_idx) = mapped_index(idx) else {
         log_debug!("[clip] paste index {} out of range", idx);
-        hide_picker();
+        if !is_pinned() {
+            hide_picker();
+        }
         return;
     };
     let entry = {
@@ -2690,7 +2753,9 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
     };
     let Some(entry) = entry else {
         log_debug!("[clip] paste index {} out of range", idx);
-        hide_picker();
+        if !is_pinned() {
+            hide_picker();
+        }
         return;
     };
     // An image whose bytes cannot be produced pastes nothing at all: say so while the picker is
@@ -2709,12 +2774,22 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
     // Effective = gesture AND setting: with the toggle off, Option falls back to a plain
     // paste (the modifier is ignored).
     let burn = delete_after && delete_after_paste();
+    // A previous hand-back is superseded HERE, before this paste arms its own suppression token:
+    // its cancellation releases whichever token existed at that moment (the old request's), while
+    // cancelling later would clear the token this paste is about to arm.
+    super::paste_handback::cancel();
     if burn {
         // Arm BEFORE the write-back (the synchronous-notification re-entry case; see the
         // arming function's comment).
         arm_paste_delete_suppression();
     }
-    hide_picker();
+    // A pinned panel stays on screen (decision R3), so it cannot rely on ordering out to hand the
+    // key window to the target: the bounded hand-back activates the captured target and posts the
+    // Cmd+V event directly to that process.
+    let pinned = is_pinned();
+    if !pinned {
+        hide_picker();
+    }
     unsafe {
         if let Some(img) = &entry.image {
             // A file-copy entry: if the source file still exists, restore file semantics
@@ -2732,16 +2807,7 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
             // On a failed write-back (e.g. cache miss) skip the synthesized Cmd+V, so the
             // OLD pasteboard content is not pasted.
             if ok {
-                let pasted = synthesize_paste();
-                if burn && pasted {
-                    delete_burned_entry(&entry);
-                    if clear_system_pasteboard_after_paste() {
-                        schedule_system_pasteboard_clear();
-                    }
-                } else if burn {
-                    log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
-                    disarm_paste_delete_suppression();
-                }
+                finish_paste(&entry, burn, pinned);
             } else {
                 // A failed write-back means nothing was written: disarm so the suppression
                 // cannot swallow the next genuine copy, and keep the entry (never lose the
@@ -2755,16 +2821,7 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
             // re-captured as a fresh copy that reorders the history).
             let ok = write_pasteboard_text(&entry.text, true);
             if ok {
-                let pasted = synthesize_paste();
-                if burn && pasted {
-                    delete_burned_entry(&entry);
-                    if clear_system_pasteboard_after_paste() {
-                        schedule_system_pasteboard_clear();
-                    }
-                } else if burn {
-                    log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
-                    disarm_paste_delete_suppression();
-                }
+                finish_paste(&entry, burn, pinned);
             } else if burn {
                 log_info!("[clip] paste-and-delete skipped: text write-back failed");
                 disarm_paste_delete_suppression();
@@ -2773,9 +2830,52 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
     }
 }
 
+/// The send half of a paste, after the write-back succeeded.
+///
+/// The two modes differ only in WHEN the keystroke is sent: a hidden panel sends immediately (the
+/// key window has already returned to the target), while a pinned panel arms the bounded hand-back,
+/// which targets the selected process after activation settles.
+unsafe fn finish_paste(entry: &ClipEntry, burn: bool, pinned: bool) {
+    if pinned {
+        // A missing change count means the hand-back cannot prove its own write is still the one on
+        // the pasteboard, so it must not arm at all - and the burn token must not be left behind for
+        // a send that is never going to happen.
+        match pasteboard_version().map(|v| super::paste_handback::begin(entry, v, burn)) {
+            Some(true) => {}
+            _ => {
+                show_toast(&t("clipboard.toast_paste_no_target"));
+                if burn {
+                    disarm_paste_delete_suppression();
+                }
+            }
+        }
+        return;
+    }
+    let pasted = synthesize_paste();
+    if burn && pasted {
+        delete_burned_entry(entry);
+        if clear_system_pasteboard_after_paste() {
+            schedule_system_pasteboard_clear();
+        }
+    } else if burn {
+        log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
+        disarm_paste_delete_suppression();
+    }
+}
+
+/// The pasteboard's change count, which the hand-back uses to prove its own write is still the one
+/// on the pasteboard when the send finally happens.
+unsafe fn pasteboard_version() -> Option<i64> {
+    let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pasteboard.is_null() {
+        return None;
+    }
+    Some(msg_send![pasteboard, changeCount])
+}
+
 /// The removal step of burn-after-paste: drop the entry from the history (the image cache
 /// file goes too) and persist; logs record only the kind and count, never the content.
-fn delete_burned_entry(target: &ClipEntry) {
+pub(super) fn delete_burned_entry(target: &ClipEntry) {
     let kind = {
         let mut hist = CLIP_HISTORY.lock().unwrap();
         let Some(h_idx) = hist
@@ -2823,7 +2923,7 @@ pub(super) fn paste_kind(img: &ImageEntry) -> PasteKind {
 /// synthesized key event would be routed to the panel's app (us) and never reach the input
 /// field; once ordered out, the panel resigns key, the system key window returns to the
 /// previous app, and the synthesized Cmd+V lands in the user's input field.
-unsafe fn synthesize_paste() -> bool {
+pub(super) unsafe fn synthesize_paste() -> bool {
     let down = CGEventCreateKeyboardEvent(std::ptr::null(), VK_V, true);
     let Some(down) = (!down.is_null()).then_some(down) else {
         return false;
@@ -2839,6 +2939,42 @@ unsafe fn synthesize_paste() -> bool {
     }
     CGEventSetFlags(up, K_CG_EVENT_FLAG_MASK_COMMAND);
     CGEventPost(K_CG_SESSION_EVENT_TAP, up);
+    CFRelease(down as *const c_void);
+    CFRelease(up as *const c_void);
+    true
+}
+
+/// Send Cmd+V into a specific app's event queue while the clipboard picker remains pinned.
+/// Posting at the session tap would route the shortcut to the picker when it owns key status.
+pub(super) unsafe fn synthesize_paste_to_pid(pid: i32) -> bool {
+    use crate::event_tap::{
+        CGEventSetIntegerValueField, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
+    };
+
+    if pid <= 0 {
+        return false;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventPostToPid(pid: i32, event: crate::event_tap::CGEventRef);
+    }
+
+    let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), VK_V, true);
+    let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), VK_V, false);
+    if down.is_null() || up.is_null() {
+        if !down.is_null() {
+            CFRelease(down as *const c_void);
+        }
+        if !up.is_null() {
+            CFRelease(up as *const c_void);
+        }
+        return false;
+    }
+    for event in [down, up] {
+        CGEventSetFlags(event, K_CG_EVENT_FLAG_MASK_COMMAND);
+        CGEventSetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
+        CGEventPostToPid(pid, event);
+    }
     CFRelease(down as *const c_void);
     CFRelease(up as *const c_void);
     true
@@ -3054,6 +3190,12 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 hide_detail();
             }
             53 => {
+                // Esc: a pinned panel ignores the key entirely (design decision R1). The check is
+                // HERE, above the existing actions, not inside hide_picker(): otherwise Esc would
+                // still close the detail or clear the query on the way to a hide it no longer does.
+                if is_pinned() {
+                    return;
+                }
                 // Esc: with the detail open, the first press closes the detail (the picker
                 // and the query stay untouched).
                 if detail_visible() {

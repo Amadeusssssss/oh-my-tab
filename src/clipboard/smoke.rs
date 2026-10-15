@@ -351,6 +351,269 @@ pub(crate) fn smoke_runner() -> bool {
         }
     }
 
+    /// The pin's STATE must be observable, not just its existence: the button is the panel's only
+    /// stateful corner control, so the smoke proves that pinning and unpinning really change what it
+    /// shows (glyph) and what it announces (accessibility label), and that a theme/locale refresh
+    /// repaints it from the live value rather than leaving a stale state.
+    unsafe fn assert_pin_button_reflects_state() {
+        let Some(button) = *super::PICKER_PIN_BUTTON.lock().unwrap() else {
+            panic!("the header must carry a pin button");
+        };
+        super::forget_pin();
+        notifications::refresh_pin_button();
+        let outline_label = crate::ffi::nsstring_to_rust(msg_send![button.0, accessibilityLabel]);
+        assert_eq!(
+            outline_label,
+            super::t("clipboard.pin_off"),
+            "an unpinned button must announce the unpinned state"
+        );
+        super::pin(400.0);
+        notifications::refresh_pin_button();
+        let filled_label = crate::ffi::nsstring_to_rust(msg_send![button.0, accessibilityLabel]);
+        assert_eq!(
+            filled_label,
+            super::t("clipboard.pin_on"),
+            "a pinned button must announce the pinned state, not only an action name"
+        );
+        assert_ne!(
+            outline_label, filled_label,
+            "the two states must be distinguishable to assistive clients"
+        );
+        // A locale/theme refresh must repaint the live state, not reset it.
+        crate::ui_coordinator::apply_theme_and_locale_refresh();
+        assert!(super::is_pinned(), "a refresh must not clear the pin");
+        let after_refresh = crate::ffi::nsstring_to_rust(msg_send![button.0, accessibilityLabel]);
+        assert_eq!(
+            after_refresh,
+            super::t("clipboard.pin_on"),
+            "a refresh must repaint the pinned state"
+        );
+        // Unpinning must be a pure state flip: the panel is meant to STAY on screen until the next
+        // outside click, so the properties that pinning changed must not be restored here (doing so
+        // can move a cross-Space panel or make it vanish). The regression this pins down is the
+        // "apply the properties in the unpin branch" defect.
+        let window = (*super::PICKER_WINDOW.lock().unwrap())
+            .expect("the picker window must exist")
+            .0;
+        // Apply the pinned properties, then drive the REAL button action to unpin: calling unpin()
+        // directly would bypass whatever the action itself does, which is exactly where the
+        // "restore in the unpin branch" defect lived. The still-visible panel must keep the pinned
+        // properties, because restoring them at unpin can move a cross-Space panel or make it vanish.
+        notifications::apply_pin_window_properties();
+        let pinned_hides: bool = msg_send![window, hidesOnDeactivate];
+        assert!(!pinned_hides, "a pinned panel must not hide on deactivate");
+        // Fire the action IMP directly: the action signature is -(void)togglePanelPin:(id)sender,
+        // and performSelector: would pass a Sel where an object belongs (that threw
+        // NSInvalidArgumentException). methodForSelector gives the IMP; calling it with the button as
+        // the sender is exactly what a click does.
+        // methodForSelector returns an unsafe function pointer ('^v'), not an object ('^?'); cast
+        // through the raw runtime instead of objc2's checked msg_send!.
+        extern "C" {
+            fn class_getInstanceMethod(cls: *mut c_void, sel: Sel) -> *mut c_void;
+            fn method_getImplementation(method: *mut c_void) -> *mut c_void;
+            fn object_getClass(obj: *mut c_void) -> *mut c_void;
+        }
+        // The action lives on the TARGET class (the clipboard observer), not on the button class, so
+        // look the IMP up there and call it with the button as the sender - exactly what a click
+        // through the target/action machinery does.
+        let target: *mut AnyObject = msg_send![button.0, target];
+        assert!(!target.is_null(), "the pin button must have a target");
+        let method = class_getInstanceMethod(
+            object_getClass(target as *mut c_void),
+            sel!(togglePanelPin:),
+        );
+        assert!(
+            !method.is_null(),
+            "the target class must implement togglePanelPin:"
+        );
+        let imp = method_getImplementation(method);
+        assert!(!imp.is_null(), "the method must have an implementation");
+        let call: unsafe extern "C" fn(*mut c_void, Sel, *mut c_void) = std::mem::transmute(imp);
+        call(
+            target as *mut c_void,
+            sel!(togglePanelPin:),
+            button.0 as *mut c_void,
+        );
+        assert!(!super::is_pinned(), "the button action must unpin");
+        let after_unpin: bool = msg_send![window, hidesOnDeactivate];
+        assert!(
+            !after_unpin,
+            "unpinning must not restore the window properties while the panel is still visible"
+        );
+
+        // The unpin -> FIRST detail open path: a detail created now must inherit what the picker is
+        // actually carrying (the pinned properties, retained by design), not recompute from the pin -
+        // recomputing was the second half of the same defect.
+        super::rebuild_rows();
+        show_detail_for_sel();
+        assert!(
+            super::detail_visible(),
+            "the detail must open for this check"
+        );
+        if let Some(detail) = (*super::DETAIL_WINDOW.lock().unwrap()).map(|w| w.0) {
+            let detail_hides: bool = msg_send![detail, hidesOnDeactivate];
+            assert_eq!(
+                detail_hides, after_unpin,
+                "a detail opened after unpin must inherit the picker's retained properties, not the defaults"
+            );
+        }
+        // Close the detail again; the smoke continues from a quiet panel.
+        hide_detail();
+
+        // Only the actual hide restores the properties.
+        notifications::apply_pin_window_properties_for_hidden_panel();
+        let hides: bool = msg_send![window, hidesOnDeactivate];
+        assert!(hides, "hiding the panel restores hidesOnDeactivate");
+        super::forget_pin();
+        notifications::refresh_pin_button();
+    }
+
+    /// A pinned paste must not be sent blindly: the hand-back arms, and cancellations (a newer paste,
+    /// the panel hiding) must clear it so a stale request can never paste later. Asserted on state,
+    /// because the actual keystroke delivery is A2 territory.
+    unsafe fn assert_paste_handback_state_is_bounded() {
+        assert!(
+            !super::handback_in_flight(),
+            "no paste hand-back may be armed outside a pinned paste"
+        );
+        // Cancelling an unarmed hand-back is a no-op and must not panic or leak.
+        super::paste_handback::cancel();
+        assert!(!super::handback_in_flight());
+        // The target PID is fixed when the request starts and the Cmd+V event is posted directly
+        // to that process. The pure target gate allows our own PID while the pinned panel is active,
+        // but rejects a different frontmost app; the unit tests cover both decisions. What is
+        // assertable here is that cancellation leaves no stale request armed.
+        assert!(
+            !super::handback_in_flight(),
+            "cancel must clear the request"
+        );
+
+        // A row click must not leave an edited search field as first responder while a
+        // process-targeted Cmd+V is being delivered.
+        let window = (*super::PICKER_WINDOW.lock().unwrap())
+            .expect("the picker window must exist")
+            .0;
+        let search = (*super::SEARCH_FIELD.lock().unwrap())
+            .expect("the search field must exist")
+            .0;
+        let _: bool = msg_send![window, makeFirstResponder: search];
+        assert!(
+            super::paste_handback::restore_picker_responder(),
+            "the pinned paste hand-back must restore the list responder after row selection"
+        );
+    }
+
+    /// Option+V must recover when AppKit has hidden the panel but the intent flag stayed true.
+    /// This constructs that exact stale state and invokes the same callback the event bridge uses.
+    unsafe fn assert_shortcut_reopens_appkit_hidden_panel() {
+        let originally_enabled = CONFIG.read().unwrap().clipboard.enabled;
+        CONFIG.write().unwrap().clipboard.enabled = true;
+        super::forget_pin();
+        show_picker();
+        assert_pinned_picker_glass_tracks_key_state();
+        let window = (*super::PICKER_WINDOW.lock().unwrap())
+            .expect("the picker window must exist")
+            .0;
+        let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
+        // Simulate an AppKit hide that did not reach our resign-key handler: the window is gone,
+        // while this flag still contains the last showing's intent.
+        super::PICKER_VISIBLE.store(true, Ordering::SeqCst);
+        assert!(
+            !super::picker_is_visible(),
+            "the setup must leave the actual panel hidden"
+        );
+        super::on_clipboard_toggle(
+            std::ptr::null_mut(),
+            sel!(onClipboardToggled:),
+            std::ptr::null_mut(),
+        );
+        assert!(
+            super::picker_is_visible(),
+            "Option+V must reopen a hidden panel even when the intent flag is stale"
+        );
+        let hides_on_deactivate: bool = msg_send![window, hidesOnDeactivate];
+        assert!(
+            !hides_on_deactivate,
+            "a visible unpinned panel must stay under the explicit dismiss handlers instead of AppKit hiding it silently"
+        );
+        hide_picker();
+        CONFIG.write().unwrap().clipboard.enabled = originally_enabled;
+    }
+
+    /// Liquid Glass's passive appearance is compensated only while a pinned picker has resigned
+    /// key; returning key restores the configured tint unchanged.
+    unsafe fn assert_pinned_picker_glass_tracks_key_state() {
+        let original_material = CONFIG.read().unwrap().appearance.panel_material.clone();
+        CONFIG.write().unwrap().appearance.panel_material = "liquid-glass".into();
+        crate::clipboard::apply_backdrop_material();
+        let glass_supported = objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some();
+        let effective_material = crate::glass::PanelMaterial::effective();
+        let skipped_reason = if !glass_supported {
+            Some("NSGlassEffectView is unavailable on this macOS version")
+        } else if crate::theme::reduce_transparency_enabled() {
+            Some("Reduce Transparency correctly selected the opaque fallback")
+        } else if crate::dev_flags::value("panel-material").is_some()
+            && effective_material != crate::glass::PanelMaterial::LiquidGlass
+        {
+            Some("the launch material override selected a non-glass surface")
+        } else {
+            None
+        };
+        if let Some(reason) = skipped_reason {
+            crate::log_info!("[smoke-clipboard] passive Liquid Glass check skipped: {reason}");
+            CONFIG.write().unwrap().appearance.panel_material = original_material;
+            crate::clipboard::apply_backdrop_material();
+            return;
+        }
+        assert_eq!(
+            effective_material,
+            crate::glass::PanelMaterial::LiquidGlass,
+            "Glass is available and enabled, so the smoke must exercise its installed compensation layer"
+        );
+        let layer = (*super::PICKER_BACKDROP.lock().unwrap())
+            .and_then(|backdrop| backdrop.compensation_layer)
+            .expect("Liquid Glass must install its passive compensation layer");
+        let window = (*super::PICKER_WINDOW.lock().unwrap())
+            .expect("the picker window must exist")
+            .0;
+        assert!(super::pin(500.0), "the smoke must exercise a pinned panel");
+        notifications::apply_pin_window_properties();
+
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let resigned: *mut AnyObject = make_nsstring("NSWindowDidResignKeyNotification");
+        let _: () = msg_send![center, postNotificationName: resigned, object: window];
+        CFRelease(resigned as *const c_void);
+        let visible_after_resign: bool = msg_send![window, isVisible];
+        assert!(
+            visible_after_resign,
+            "a pinned picker must remain visible after resigning key"
+        );
+        let inactive_color = crate::ffi::layer_background_color(layer.0);
+        assert!(!inactive_color.is_null());
+        assert_eq!(
+            crate::ffi::CGColorGetAlpha(inactive_color as *const c_void),
+            crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA as f64 / 255.0,
+            "a pinned picker that resigns key must apply the established passive-glass compensation"
+        );
+
+        let became_key: *mut AnyObject = make_nsstring("NSWindowDidBecomeKeyNotification");
+        let _: () = msg_send![center, postNotificationName: became_key, object: window];
+        CFRelease(became_key as *const c_void);
+        let visible_after_become_key: bool = msg_send![window, isVisible];
+        assert!(visible_after_become_key);
+        let active_color = crate::ffi::layer_background_color(layer.0);
+        assert!(!active_color.is_null());
+        assert_eq!(
+            crate::ffi::CGColorGetAlpha(active_color as *const c_void),
+            0.0,
+            "regaining key must remove passive-glass compensation"
+        );
+        super::forget_pin();
+        notifications::apply_pin_window_properties();
+        CONFIG.write().unwrap().appearance.panel_material = original_material;
+        crate::clipboard::apply_backdrop_material();
+    }
+
     /// The header's two new controls must exist in the LIVE view tree, not merely as geometry in a
     /// pure function: the handle the A2 drag scenario grabs, and a settings button wired to the
     /// action that opens the settings page. Both are found by class/action, so a rename that
@@ -359,7 +622,7 @@ pub(crate) fn smoke_runner() -> bool {
         let header = (*super::PICKER_HEADER_STRIP.lock().unwrap())
             .expect("the picker header strip must be built")
             .0;
-        let (search, gear, close) = super::picker_header_frames();
+        let (search, pin, gear, close) = super::picker_header_frames();
         let grip = super::picker_grip_frame();
 
         let subviews: *mut AnyObject = msg_send![header, subviews];
@@ -407,6 +670,37 @@ pub(crate) fn smoke_runner() -> bool {
         assert!(
             !found_settings.is_null(),
             "the header's settings button must exist and target openClipboardSettings:"
+        );
+        // The pin is the corner row's third glyph. It is found by ACTION, so a rename that left the
+        // header without a working pin fails here, and its frame is checked against the geometry
+        // that no-overlap proof is written against.
+        let found_pin = (0..count).any(|index| {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            // Only buttons answer action; the grip is a plain NSView, and asking it would be a
+            // "method not found" crash exactly like the loop above avoids.
+            let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+            if !is_button {
+                return false;
+            }
+            let action: Sel = msg_send![view, action];
+            if action != sel!(togglePanelPin:) {
+                return false;
+            }
+            let frame: NSRect = msg_send![view, frame];
+            assert_eq!(
+                frame, pin,
+                "the pin button must sit in the frame the geometry reserves for it"
+            );
+            let label: *mut AnyObject = msg_send![view, accessibilityLabel];
+            assert!(
+                !label.is_null(),
+                "the pin must state its state to assistive clients, not just show a glyph"
+            );
+            true
+        });
+        assert!(
+            found_pin,
+            "the header must carry a pin button targeting togglePanelPin:"
         );
         let gear_frame: NSRect = msg_send![found_settings, frame];
         assert_eq!(
@@ -571,6 +865,9 @@ pub(crate) fn smoke_runner() -> bool {
     // query by hand in the list-focus Esc branch used to leave a stale scope on the buttons.
     unsafe {
         assert_header_controls_are_live();
+        assert_pin_button_reflects_state();
+        assert_paste_handback_state_is_bounded();
+        assert_shortcut_reopens_appkit_hidden_panel();
         // The handle's dots must follow a theme switch: the picker window is reused across showings, so an
         // ink captured when the handle was built kept the previous mode's colour. This drives the real
         // refresh (the coordinator the settings switch runs) and reads the layer the dots are painted with.
@@ -602,6 +899,16 @@ pub(crate) fn smoke_runner() -> bool {
             );
             CONFIG.write().unwrap().appearance.theme = original_theme;
             crate::ui_coordinator::apply_theme_and_locale_refresh();
+            // A theme/locale/material refresh repaints the picker in place; it must NOT read as (or
+            // cause) a pin change. A pinned panel that silently lost its pin on a light/dark switch
+            // would change behaviour because of a visual setting (design review, round 2).
+            super::pin(500.0);
+            crate::ui_coordinator::apply_theme_and_locale_refresh();
+            assert!(
+                super::is_pinned() && super::frozen_height() == Some(500.0),
+                "a theme/locale refresh must preserve the pin and its frozen height"
+            );
+            super::forget_pin();
         }
         // The moved position lasts exactly one showing and never reaches the configuration file (the
         // A2 drag scenario asserts the across-a-relaunch half of the same promise).

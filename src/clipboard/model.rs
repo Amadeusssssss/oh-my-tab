@@ -186,10 +186,11 @@ pub(super) fn header_strip_h() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y + FILTERS_H
 }
 
-/// The search field, the settings button and the corner close button side by side in the header
-/// strip (flipped coordinates, measured from the strip's top-left). One source of truth so no two
-/// can ever overlap: the field gives up both buttons' size plus both gaps on the right.
-pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect) {
+/// The search field, the pin button, the settings button and the corner close button side by side
+/// in the header strip (flipped coordinates, measured from the strip's top-left). One source of
+/// truth so no two can ever overlap: the field gives up every button's size plus every gap on the
+/// right. Returns `(search, pin, gear, close)`, laid out left to right.
+pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect, NSRect) {
     let close = NSRect::new(
         NSPoint::new(
             PICKER_W - SEARCH_PAD_X - PICKER_CLOSE_BTN_SIZE,
@@ -204,14 +205,23 @@ pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect) {
         ),
         close.size,
     );
+    let pin = NSRect::new(
+        NSPoint::new(
+            gear.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_CLOSE_BTN_SIZE,
+            gear.origin.y,
+        ),
+        gear.size,
+    );
+    // Three buttons and three gaps are reserved on the right, so the pin can never be drawn over
+    // the query/⌘F keycap however long the widest locale's hint is.
     let search = NSRect::new(
         NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
         NSSize::new(
-            PICKER_W - SEARCH_PAD_X * 2.0 - (PICKER_CLOSE_BTN_SIZE + PICKER_CLOSE_BTN_GAP) * 2.0,
+            PICKER_W - SEARCH_PAD_X * 2.0 - (PICKER_CLOSE_BTN_SIZE + PICKER_CLOSE_BTN_GAP) * 3.0,
             SEARCH_H,
         ),
     );
-    (search, gear, close)
+    (search, pin, gear, close)
 }
 
 /// The drag handle's transparent hit band: the WHOLE top bar, i.e. the header strip's top padding across

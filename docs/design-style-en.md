@@ -765,11 +765,20 @@ nonactivating, its keyboard focus belongs to something else (the picker's search
 switcher's card container), and the button has no selected or open state to express — so there is no
 keyboard focus ring to draw. Every other control keeps all six states of this section.
 
-- *The clipboard picker's top-right pair* — the close × and Clipboard Settings. Here the reason is
-  also grouping: the two buttons share one 28pt corner and are each other's neighbours, so giving
-  one of them a border and fill would make it read as a different component family than the one
-  beside it. (The close button still turns destructive red on hover; that is its semantic colour,
-  not part of this exception.)
+- *The clipboard picker's top-right corner row* — the close ×, Clipboard Settings and the panel
+  **pin**. Here the reason is also grouping: the buttons share one 28pt corner and are each other's
+  neighbours, so giving one of them a border and fill would make it read as a different component
+  family than the ones beside it. (The close button still turns destructive red on hover; that is its
+  semantic colour, not part of this exception.)
+- *The pin is this exception's one stateful control.* The pin is a persistent switch — the panel is
+  either held open or not — so it keeps the family (no border, no focus ring, the shared faint hover
+  wash) but expresses its state through the glyph: outline while off, filled while on, with the
+  primary ink in both the on state and hover. Hover never overrides the on state: a pinned button
+  must not read as unpinned because the pointer is over it. Because a filled-versus-outline glyph is
+  a shape distinction a colour-blind user can still miss, the accessibility label states the state in
+  words ("keep this panel open" / "unpin this panel") rather than naming only the action. The state
+  is repainted from the live value on every locale/theme/material refresh, like the neighbouring
+  buttons' strings.
 - *The three settings gears* — the clipboard picker's, the switcher overlay's footer gear, and the
   keystroke display's trailing gear. Each one is the panel's only settings entry and none of them has
   a neighbouring glyph control to group with, so adjacency is **not** their justification: they are

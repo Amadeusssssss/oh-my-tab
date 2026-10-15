@@ -45,6 +45,9 @@ pub(crate) struct MenuUi {
     pub(crate) thumbnail: Option<ThumbnailState>,
     pub(crate) services: Option<ServiceMenuState>,
     pub(crate) fixed: Option<FixedMenuItems>,
+    /// The clipboard pin item, tracked separately from the fixed-title items because its CHECK
+    /// state changes at runtime (the pin), not only its title.
+    pub(crate) clipboard_pin: Option<*mut AnyObject>,
 }
 
 thread_local! {
@@ -53,6 +56,7 @@ thread_local! {
         thumbnail: None,
         services: None,
         fixed: None,
+        clipboard_pin: None,
     }) };
 }
 
@@ -371,6 +375,62 @@ pub(crate) fn refresh_service_menu() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The clipboard pin menu item
+// ---------------------------------------------------------------------------------------------
+
+/// The item's localized title key.
+const CLIPBOARD_PIN_TITLE_KEY: &str = "menu.pin_clipboard";
+/// The item's SF Symbol, matching the corner button's glyph family.
+const CLIPBOARD_PIN_SYMBOL: &str = "pin";
+
+/// Add the "show and pin clipboard history" item.
+///
+/// Deliberately its own item and its own state, not a sixth entry in the service array: those
+/// switches write persisted configuration, while the pin is in-process state that lasts until the
+/// app restarts (decision G). The action is idempotent, not a toggle - unpinned shows and pins,
+/// pinned-but-visible does nothing, pinned-but-hidden brings it back at the frozen height - so the
+/// menu can never leave the user without the way back the design relies on.
+pub(crate) unsafe fn build_clipboard_pin_item(
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
+) -> *mut AnyObject {
+    let item = make_menu_item(
+        target,
+        &t(CLIPBOARD_PIN_TITLE_KEY),
+        sel!(handlePinClipboard:),
+        0,
+        Some(CLIPBOARD_PIN_SYMBOL),
+    );
+    let _: () = msg_send![item, setState: 0isize];
+    let _: () = msg_send![menu, addItem: item];
+    item
+}
+
+/// Mirror the pin in the menu bar's item. Called from both surfaces that change the pin (the corner
+/// button and the menu action itself), so they cannot disagree.
+pub(crate) fn refresh_clipboard_pin_item() {
+    let item = with_menu_ui(|ui| ui.clipboard_pin);
+    let Some(item) = item else {
+        return;
+    };
+    unsafe {
+        set_menu_item_full_title(item, &t(CLIPBOARD_PIN_TITLE_KEY));
+        let _: () = msg_send![
+            item,
+            setState: if crate::clipboard::is_pinned() { 1isize } else { 0isize }
+        ];
+    }
+}
+
+/// The menu action: show and pin. Idempotent by design (see `build_clipboard_pin_item`).
+pub(crate) extern "C" fn handle_pin_clipboard(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        // The entry follows the module switch; it never turns recording on as a side effect.
+        return;
+    }
+    crate::clipboard::show_and_pin_for_menu();
+}
 pub(crate) extern "C" fn handle_toggle_service(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     if sender.is_null() {
         return;

@@ -176,7 +176,10 @@ extern "C" {
         attribute: *const c_void,
         value: *const c_void,
     ) -> AXError;
-    pub(crate) fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f64) -> AXError;
+    /// The SDK declares `timeoutInSeconds` as `float`, not `double` (AXUIElement.h:402). Passing
+    /// an `f64` put the value in a d-register the callee never read, so every timeout this app set
+    /// was effectively undefined. Declared as `f32` to match the ABI.
+    pub(crate) fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f32) -> AXError;
     // AXValue: wrapper type for geometry values (CGPoint/CGSize); used to read/write
     // AXPosition/AXSize for window control.
     pub(crate) fn AXValueCreate(value_type: i32, value_ptr: *const c_void) -> *const c_void;
