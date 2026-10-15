@@ -120,6 +120,7 @@ keystroke_display_tap_session = "会话（包含重新映射的按键）"
 keystroke_display_tap_hid = "硬件（实体按键）"
 row_keystroke_display_position = "显示屏幕"
 row_keystroke_display_initial_position = "初始显示位置"
+row_keystroke_display_max_extent = "最大宽度或高度"
 keystroke_display_initial_position_top = "屏幕上方横向"
 keystroke_display_initial_position_bottom = "屏幕下方横向"
 keystroke_display_initial_position_left = "屏幕左侧竖向"
@@ -500,6 +501,7 @@ keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" 只能是 al
 keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" 只能是 session 或 hid'
 keystroke_display_position_mode_invalid = 'keystroke_display.display_position: "{value}" 只能是 main 或 caret'
 keystroke_display_initial_position_invalid = 'keystroke_display.initial_position: "{value}" 只能是 top、bottom、left 或 right'
+keystroke_display_max_extent_percent_invalid = 'keystroke_display.max_extent_percent: {value} 必须是 10..=100 且为 10 的整数倍'
 keystroke_display_position_invalid = 'keystroke_display.position.{field}: "{value}" 必须是有限数值'
 key_binding_action_unknown = '未知动作 "{value}"'
 key_binding_trigger_invalid = '无效的快捷键 "{value}"'

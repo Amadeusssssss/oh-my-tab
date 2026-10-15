@@ -50,6 +50,16 @@ const GRIP_MARK_WIDTH: f64 = 3.0;
 const GRIP_MARK_HEIGHT: f64 = 3.0;
 const GRIP_MARK_GAP: f64 = 3.0;
 const DRAG_THRESHOLD: f64 = 4.0;
+/// How long a preview may go without a live pointer or a refresh before the watchdog ends it.
+/// Every tick refreshes this while the left button is still down, so a user who pauses mid-drag is
+/// never cut off; it only fires for a preview whose release was lost.
+const PREVIEW_WATCHDOG: Duration = Duration::from_millis(3000);
+
+/// The level the settings window uses for its own dropdown panels (NSFloatingWindowLevel, 3). It is
+/// also the level the panel itself ships at, which is why the main settings window -- a normal
+/// window -- never covers it. A preview compares against this to decide whether lifting is needed at
+/// all, rather than raising unconditionally and restoring a level it never measured.
+const SETTINGS_WINDOW_LEVEL: isize = 3;
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -70,6 +80,10 @@ struct PanelState {
     drag: Option<GripDrag>,
     last_badges: Vec<Badge>,
     last_palette: Option<crate::theme::UiPalette>,
+    /// The layout the badge views were last built for. A size change alone (the cap preview resizing
+    /// the panel from the settings slider) moves every keycap, so the badges alone are not enough to
+    /// decide a rebuild: identical content at a different size still has to be laid out again.
+    last_layout: Option<(NSSize, Orientation, usize)>,
     measurements: HashMap<String, f64>,
     /// Layout direction of the live panel, refreshed on every render. The grip and hit-testing
     /// paths run outside `render` and need it to place the handle on the correct edge.
@@ -85,6 +99,17 @@ struct PanelState {
     /// Whether a press on the settings button is in flight. Keeps the window receiving input until
     /// the press finishes or is cancelled, like `drag` does for the handle.
     settings_armed: bool,
+    /// While the settings cap slider is being dragged: the percentage to preview. The panel shows
+    /// virtual keycaps at this size and ignores the real event stream entirely -- nothing from the
+    /// preview reaches the state machine, the latches, or the saved position.
+    preview_percent: Option<u32>,
+    /// The window level to restore when the preview ends. Only ever written together with
+    /// `preview_percent`, so the two cannot disagree about whether a level was raised.
+    preview_saved_level: Option<isize>,
+    /// The wall-clock deadline a preview must not outlive. Set when the preview starts and
+    /// refreshed by every step: a live drag keeps extending it, while a policy watchdog ends a
+    /// preview whose release never arrived (see `max_extent_preview_expired`).
+    preview_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -186,18 +211,43 @@ pub(super) fn fade_pending() -> bool {
     PANEL.with(|panel| panel.borrow().fade_deadline.is_some())
 }
 
-/// The target screen's extent along the panel's stream axis: the width the cap is measured
-/// against when keys run in a row, the height when they stack in a column.
-/// The stream-axis budget the keycap state machine may fill: half the target screen's extent along
-/// the stream axis, minus what the panel's own controls reserve. The state machine trims to this
-/// BEFORE render runs, so both layers must use the identical number -- otherwise the state keeps a
-/// keycap the renderer must drop, or drops one the renderer had room for.
+/// The smallest stream-axis cap the panel may be given, in points. Below this the panel's own
+/// controls (the leading drag handle and the trailing settings button) plus one minimum-width
+/// keycap no longer fit: a 32pt keycap needs 32 + 24 of panel padding + STREAM_BUDGET_DEDUCTION
+/// (72) = 128pt of cap. A percentage that would ask for less is clamped here, so a very small
+/// screen cannot produce a panel whose keycap sits under a control.
+const MIN_PANEL_STREAM_EXTENT: f64 = 128.0;
+
+/// The panel's stream-axis cap in points: the configured percentage of the target screen's
+/// extent along that axis. Both the renderer and the keycap state machine call this, so the two
+/// cannot disagree -- the state keeps exactly what the renderer can lay out.
+///
+/// The measured extent is the screen's full frame, not its visible area, so the default 50% keeps
+/// the exact meaning it had before this was configurable. At 100% the window can be taller than
+/// the visible area; placement still clamps the origin back on screen.
+pub(super) fn max_extent_for_percent(screen_extent: f64, percent: u32) -> f64 {
+    let percent = percent.clamp(
+        crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MIN,
+        crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MAX,
+    ) as f64
+        / 100.0;
+    (screen_extent.max(1.0) * percent).max(MIN_PANEL_STREAM_EXTENT)
+}
+
+/// The stream-axis budget the keycap state machine may fill: the panel's cap, minus what the
+/// panel's own controls reserve. The state machine trims to this BEFORE render runs, so both
+/// layers must use the identical number -- otherwise the state keeps a keycap the renderer must
+/// drop, or drops one the renderer had room for.
 pub(super) fn stream_budget_for_panel(
     display_position: &str,
     position: Option<KeystrokeDisplayPosition>,
     orientation: Orientation,
+    max_extent_percent: u32,
 ) -> f64 {
-    (target_screen_extent(display_position, position, orientation) * 0.5 - STREAM_BUDGET_DEDUCTION)
+    (max_extent_for_percent(
+        target_screen_extent(display_position, position, orientation),
+        max_extent_percent,
+    ) - STREAM_BUDGET_DEDUCTION)
         .max(32.0)
 }
 
@@ -476,6 +526,34 @@ pub(super) struct PanelPlacement<'a> {
     pub(super) initial_position: &'a str,
     /// A remembered drag origin, which outranks the edge until the setting changes.
     pub(super) position: Option<KeystrokeDisplayPosition>,
+    /// The stream-axis cap as a percentage of the target screen (see max_extent_for_percent).
+    pub(super) max_extent_percent: u32,
+}
+
+/// The virtual keycap stream a size preview draws, in the order it rolls in. One keycap per
+/// character, cycling "Oh-My-Tab", so the stream always fills the panel and reads unmistakably as
+/// a preview rather than the user's real input.
+const PREVIEW_PHRASE: &str = "Oh-My-Tab";
+
+/// How many preview keycaps the virtual stream cycles through at most. This bounds the content
+/// while still over-filling the largest possible cap (a 5K screen at 100%, where even the widest
+/// cell is far under this many), so the stream always reaches the cap and the trim path is real.
+const PREVIEW_MAX_BADGES: usize = 200;
+
+/// Build the virtual stream shown while the cap slider is dragged. Lone keycaps, so both the row
+/// and the column paths size them exactly as real content.
+fn preview_badges() -> Vec<Badge> {
+    PREVIEW_PHRASE
+        .chars()
+        .cycle()
+        .take(PREVIEW_MAX_BADGES)
+        .map(|glyph| Badge {
+            text: glyph.to_string(),
+            kind: BadgeKind::Chord,
+            repeats: 1,
+            cells: Vec::new(),
+        })
+        .collect()
 }
 
 pub(super) fn render(
@@ -491,8 +569,17 @@ pub(super) fn render(
         display_position,
         initial_position,
         position,
+        max_extent_percent,
     } = placement;
     let orientation = Orientation::from_initial_position(initial_position);
+    // A preview outranks the real stream: while the cap slider is being dragged the panel shows
+    // virtual keycaps at the previewed size. The substitution happens here, before anything is
+    // measured, so the preview goes through exactly the sizing and trimming path real content
+    // does -- and the real badges never touch this call.
+    let preview = PANEL.with(|panel| panel.borrow().preview_percent);
+    let preview_content = preview.map(|_| preview_badges());
+    let badges: &[Badge] = preview_content.as_deref().unwrap_or(badges);
+    let visible = visible || preview.is_some();
     if visible {
         // The panel window persists across shows: sync the backdrop material first (here,
         // outside the PANEL borrow below). The check is a cheap enum compare unless the
@@ -577,12 +664,18 @@ pub(super) fn render(
                 ));
             }
             // The stream may only grow along its own axis, so the cap follows the panel's edge:
-            // half the screen's width for a row, half its height for a column.
-            let max_extent = if orientation.is_vertical() {
-                screen_frame.size.height * 0.5
-            } else {
-                screen_frame.size.width * 0.5
-            };
+            // the configured percentage of the screen's height for a column, of its width for a
+            // row. stream_budget_for_panel measures the same screen with the same percentage. A
+            // live preview overrides the configured value: the slider is showing what the panel
+            // would look like at the previewed size.
+            let max_extent = max_extent_for_percent(
+                if orientation.is_vertical() {
+                    screen_frame.size.height
+                } else {
+                    screen_frame.size.width
+                },
+                preview.unwrap_or(max_extent_percent),
+            );
             // The keycap stream shares the panel's stream axis with the two controls (the leading
             // drag handle and the trailing settings button), so their reserve comes off the budget
             // BEFORE the trim decisions below. Every layer that trims (the state machine, this
@@ -627,7 +720,12 @@ pub(super) fn render(
             // covers the panel's own measured trim, which can fire a little before the state's
             // estimate-based trim does.
             let pinned = capped || state.latched || first > 0;
-            state.latched = pinned;
+            // A preview must not mutate the real session's latches: the panel is showing virtual
+            // keycaps, so what it learned about them says nothing about the real stream when the
+            // user is handed back to it.
+            if preview.is_none() {
+                state.latched = pinned;
+            }
             // The panel's own length covers the keycap stream plus the controls' reserve: sizing it
             // from the stream alone would clip the trailing button once the stream reaches budget.
             let panel_length = if pinned {
@@ -647,7 +745,11 @@ pub(super) fn render(
             // A column's width only grows: a wider badge widens the panel once for its
             // lifetime, and it never shrinks while shown, so the shared edge and the panel
             // behind it never breathe as keys come and go.
-            let panel_cross = if orientation.is_vertical() {
+            // Same rule as the stream latch: a preview's cross-axis measurement is about virtual
+            // keycaps, so it neither grows nor clears the real column's width.
+            let panel_cross = if preview.is_some() {
+                panel_cross
+            } else if orientation.is_vertical() {
                 let latched = state.panel_cross_latched.max(panel_cross);
                 state.panel_cross_latched = latched;
                 latched
@@ -683,6 +785,7 @@ pub(super) fn render(
             unsafe {
                 if reopened {
                     state.last_badges.clear();
+                    state.last_layout = None;
                     set_alpha_immediately(panel, 1.0);
                     let _: () = msg_send![panel, orderFront: std::ptr::null::<AnyObject>()];
                 }
@@ -701,7 +804,15 @@ pub(super) fn render(
                     ];
                 }
                 let palette = crate::theme::ui_palette();
-                if state.last_badges != badges || state.last_palette != Some(palette) {
+                // The size and the visible slice are part of the layout key. A preview resizes the
+                // panel while the virtual badges stay identical, so comparing the badges alone left
+                // the old keycaps (their positions and their frames) in place while the window grew
+                // or shrank around them.
+                let layout = (size, orientation, first);
+                if state.last_badges != badges
+                    || state.last_palette != Some(palette)
+                    || state.last_layout != Some(layout)
+                {
                     rebuild_badges(
                         badge_container,
                         &display[first..],
@@ -712,6 +823,7 @@ pub(super) fn render(
                     );
                     state.last_badges = badges.to_vec();
                     state.last_palette = Some(palette);
+                    state.last_layout = Some(layout);
                 }
                 let _ = state.fade_deadline.take();
             }
@@ -728,6 +840,7 @@ pub(super) fn render(
             if state.visible {
                 state.visible = false;
                 state.last_badges.clear();
+                state.last_layout = None;
                 state.latched = false;
                 state.panel_cross_latched = 0.0;
                 let reduce_motion = crate::theme::reduce_motion_enabled();
@@ -784,9 +897,162 @@ pub(super) fn render(
     })
 }
 
+/// Show the panel with virtual keycaps at `percent`, for the settings cap slider drag. Idempotent:
+/// the first call shows the panel and raises its window level, later calls only move the size.
+/// The real event stream is not consulted, so previewing works even while the display is off, and
+/// nothing here writes configuration, the latches, or the saved position.
+pub(super) fn begin_max_extent_preview(percent: u32) {
+    crate::debug_assert_main_thread();
+    let percent = crate::config::keystroke_display_max_extent_percent_snap(percent);
+    let first = PANEL.with(|panel| {
+        let mut state = panel.borrow_mut();
+        let first = state.preview_percent.is_none();
+        state.preview_percent = Some(percent);
+        // Refreshed on every step of a live drag; a stall past this ends the preview instead of
+        // leaving the panel up at a raised level.
+        state.preview_deadline = Some(Instant::now() + PREVIEW_WATCHDOG);
+        first
+    });
+    if first {
+        // The preview must not disturb the real session: it is not "visible" in the state
+        // machine sense, so an active session keeps its badges and its own visibility.
+        start_timer();
+        raise_preview_window_level();
+    }
+    // Render immediately so the first frame already shows the previewed size; the timer keeps it
+    // settled while the drag continues.
+    render_preview_tick();
+}
+
+/// One preview frame. Shared by the first frame and by every timer tick while the preview runs, so
+/// the panel keeps re-laying out from the current percentage even if no action arrives for a while.
+/// The badges argument is ignored while previewing, so an empty slice is honest: render substitutes
+/// the virtual stream itself.
+pub(super) fn render_preview_tick() {
+    crate::debug_assert_main_thread();
+    if !max_extent_preview_active() {
+        return;
+    }
+    let config = crate::config::CONFIG.read().unwrap();
+    let placement = PanelPlacement {
+        display_position: &config.keystroke_display.display_position,
+        initial_position: &config.keystroke_display.initial_position,
+        position: config.keystroke_display.position,
+        max_extent_percent: config.keystroke_display.max_extent_percent,
+    };
+    let _ = render(
+        &[],
+        true,
+        false,
+        placement,
+        Instant::now(),
+        current_cursor_appkit_point(),
+    );
+}
+
+/// Stop the size preview, restoring the window level and letting the real stream decide what the
+/// panel shows next. Safe to call when no preview is running.
+pub(super) fn end_max_extent_preview() {
+    crate::debug_assert_main_thread();
+    let was_previewing = PANEL.with(|panel| {
+        let mut state = panel.borrow_mut();
+        let was = state.preview_percent.take().is_some();
+        state.preview_deadline = None;
+        if was {
+            state.last_badges.clear();
+            state.last_layout = None;
+        }
+        was
+    });
+    if !was_previewing {
+        return;
+    }
+    restore_preview_window_level();
+    // Hand the panel back to the real state machine on the next tick: it re-renders from the
+    // live badges, or fades the panel out when there are none.
+    super::wake();
+}
+
+/// Refresh a running preview's watchdog. Called once per tick while the pointer is still down, so
+/// a stationary drag is not mistaken for an abandoned one.
+pub(super) fn refresh_max_extent_preview_deadline() {
+    crate::debug_assert_main_thread();
+    PANEL.with(|panel| {
+        let mut state = panel.borrow_mut();
+        if state.preview_percent.is_some() {
+            state.preview_deadline = Some(Instant::now() + PREVIEW_WATCHDOG);
+        }
+    });
+}
+
+/// Whether a running preview has outlived its watchdog (its release never arrived).
+pub(super) fn max_extent_preview_expired() -> bool {
+    crate::debug_assert_main_thread();
+    PANEL.with(|panel| {
+        let state = panel.borrow();
+        match (state.preview_percent, state.preview_deadline) {
+            (Some(_), Some(deadline)) => Instant::now() >= deadline,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    })
+}
+
+/// Whether a size preview is running (assertable state for the smoke runner).
+pub(super) fn max_extent_preview_active() -> bool {
+    crate::debug_assert_main_thread();
+    PANEL.with(|panel| panel.borrow().preview_percent.is_some())
+}
+
+/// The percentage currently previewed, if any.
+pub(super) fn max_extent_preview_percent() -> Option<u32> {
+    crate::debug_assert_main_thread();
+    PANEL.with(|panel| panel.borrow().preview_percent)
+}
+
+/// Read the panel window's current level, if the window exists.
+fn panel_window_level() -> Option<isize> {
+    PANEL
+        .with(|panel| panel.borrow().panel)
+        .map(|panel| unsafe { msg_send![panel, level] })
+}
+
+/// Lift the panel above the settings window while a preview runs. The settings window is a
+/// normal window, so floating level already keeps the panel on top; only lift when the measured
+/// level says otherwise, and remember the old value so the restore is exact.
+fn raise_preview_window_level() {
+    let Some(current) = panel_window_level() else {
+        return;
+    };
+    if current > SETTINGS_WINDOW_LEVEL {
+        return;
+    }
+    let Some(panel) = PANEL.with(|panel| panel.borrow().panel) else {
+        return;
+    };
+    PANEL.with(|state| state.borrow_mut().preview_saved_level = Some(current));
+    unsafe {
+        let _: () = msg_send![panel, setLevel: SETTINGS_WINDOW_LEVEL + 1];
+    }
+}
+
+/// Put the panel window back at the level it had before the preview.
+fn restore_preview_window_level() {
+    let saved = PANEL.with(|state| state.borrow_mut().preview_saved_level.take());
+    let Some(level) = saved else {
+        return;
+    };
+    if let Some(panel) = PANEL.with(|state| state.borrow().panel) {
+        unsafe {
+            let _: () = msg_send![panel, setLevel: level];
+        }
+    }
+}
+
 pub(super) fn reset() {
     crate::debug_assert_main_thread();
     stop_timer();
+    let was_previewing = PANEL.with(|panel| panel.borrow_mut().preview_percent.take().is_some());
     PANEL.with(|panel| {
         let mut state = panel.borrow_mut();
         if let Some(panel) = state.panel {
@@ -802,6 +1068,7 @@ pub(super) fn reset() {
         state.drag = None;
         set_grip_mouse_state(&mut state, false, GripCursor::None);
         state.last_badges.clear();
+        state.last_layout = None;
         state.last_palette = None;
         state.measurements.clear();
         state.latched = false;
@@ -812,6 +1079,11 @@ pub(super) fn reset() {
         // reference that re-lays it out and retints it on the next show.
         state.settings_armed = false;
     });
+    // A reset while a preview is running (the feature was switched off, or the panel was torn
+    // down) must not leave the window at the lifted level or the preview marker set.
+    if was_previewing {
+        restore_preview_window_level();
+    }
 }
 
 pub(super) fn smoke_runner() -> bool {
@@ -870,6 +1142,7 @@ pub(super) fn smoke_runner() -> bool {
             display_position: "main",
             initial_position: &initial_position,
             position: saved_position,
+            max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
         },
         smoke_now,
         None,
@@ -888,6 +1161,7 @@ pub(super) fn smoke_runner() -> bool {
             display_position: "main",
             initial_position: &initial_position,
             position: saved_position,
+            max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
         },
         smoke_now,
         None,
@@ -900,6 +1174,7 @@ pub(super) fn smoke_runner() -> bool {
             display_position: "main",
             initial_position: &initial_position,
             position: saved_position,
+            max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
         },
         smoke_now,
         None,
@@ -917,6 +1192,7 @@ pub(super) fn smoke_runner() -> bool {
             display_position: "main",
             initial_position: &initial_position,
             position: saved_position,
+            max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
         },
         smoke_now,
         None,
@@ -945,6 +1221,7 @@ pub(super) fn smoke_runner() -> bool {
             display_position: "main",
             initial_position: &initial_position,
             position: saved_position,
+            max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
         },
         smoke_now,
         None,
@@ -1113,6 +1390,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "bottom",
                 initial_position: &initial_position,
                 position: None,
+                max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1222,6 +1500,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "main",
                 initial_position: "right",
                 position: saved_position,
+                max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1315,6 +1594,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "main",
                 initial_position: "bottom",
                 position: saved_position,
+                max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1327,6 +1607,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "main",
                 initial_position: "bottom",
                 position: saved_position,
+                max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1391,6 +1672,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "main",
                 initial_position: "right",
                 position: saved_position,
+                max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1403,6 +1685,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "main",
                 initial_position: "right",
                 position: saved_position,
+                max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1455,6 +1738,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "main",
                 initial_position: position,
                 position: saved_position,
+            max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1467,6 +1751,7 @@ pub(super) fn smoke_runner() -> bool {
                 display_position: "main",
                 initial_position: position,
                 position: saved_position,
+            max_extent_percent: crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT,
             },
             smoke_now,
             None,
@@ -1508,6 +1793,9 @@ pub(super) fn smoke_runner() -> bool {
     });
     update_config_position(saved_position);
     let config_restored = crate::config::flush_config_sync().is_ok();
+    // The cap preview: it must draw the panel at the previewed size, report that it is running,
+    // and leave no trace (no config write, no saved position) once it ends.
+    let preview_valid = smoke_max_extent_preview(saved_position);
     reset();
     if !(valid
         && smoke_process_isolated
@@ -1516,6 +1804,7 @@ pub(super) fn smoke_runner() -> bool {
         && settings_button_valid
         && grip_valid
         && config_restored
+        && preview_valid
         && (dev_material_forced || every_material_paints_its_surface)
         && (dev_material_forced || theme_refresh_retints_surface))
     {
@@ -1532,6 +1821,7 @@ pub(super) fn smoke_runner() -> bool {
         && settings_button_valid
         && grip_valid
         && config_restored
+        && preview_valid
         && (dev_material_forced || every_material_paints_its_surface)
         && (dev_material_forced || theme_refresh_retints_surface)
 }
@@ -1621,6 +1911,144 @@ fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -
     moved_and_saved && reset_to_default
 }
 
+/// The cap preview, asserted on the real AppKit tree: it draws the panel at the previewed size,
+/// reports itself as running, writes no configuration, and leaves nothing behind when it ends.
+/// `saved_position` is the position the run started with, restored by the caller.
+fn smoke_max_extent_preview(saved_position: Option<KeystrokeDisplayPosition>) -> bool {
+    let before_frames = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .keystroke_display
+        .clone();
+    begin_max_extent_preview(20);
+    let small = e2e_geometry();
+    let running = max_extent_preview_active();
+    let reported = max_extent_preview_percent();
+    // The virtual stream must be what the panel laid out, not the caller's badges: the preview
+    // path ignores the real stream entirely.
+    let virtual_content = preview_badges();
+    let virtual_ok = virtual_content.len() == PREVIEW_MAX_BADGES
+        && virtual_content.iter().all(|badge| badge.cells.is_empty());
+    begin_max_extent_preview(80);
+    let large = e2e_geometry();
+    end_max_extent_preview();
+    let stopped = !max_extent_preview_active();
+    let after_frames = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .keystroke_display
+        .clone();
+    let config_untouched = before_frames == after_frames && after_frames.position == saved_position;
+    // 80% must lay the panel out longer than 20% along the stream axis (the width of a row,
+    // the height of a column), and the panel must be on screen for both.
+    let orientation = Orientation::from_initial_position(&after_frames.initial_position);
+    let grew = match (small, large) {
+        (Some(small), Some(large)) if orientation.is_vertical() => large.panel_h > small.panel_h,
+        (Some(small), Some(large)) => large.panel_w > small.panel_w,
+        _ => false,
+    };
+    // The window growing is not enough: the keycap subviews have to be laid out again for the new
+    // size, or the panel resizes around keycaps still positioned for the old one. Measure the real
+    // subviews at both sizes, the way the rest of this runner measures the live view tree.
+    begin_max_extent_preview(20);
+    let small_caps = keycap_layout_snapshot();
+    begin_max_extent_preview(80);
+    let large_caps = keycap_layout_snapshot();
+    end_max_extent_preview();
+    // Both sizes must fill their panel with visible keycaps, and the larger cap must carry strictly
+    // more of them along the stream axis (the trim keeps only what fits, so the count is the layout).
+    let caps_relaid = match (small_caps, large_caps) {
+        (Some(small), Some(large)) => {
+            small.count > 0 && large.count > small.count && small.within_panel && large.within_panel
+        }
+        _ => false,
+    };
+    // A secure-input transition during a preview must still reach the REAL state machine: the
+    // events are drained while the preview owns the frame, and dropping these two would leave the
+    // machine paused (or holding a stale modifier) once the user is handed back to it.
+    let security_synced = smoke_preview_keeps_security_state();
+    if !(running
+        && reported == Some(20)
+        && virtual_ok
+        && stopped
+        && config_untouched
+        && grew
+        && caps_relaid)
+    {
+        crate::log_info!(
+            "[smoke-keystroke-display-panel] preview running={running} reported={reported:?} virtual={virtual_ok} stopped={stopped} config={config_untouched} grew={grew} caps={caps_relaid}"
+        );
+    }
+    running
+        && reported == Some(20)
+        && virtual_ok
+        && stopped
+        && config_untouched
+        && grew
+        && caps_relaid
+        && security_synced
+}
+
+/// A secure-input transition and a modifier release both arrive while a preview is draining events.
+/// Neither may be lost: the first decides whether the machine is paused when the real stream
+/// resumes, the second decides whether a modifier still reads as held.
+fn smoke_preview_keeps_security_state() -> bool {
+    use crate::keystroke_display::state::Input as StateInput;
+    // Start from a known state: not paused, no badges. The smoke runner has the display enabled.
+    super::STATE.with(|state| {
+        *state.borrow_mut() = super::StateMachine::default();
+    });
+    begin_max_extent_preview(50);
+    let previewing = max_extent_preview_active();
+    // Post through the same queue the tap uses, then drive the real tick body that drains it.
+    super::enqueue(StateInput::SecureActive(true));
+    crate::keystroke_display::process_tick_for_test();
+    let paused_while_previewing = super::STATE.with(|state| state.borrow().secure_paused());
+    let still_previewing = max_extent_preview_active();
+    super::enqueue(StateInput::SecureActive(false));
+    crate::keystroke_display::process_tick_for_test();
+    let resumed = !super::STATE.with(|state| state.borrow().secure_paused());
+    end_max_extent_preview();
+    super::STATE.with(|state| {
+        *state.borrow_mut() = super::StateMachine::default();
+    });
+    previewing && paused_while_previewing && still_previewing && resumed
+}
+
+/// What the preview's keycap subviews look like right now: how many there are, and whether every
+/// one of them sits inside the badge container it was laid out for.
+struct KeycapLayout {
+    count: usize,
+    within_panel: bool,
+}
+
+fn keycap_layout_snapshot() -> Option<KeycapLayout> {
+    PANEL.with(|panel| {
+        let state = panel.borrow();
+        let container = state.badge_container?;
+        unsafe {
+            let subviews: *mut AnyObject = msg_send![container, subviews];
+            let count: usize = msg_send![subviews, count];
+            let bounds: NSRect = msg_send![container, bounds];
+            let mut within_panel = true;
+            for index in 0..count {
+                let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+                let frame: NSRect = msg_send![view, frame];
+                if frame.origin.x < -0.5
+                    || frame.origin.y < -0.5
+                    || frame.origin.x + frame.size.width > bounds.size.width + 0.5
+                    || frame.origin.y + frame.size.height > bounds.size.height + 0.5
+                {
+                    within_panel = false;
+                }
+            }
+            Some(KeycapLayout {
+                count,
+                within_panel,
+            })
+        }
+    })
+}
 fn panel_frame_and_grip_center() -> Option<(NSRect, NSPoint)> {
     PANEL.with(|panel| {
         let state = panel.borrow();
@@ -3320,15 +3748,52 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_keycap_surface, centered_stream_cursor, default_edge_frame, neutral_keycap_surface,
-        opaque_over, resize_frame_preserving_center, resolve_panel_frame, target_screen_index,
-        uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry, BADGE_GAP, BADGE_H,
-        PANEL_SIDE_PADDING, SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE,
+        accent_keycap_surface, centered_stream_cursor, default_edge_frame, max_extent_for_percent,
+        neutral_keycap_surface, opaque_over, preview_badges, resize_frame_preserving_center,
+        resolve_panel_frame, target_screen_index, uses_accent_fill, Badge, BadgeCell, Orientation,
+        ScreenGeometry, BADGE_GAP, BADGE_H, MIN_PANEL_STREAM_EXTENT, PANEL_SIDE_PADDING,
+        PREVIEW_MAX_BADGES, PREVIEW_PHRASE, SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE,
+        STREAM_BUDGET_DEDUCTION,
     };
     use crate::config::KeystrokeDisplayPosition;
-    use crate::keystroke_display::state::{estimated_badge_width, BadgeKind, KEYCAP_RAIL_W};
+    use crate::keystroke_display::state::{
+        estimated_badge_width, estimated_stream_width, BadgeKind, KEYCAP_RAIL_W,
+    };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
+    #[test]
+    fn max_extent_for_percent_scales_the_screen_and_keeps_a_usable_floor() {
+        // The documented default is exactly the old hard-coded half.
+        assert_eq!(
+            max_extent_for_percent(1440.0, 50),
+            720.0,
+            "the default must equal the old screen/2 cap"
+        );
+        assert_eq!(max_extent_for_percent(1440.0, 10), 144.0);
+        assert_eq!(max_extent_for_percent(1440.0, 100), 1440.0);
+        // A very small screen clamps to the floor that keeps a keycap clear of the controls.
+        assert_eq!(max_extent_for_percent(200.0, 10), MIN_PANEL_STREAM_EXTENT);
+        assert!(max_extent_for_percent(200.0, 10) >= 32.0 + STREAM_BUDGET_DEDUCTION);
+        // Out-of-range input from a stale caller is clamped, never extrapolated.
+        assert_eq!(max_extent_for_percent(1440.0, 0), 144.0);
+        assert_eq!(max_extent_for_percent(1440.0, 500), 1440.0);
+    }
+
+    #[test]
+    fn preview_badges_cycle_the_phrase_and_stay_bounded() {
+        let badges = preview_badges();
+        assert_eq!(badges.len(), PREVIEW_MAX_BADGES);
+        let text: String = badges.iter().map(|badge| badge.text.clone()).collect();
+        assert_eq!(
+            text.chars().take(PREVIEW_PHRASE.len()).collect::<String>(),
+            PREVIEW_PHRASE
+        );
+        assert_eq!(badges[0].kind, BadgeKind::Chord);
+        // Every entry is a lone keycap: a cell list would draw a chord the preview does not have.
+        assert!(badges.iter().all(|badge| badge.cells.is_empty()));
+        // Even the widest possible cell cannot over-fill the cap in this many badges.
+        assert!(estimated_stream_width(badges.iter().map(Badge::estimated_width)) > 5000.0);
+    }
     #[test]
     fn single_key_streams_are_centered_with_equal_end_margins_in_both_orientations() {
         // A one-letter row uses a 32pt keycap in a 64pt panel; a column uses a 34pt

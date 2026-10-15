@@ -22,6 +22,19 @@ mod tap;
 
 pub(crate) use state::Input;
 
+/// Show the panel with virtual keycaps at `percent` while the settings cap slider is dragged.
+/// Idempotent, writes no configuration, and does not touch the real event stream.
+pub(crate) fn begin_max_extent_preview(percent: u32) {
+    crate::debug_assert_main_thread();
+    panel::begin_max_extent_preview(percent);
+}
+
+/// End the cap preview and hand the panel back to the real stream.
+pub(crate) fn end_max_extent_preview() {
+    crate::debug_assert_main_thread();
+    panel::end_max_extent_preview();
+}
+
 /// Repaint the panel surface from the current palette (see `panel::apply_glass_properties`).
 pub(crate) unsafe fn apply_glass_properties() {
     panel::apply_glass_properties();
@@ -190,6 +203,50 @@ pub(crate) fn wake() {
 
 fn process_tick() -> bool {
     crate::debug_assert_main_thread();
+    // The preview ends with the pointer gesture, but a lost release (a drag that ended while the
+    // app was busy, a synthetic gesture with no mouse-up) must not leave the panel up at a raised
+    // level forever. The watchdog is the backstop; the gesture path is the normal exit. Ending it
+    // here -- rather than tearing the session down -- lets the ordinary path below resume from the
+    // real state, which the preview deliberately never touched.
+    if panel::max_extent_preview_active() && panel::max_extent_preview_expired() {
+        panel::end_max_extent_preview();
+        crate::settings::end_max_extent_preview();
+    }
+    if panel::max_extent_preview_active() {
+        // A preview owns the frame, and it must not replay a key stream the user never saw: key
+        // presses are dropped rather than queued. Two inputs are still applied to the REAL state
+        // machine, because they describe the session rather than the display, and losing them
+        // would leave the machine wrong once the preview ends:
+        //   * a secure-input transition -- otherwise the machine stays paused (or stays unpaused)
+        //     after the preview, and the secure indicator disagrees with it;
+        //   * a modifier transition -- otherwise a modifier released during the drag keeps its
+        //     held keycap when the real stream comes back.
+        // SECURE_ACTIVE_HINT is deliberately NOT rewritten from these drained events: the enqueue
+        // path already maintains it, and a newer transition may have landed on another thread
+        // since this drain, which an older event must not overwrite.
+        let config = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .keystroke_display
+            .clone();
+        let mode = DisplayMode::from_config(&config.mode);
+        let now = Instant::now();
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            for input in drain_events() {
+                if matches!(input, Input::SecureActive(_) | Input::FlagsChanged { .. }) {
+                    state.apply(input, mode, now);
+                }
+            }
+        });
+        // A drag that is still held keeps its watchdog alive; the timer is what proves the gesture
+        // is live, since a paused drag produces no further actions.
+        if crate::settings::left_mouse_button_is_down() {
+            panel::refresh_max_extent_preview_deadline();
+        }
+        panel::render_preview_tick();
+        return true;
+    }
     if !is_active() {
         reset_on_main();
         return false;
@@ -259,8 +316,12 @@ fn process_tick() -> bool {
             let orientation = state::Orientation::from_initial_position(&config.initial_position);
             // The same budget the renderer uses: it already has the drag handle and the trailing
             // settings button reserved, so the state never keeps a keycap the panel cannot show.
-            let budget =
-                panel::stream_budget_for_panel(&display_position, config.position, orientation);
+            let budget = panel::stream_budget_for_panel(
+                &display_position,
+                config.position,
+                orientation,
+                config.max_extent_percent,
+            );
             changed |= state.trim_to_extent(budget, orientation);
             // Development only (--show-keystroke-display): hold the panel open so an A2 scenario can
             // click its settings gear. Without this the panel fades 1.8s after the seeded key, which
@@ -282,10 +343,6 @@ fn process_tick() -> bool {
     if became_secure {
         crate::log_info!("[keystroke-display] secure input active; display paused.");
     }
-    if !is_active() {
-        reset_on_main();
-        return false;
-    }
     let first_hover_sample = panel::render(
         &badges,
         visible,
@@ -294,6 +351,7 @@ fn process_tick() -> bool {
             display_position: &display_position,
             initial_position: &config.initial_position,
             position: config.position,
+            max_extent_percent: config.max_extent_percent,
         },
         now,
         cursor_point,
@@ -323,6 +381,15 @@ pub(super) fn timer_fired() {
     process_tick();
 }
 
+/// Run one tick body outside the run-loop timer. The panel smoke uses it to drive the real drain
+/// path (the same function the timer calls) instead of calling the preview helpers directly, so a
+/// regression in how preview input is handled fails the assertion. Compiled unconditionally like
+/// the other smoke entry points, which live in the library rather than a test-only module.
+#[allow(dead_code)] // only the smoke runners call it
+pub(crate) fn process_tick_for_test() -> bool {
+    process_tick()
+}
+
 fn reset_on_main() {
     crate::debug_assert_main_thread();
     panel::reset();
@@ -339,6 +406,11 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config) {
     let force_on = crate::dev_flags::present("keystroke-display-force-on");
     let was_enabled = old.keystroke_display.enabled || force_on;
     let is_enabled = new.keystroke_display.enabled || force_on;
+    // The service going away takes any running size preview with it, or the panel would be left
+    // showing virtual keycaps at a raised window level after its feature was switched off.
+    if was_enabled && !is_enabled {
+        panel::end_max_extent_preview();
+    }
     if was_enabled != is_enabled {
         if is_enabled {
             start();

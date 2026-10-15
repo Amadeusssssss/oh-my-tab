@@ -557,11 +557,92 @@ pub(super) unsafe fn build_keystroke_display_page(
     )
     .1;
     bind_control(target, ui.keystroke_display_initial_position);
+
+    // The panel's stream-axis cap. One value covers both orientations: it is the width of a
+    // horizontal stream and the height of a vertical one. Whole tens only, so the readout, the
+    // saved value and the config validation all speak the same steps. No marker is drawn at the
+    // default stop: a full-height rule there pokes out above and below the knob and reads as a
+    // stray line, and the stop is already legible while the user drags. The reset gesture itself is
+    // announced by the slider's tooltip.
+    let y = canvas.next_row(row_h);
+    SettingsRow::separator_above_row(keystroke_display_view, y, row_h, content_w);
+    ui.keystroke_display_max_extent = SettingsRow::tall_with_height(
+        keystroke_display_view,
+        label_x,
+        y,
+        label_w,
+        row_h,
+        &t("settings.row_keystroke_display_max_extent"),
+        SettingsControl::stepped_slider(
+            ctrl_x,
+            y + 10.0,
+            SettingsRow::slider_width(ctrl_w),
+            row_h,
+            max_extent_slider_min(),
+            max_extent_slider_max(),
+            crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_STEP as i64,
+            max_extent_slider_value(
+                crate::config::CONFIG
+                    .read()
+                    .unwrap()
+                    .keystroke_display
+                    .max_extent_percent,
+            ),
+            // Double-click restores the 50% default, which is the panel's pre-setting behaviour.
+            Some(crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT as f64),
+        ),
+    )
+    .1;
+    ui.keystroke_display_max_extent_value = SettingsRow::attach_slider_readout(
+        keystroke_display_view,
+        ui.keystroke_display_max_extent,
+        max_extent_readout(
+            crate::config::CONFIG
+                .read()
+                .unwrap()
+                .keystroke_display
+                .max_extent_percent,
+        ),
+    );
+    bind_control(target, ui.keystroke_display_max_extent);
     canvas.card(&t("settings.header_keystroke_display"));
 
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX] = canvas;
     content_bottom
+}
+
+/// The keystroke panel cap slider range, in whole percent. Shared with dispatch.rs so the
+/// range is stated once.
+pub(super) fn max_extent_slider_min() -> i64 {
+    crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MIN as i64
+}
+
+pub(super) fn max_extent_slider_max() -> i64 {
+    crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MAX as i64
+}
+
+/// Slider integer -> config value. Only the slider own steps can arrive, but a stale or
+/// hand-set value is snapped rather than trusted, so the persisted number is always valid.
+pub(super) fn max_extent_slider_value(percent: u32) -> i64 {
+    crate::config::keystroke_display_max_extent_percent_snap(percent) as i64
+}
+
+/// The row readout: the percentage, which is the unit the slider itself speaks.
+pub(super) fn max_extent_readout(percent: u32) -> String {
+    format!(
+        "{}%",
+        crate::config::keystroke_display_max_extent_percent_snap(percent)
+    )
+}
+
+/// Write the readout text of the panel-cap slider. Called from the change callback, so the number
+/// follows the drag; it formats through the same helper the row was built with.
+pub(super) unsafe fn set_max_extent_readout(label: *mut AnyObject, percent: u32) {
+    if label.is_null() {
+        return;
+    }
+    set_field(label, max_extent_readout(percent));
 }
 
 unsafe impl Send for SettingsPageBuildContext {}

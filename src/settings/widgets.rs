@@ -2166,6 +2166,61 @@ pub(super) unsafe fn make_slider(
     slider
 }
 
+/// The tick count AppKit needs so that a stepped slider lands only on whole `step`s from `min` to
+/// `max` inclusive. At least two, because one mark is not a range and AppKit treats a single-mark
+/// slider as unstepped.
+pub(super) fn stepped_slider_ticks(min: i64, max: i64, step: i64) -> i64 {
+    let step = step.max(1);
+    if max <= min {
+        return 2;
+    }
+    ((max - min) / step + 1).max(2)
+}
+
+/// Identifier carried by sliders built by `make_stepped_slider`. The settings style-tree smoke
+/// (`--smoke-settings-layout`) uses it to tell a deliberate stepped slider from a stray
+/// tick-marked one, because the design system draws ticks only on a stepped slider.
+pub(super) const STEPPED_SLIDER_IDENTIFIER: &str = "com.ohmytab.settings-stepped-slider";
+
+/// A slider the user may only move between whole `step`s of its range.
+///
+/// AppKit performs the snapping itself (numberOfTickMarks: plus allowsTickMarkValuesOnly:), so the
+/// knob can only rest on a step and the value the action commits is the value the control shows. A
+/// continuous slider corrected afterwards cannot promise that: the cell re-applies the pointer
+/// position during the tail of the event, so a write made from an action handler, a mouseUp:
+/// override or a zero-delay timer was measured to be undone (the stored value said 50 while the
+/// knob and the accessibility value stayed at 60.4).
+///
+/// Tick marks are drawn; they are also what makes the steps discoverable, which is the point.
+#[allow(clippy::too_many_arguments)] // geometry + range + value + default exceeds the 7-arg limit.
+pub(super) unsafe fn make_stepped_slider(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    min: i64,
+    max: i64,
+    step: i64,
+    value: i64,
+    default_value: Option<f64>,
+) -> *mut AnyObject {
+    let slider: *mut AnyObject = msg_send![settings_slider_class(), alloc];
+    let slider: *mut AnyObject =
+        msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
+    let _: () = msg_send![slider, setContinuous: true];
+    let _: () = msg_send![slider, setMinValue: min as f64];
+    let _: () = msg_send![slider, setMaxValue: max as f64];
+    let _: () =
+        msg_send![slider, setNumberOfTickMarks: stepped_slider_ticks(min, max, step) as isize];
+    let _: () = msg_send![slider, setAllowsTickMarkValuesOnly: true];
+    let _: () = msg_send![slider, setIntegerValue: value];
+    let identifier = make_nsstring(STEPPED_SLIDER_IDENTIFIER);
+    let _: () = msg_send![slider, setIdentifier: identifier];
+    CFRelease(identifier as *const c_void);
+    apply_slider_default(slider, default_value);
+    slider
+}
+
 /// A continuous-value slider (no tick snapping), for fractional ranges such as pointer
 /// acceleration / tracking speed.
 ///
@@ -3918,8 +3973,8 @@ mod tests {
     use super::{
         derived_label_width, html_switch_knob_radius, html_switch_track_radius,
         pixel_rows_to_parent_span, rect_inside, rects_overlap, sidebar_hover_fill,
-        sidebar_label_frame_y, slider_should_reset, switch_hit_bounds, SidebarLabelGeometry,
-        HTML_SWITCH_H, HTML_SWITCH_KNOB_D, HTML_SWITCH_W, SIDEBAR_HOVERED,
+        sidebar_label_frame_y, slider_should_reset, stepped_slider_ticks, switch_hit_bounds,
+        SidebarLabelGeometry, HTML_SWITCH_H, HTML_SWITCH_KNOB_D, HTML_SWITCH_W, SIDEBAR_HOVERED,
     };
     // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
     use crate::ffi::release_obj;
@@ -3927,6 +3982,21 @@ mod tests {
     use objc2::{class, msg_send, sel};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::ffi::c_void;
+
+    /// The cap slider snaps to whole tens, so AppKit must be told there are ten marks (10..=100 step
+    /// 10 is 10, 20, ... 100). A wrong count would either let the knob rest between steps or misplace
+    /// the ends.
+    #[test]
+    fn stepped_slider_tick_count_covers_the_range_inclusive() {
+        assert_eq!(stepped_slider_ticks(10, 100, 10), 10);
+        assert_eq!(stepped_slider_ticks(0, 10, 1), 11);
+        assert_eq!(stepped_slider_ticks(13, 20, 1), 8);
+        // Degenerate ranges still report at least two marks, or AppKit drops the stepping.
+        assert_eq!(stepped_slider_ticks(50, 50, 10), 2);
+        assert_eq!(stepped_slider_ticks(80, 10, 10), 2);
+        // A zero or negative step must not divide by zero.
+        assert_eq!(stepped_slider_ticks(0, 10, 0), 11);
+    }
 
     /// The sidebar label is centred by its *inked* glyphs, not by its line box. This is the pure half
     /// of that fix, asserted against the real metrics of the control (`--smoke-settings-layout`
@@ -4245,6 +4315,34 @@ mod tests {
 
             // The NSEvents come from a factory method (+0, autoreleased) and must not be released
             // manually; a test has no autorelease pool, and this one-off leak is irrelevant.
+            release_obj(slider);
+        }
+    }
+
+    /// Smoke (GUI/AppKit): a stepped slider's own value only ever rests on a whole step. That is
+    /// the property that makes the knob, the readout and the persisted field agree without any
+    /// post-hoc correction: all three read this one control's value.
+    #[test]
+    #[ignore]
+    fn stepped_slider_rests_on_whole_steps_smoke() {
+        unsafe {
+            let slider = super::make_stepped_slider(0.0, 0.0, 120.0, 20.0, 10, 100, 10, 50, None);
+            let allows: bool = msg_send![slider, allowsTickMarkValuesOnly];
+            assert!(allows, "the control must enforce its own steps");
+            for probe in [55.0f64, 61.0, 99.0, 10.0, 100.0] {
+                let _: () = msg_send![slider, setDoubleValue: probe];
+                let value: f64 = msg_send![slider, doubleValue];
+                assert!(
+                    (value - value.round()).abs() < 1e-9 && (value as i64) % 10 == 0,
+                    "a probe of {probe} left the control on {value}, not a whole step"
+                );
+                // The nearest step, not the value the probe asked for: that also rules out a
+                // control that silently ignored the write and stayed where it was.
+                assert!(
+                    (value - probe).abs() <= 5.0 + 1e-9,
+                    "a probe of {probe} snapped to {value}, further than half a step away"
+                );
+            }
             release_obj(slider);
         }
     }

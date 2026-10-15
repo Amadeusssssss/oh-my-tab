@@ -739,6 +739,23 @@ impl SettingsControl {
         widgets::make_slider(x, y, w, h, min, max, value, default_value)
     }
 
+    /// Build a slider that can only rest on whole `step`s of its range (AppKit snapping).
+    /// `default_value`: the value a double-click restores (None = double-click untouched).
+    #[allow(clippy::too_many_arguments)] // same parameter list as widgets::make_*.
+    pub(super) unsafe fn stepped_slider(
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        min: i64,
+        max: i64,
+        step: i64,
+        value: i64,
+        default_value: Option<f64>,
+    ) -> *mut AnyObject {
+        widgets::make_stepped_slider(x, y, w, h, min, max, step, value, default_value)
+    }
+
     /// Build a continuous (fractional) slider.
     /// `default_value`: the value a double-click restores (None = double-click untouched).
     #[allow(clippy::too_many_arguments)] // same parameter list as widgets::make_*.

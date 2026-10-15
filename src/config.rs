@@ -50,6 +50,12 @@ pub struct KeystrokeDisplaySection {
     /// remembered position is dropped so the new choice takes effect immediately.
     #[serde(default = "default_keystroke_display_initial_position")]
     pub initial_position: String,
+    /// The panel's largest extent along its stream axis, as a percentage of the target screen:
+    /// the width of a horizontal stream (bottom/top) or the height of a vertical one
+    /// (left/right). One value covers both, because a stream only grows along the axis its
+    /// placement defines. Kept to whole tens so the slider's readout matches what is saved.
+    #[serde(default = "default_keystroke_display_max_extent_percent")]
+    pub max_extent_percent: u32,
     pub position: Option<KeystrokeDisplayPosition>,
 }
 
@@ -60,6 +66,36 @@ fn default_keystroke_display_position() -> String {
 /// The documented default: the bottom edge of the screen.
 fn default_keystroke_display_initial_position() -> String {
     "bottom".into()
+}
+
+/// The panel cap's default, in percent of the target screen's stream-axis extent. 50% is what the
+/// panel hard-coded before the setting existed, so an upgrade keeps the previous feel.
+fn default_keystroke_display_max_extent_percent() -> u32 {
+    KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT
+}
+
+/// Whether a configured percentage is one of the accepted steps. The slider can only produce
+/// these values, so a differently-stepped value in the file is a hand edit: it is reported and
+/// falls back per field rather than being silently rounded.
+pub fn keystroke_display_max_extent_percent_is_valid(percent: u32) -> bool {
+    (KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MIN..=KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MAX)
+        .contains(&percent)
+        && percent.is_multiple_of(KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_STEP)
+}
+
+/// Snap an arbitrary percentage onto the accepted steps. Used where a value arrives from a control
+/// rather than from the file (the settings slider), so an out-of-step number is corrected instead
+/// of being written back invalid.
+pub fn keystroke_display_max_extent_percent_snap(percent: u32) -> u32 {
+    let clamped = percent.clamp(
+        KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MIN,
+        KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MAX,
+    );
+    let steps = (clamped as f64 / KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_STEP as f64).round() as u32;
+    (steps * KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_STEP).clamp(
+        KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MIN,
+        KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MAX,
+    )
 }
 
 fn deserialize_keystroke_display_position<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -101,6 +137,7 @@ impl Default for KeystrokeDisplaySection {
             tap_level: "session".into(),
             display_position: default_keystroke_display_position(),
             initial_position: default_keystroke_display_initial_position(),
+            max_extent_percent: default_keystroke_display_max_extent_percent(),
             position: None,
         }
     }
@@ -805,6 +842,15 @@ pub struct PointerSection {
 pub const MOUSE_ACCELERATION_MIN: f64 = 0.0;
 pub const MOUSE_ACCELERATION_MAX: f64 = 10.0;
 
+/// The keystroke panel's stream-axis cap, as a percentage of the target screen. The floor keeps
+/// the two controls (drag handle, settings button) and at least one keycap; the ceiling is "no
+/// extra limit", because the panel never overflows the screen anyway. Whole tens only: the
+/// settings slider's readout, the saved value and the validation all speak the same steps.
+pub const KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MIN: u32 = 10;
+pub const KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MAX: u32 = 100;
+pub const KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_STEP: u32 = 10;
+pub const KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT: u32 = 50;
+
 /// Device matcher (None = wildcard, i.e. "All Mice"). Config matches devices by VID+PID.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -1370,6 +1416,16 @@ impl Config {
                 &[("value", &self.keystroke_display.initial_position)],
             ));
         }
+        if !keystroke_display_max_extent_percent_is_valid(self.keystroke_display.max_extent_percent)
+        {
+            errs.push(tf(
+                "errors.keystroke_display_max_extent_percent_invalid",
+                &[(
+                    "value",
+                    &self.keystroke_display.max_extent_percent.to_string(),
+                )],
+            ));
+        }
         if let Some(position) = self.keystroke_display.position {
             for (axis, value) in [("x", position.x), ("y", position.y)] {
                 if !value.is_finite() {
@@ -1689,6 +1745,13 @@ impl Config {
             self.keystroke_display = other.keystroke_display;
         } else {
             self.keystroke_display.enabled = other.keystroke_display.enabled;
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("keystroke_display.max_extent_percent"))
+            {
+                self.keystroke_display.max_extent_percent =
+                    other.keystroke_display.max_extent_percent;
+            }
             if !errs
                 .iter()
                 .any(|e| e.starts_with("keystroke_display.display_position"))
@@ -3170,6 +3233,67 @@ mod tests {
         assert!(merged.keystroke_display.enabled);
     }
 
+    /// The panel cap is a whole-tens percentage. A value off the step or outside the range must be
+    /// reported and fall back per field, and the default must be the panel pre-setting behaviour.
+    #[test]
+    fn keystroke_display_max_extent_percent_validates_steps_and_falls_back_per_field() {
+        for valid in [10u32, 20, 50, 100] {
+            let mut config = Config::default();
+            config.keystroke_display.max_extent_percent = valid;
+            assert!(
+                config.validate().is_empty(),
+                "{valid}% must be an accepted cap"
+            );
+        }
+        // The pre-setting behaviour: half the screen.
+        assert_eq!(
+            Config::default().keystroke_display.max_extent_percent,
+            50,
+            "the default cap must be the old hard-coded 50%"
+        );
+
+        for invalid in [0u32, 5, 9, 15, 55, 101, 1000] {
+            let mut loaded = Config::default();
+            loaded.keystroke_display.enabled = true;
+            loaded.keystroke_display.mode = "shortcuts".into();
+            loaded.keystroke_display.max_extent_percent = invalid;
+            let errors = loaded.validate();
+            assert_eq!(errors.len(), 1, "{invalid}% must be refused once");
+            assert!(errors[0].starts_with("keystroke_display.max_extent_percent"));
+
+            let mut merged = Config::default();
+            merged.merge_valid(loaded, &errors);
+            // The bad step falls back, its neighbours survive.
+            assert_eq!(merged.keystroke_display.max_extent_percent, 50);
+            assert_eq!(merged.keystroke_display.mode, "shortcuts");
+            assert!(merged.keystroke_display.enabled);
+        }
+
+        // The slider can only produce accepted steps, but a stale or hand-set number is snapped
+        // rather than written back invalid.
+        assert_eq!(keystroke_display_max_extent_percent_snap(0), 10);
+        assert_eq!(keystroke_display_max_extent_percent_snap(54), 50);
+        assert_eq!(keystroke_display_max_extent_percent_snap(56), 60);
+        assert_eq!(keystroke_display_max_extent_percent_snap(999), 100);
+        for percent in [10u32, 30, 70, 100] {
+            assert!(keystroke_display_max_extent_percent_is_valid(
+                keystroke_display_max_extent_percent_snap(percent)
+            ));
+        }
+    }
+
+    #[test]
+    fn keystroke_display_max_extent_percent_roundtrips_through_toml() {
+        let mut config = Config::default();
+        config.keystroke_display.max_extent_percent = 80;
+        let text = toml::to_string(&config).unwrap();
+        assert!(text.contains("max_extent_percent = 80"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.keystroke_display.max_extent_percent, 80);
+        // An older file without the key keeps the documented default.
+        let legacy: Config = toml::from_str("[keystroke_display]\nenabled = true\n").unwrap();
+        assert_eq!(legacy.keystroke_display.max_extent_percent, 50);
+    }
     #[test]
     fn keystroke_display_position_migrates_legacy_boolean_and_validates_modes() {
         let follows_window: Config =

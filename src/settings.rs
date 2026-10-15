@@ -420,6 +420,8 @@ pub(super) struct SettingsUi {
     keystroke_display_tap_level: *mut AnyObject,
     keystroke_display_position: *mut AnyObject,
     keystroke_display_initial_position: *mut AnyObject,
+    keystroke_display_max_extent: *mut AnyObject, // NSSlider: stream cap, percent
+    keystroke_display_max_extent_value: *mut AnyObject, // the slider's read-only readout
     log_level: *mut AnyObject, // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // launch at login
     reverse_scroll: *mut AnyObject, // reverse scrolling
@@ -739,12 +741,13 @@ use window::*;
 // Entry points exposed to the rest of the crate (implemented in child modules; main.rs
 // consumes them through use settings::*).
 pub(crate) use dispatch::{
-    handle_clipboard_enabled_toggle, handle_device_changed, handle_enable_mouse_toggle,
-    handle_export_logs, handle_export_settings, handle_export_settings_ready,
-    handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
-    handle_windows_enabled_toggle, on_control_changed, on_control_text_did_change,
-    on_control_text_did_end_editing, on_sidebar_select, refresh_clipboard_unavailable_notice,
-    refresh_device_popup_if_open, refresh_service_controls_from_config,
+    end_max_extent_preview, handle_clipboard_enabled_toggle, handle_device_changed,
+    handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
+    handle_export_settings_ready, handle_import_settings, handle_import_settings_ready,
+    handle_key_bindings_toggle, handle_windows_enabled_toggle, left_mouse_button_is_down,
+    on_control_changed, on_control_text_did_change, on_control_text_did_end_editing,
+    on_sidebar_select, refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
+    refresh_service_controls_from_config,
     refresh_switcher_keystroke_and_mouse_controls_from_config,
 };
 pub(crate) use window::{
@@ -1651,6 +1654,14 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 ui.keystroke_display_initial_position,
                 selectItemAtIndex: initial_position_idx
             ];
+            let max_extent = crate::config::keystroke_display_max_extent_percent_snap(
+                cfg.keystroke_display.max_extent_percent,
+            );
+            let _: () = msg_send![
+                ui.keystroke_display_max_extent,
+                setIntegerValue: max_extent as isize
+            ];
+            page_builder::set_max_extent_readout(ui.keystroke_display_max_extent_value, max_extent);
             // locale: select the item matching CONFIG.i18n.locale; fall back to index 0 (auto).
             let loc_idx: isize = LOCALE_VALUES
                 .iter()
@@ -2003,6 +2014,11 @@ extern "C" fn settings_window_close(_self: *mut c_void, _cmd: Sel) {
 const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 1 << 20;
 const KEYCODE_Q: u16 = 12;
 const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
+/// NSEventTypeLeftMouseUp. The panel size preview ends here: a slider drag can also finish outside
+/// the window, so the mouse-up is observed at the window's event-dispatch point rather than on the
+/// control. Any button's up settles the drag, because the preview must never outlive one.
+const NSEVENT_TYPE_LEFT_MOUSE_UP: usize = 2;
+const NSEVENT_TYPE_RIGHT_MOUSE_UP: usize = 4;
 
 /// End inline text editing when the user clicks elsewhere in the settings window.
 ///
@@ -2022,6 +2038,14 @@ unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event:
     unsafe {
         if !event.is_null() {
             let event_type: usize = msg_send![event, type];
+            // A slider drag can also end outside the window (or on another control), so the
+            // preview is settled here, at the one place every mouse-up passes through, instead of
+            // on the slider itself -- and it settles before the event is dispatched, so the panel
+            // is back under the real stream by the time the next tick runs.
+            if event_type == NSEVENT_TYPE_LEFT_MOUSE_UP || event_type == NSEVENT_TYPE_RIGHT_MOUSE_UP
+            {
+                dispatch::end_max_extent_preview();
+            }
             if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
                 let window = _self as *mut AnyObject;
                 collapse_restore_confirmations_on_external_click(window, event);

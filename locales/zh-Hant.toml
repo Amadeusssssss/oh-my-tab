@@ -120,6 +120,7 @@ keystroke_display_tap_session = "工作階段（包含重新映射的按鍵）"
 keystroke_display_tap_hid = "硬體（實體按鍵）"
 row_keystroke_display_position = "顯示螢幕"
 row_keystroke_display_initial_position = "初始顯示位置"
+row_keystroke_display_max_extent = "最大寬度或高度"
 keystroke_display_initial_position_top = "螢幕上方橫向"
 keystroke_display_initial_position_bottom = "螢幕下方橫向"
 keystroke_display_initial_position_left = "螢幕左側縱向"
@@ -500,6 +501,7 @@ keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" 只能是 al
 keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" 只能是 session 或 hid'
 keystroke_display_position_mode_invalid = 'keystroke_display.display_position: "{value}" 只能是 main 或 caret'
 keystroke_display_initial_position_invalid = 'keystroke_display.initial_position: "{value}" 只能是 top、bottom、left 或 right'
+keystroke_display_max_extent_percent_invalid = 'keystroke_display.max_extent_percent: {value} 必須是 10..=100 且為 10 的整數倍'
 keystroke_display_position_invalid = 'keystroke_display.position.{field}: "{value}" 必須是有限數值'
 key_binding_action_unknown = '未知動作 "{value}"'
 key_binding_trigger_invalid = '無效的快速鍵 "{value}"'

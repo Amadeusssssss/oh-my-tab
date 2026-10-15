@@ -647,8 +647,11 @@ whole row is not clickable; only the switch is. The knob uses its spring settlin
 component-specific values override the general fast-duration and easing tokens. The knob follows
 the pointer only within its 2pt inset.
 
-**Slider.** Continuous — **no tick marks**. The filled portion is `accent`; the knob is white with a
-1px border. It is always paired with a right-aligned tabular readout of the current value, and that
+**Slider.** Continuous — **no tick marks** — except a *stepped* slider, one that may only rest on
+whole multiples of its step (the keystroke panel's 10% size stops): it draws AppKit's tick marks and
+sets `allowsTickMarkValuesOnly`, because tick-mark values are the only snapping AppKit offers and
+the marks make the stops discoverable. The filled portion is `accent`; the knob is white with a 1px
+border. It is always paired with a right-aligned tabular readout of the current value, and that
 readout is the same width on every row of a group.
 
 **Select.** 200pt wide, one line, ellipsis on overflow, chevron on the right. The dropdown panel is

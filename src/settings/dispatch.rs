@@ -39,6 +39,7 @@ pub(super) enum ControlField {
     KeystrokeDisplayTapLevel,
     KeystrokeDisplayPosition,
     KeystrokeDisplayInitialPosition,
+    KeystrokeDisplayMaxExtent,
     MouseEnabled,
     ReverseScroll,
     ScrollMode,
@@ -132,6 +133,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                 m(
                     u.keystroke_display_initial_position,
                     ControlField::KeystrokeDisplayInitialPosition,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.keystroke_display_max_extent,
+                    ControlField::KeystrokeDisplayMaxExtent,
                 )
             })
             .or_else(|| m(u.enable_mouse, ControlField::MouseEnabled))
@@ -297,6 +304,71 @@ pub(super) fn apply_recorded_clipboard_shortcut(shortcut: &str) {
     }
     schedule_config_persist();
     apply_config_change(&old, &updated, ConfigChangeSource::Settings);
+}
+
+/// The settings-side owner of the panel size preview.
+///
+/// A slider drag produces one action per mouse-dragged event, but only the first should show the
+/// panel and lift its window level, and the preview has to end exactly once -- on mouse-up, on a
+/// lost pointer, or when the window or the feature goes away. This keeps that small state machine
+/// in one place instead of threading flags through the control callback.
+#[derive(Default)]
+struct MaxExtentPreview {
+    active: bool,
+}
+
+thread_local! {
+    static MAX_EXTENT_PREVIEW: RefCell<MaxExtentPreview> = RefCell::new(MaxExtentPreview::default());
+}
+
+/// Show (or resize) the panel preview at `percent`. Called from the slider action, so it runs for
+/// every step of the drag.
+pub(super) fn preview_max_extent(percent: u32) {
+    if !crate::is_main_thread() {
+        return;
+    }
+    // Only a pointer gesture gets a preview. Keyboard and accessibility changes (arrow keys on the
+    // focused slider, AX increment) also post this action, but they have no release to end a
+    // preview with -- starting one there would leave the panel up with nothing to take it down.
+    if !left_mouse_button_is_down() {
+        return;
+    }
+    // begin() is idempotent: it only shows and raises on the first call of a drag. The flag here
+    // only records that an end is owed, so repeated steps do not repeatedly tear the preview down.
+    MAX_EXTENT_PREVIEW.with(|preview| preview.borrow_mut().active = true);
+    crate::keystroke_display::begin_max_extent_preview(percent);
+}
+
+/// Whether the left mouse button is physically down right now. `NSEvent` reports the hardware
+/// state, so it is true both inside AppKit drag tracking and outside a window event dispatch.
+pub(crate) fn left_mouse_button_is_down() -> bool {
+    const LEFT_MOUSE_BUTTON_MASK: usize = 1;
+    unsafe {
+        let pressed: usize = msg_send![class!(NSEvent), pressedMouseButtons];
+        pressed & LEFT_MOUSE_BUTTON_MASK != 0
+    }
+}
+
+/// End the preview if one is running, and put the control back in step with what was actually
+/// committed. Safe to call repeatedly and from every teardown path.
+///
+/// The resync is not cosmetic: NSSlider keeps reporting the position the pointer last tracked,
+/// while the action handler snaps the *committed* value to a whole ten. After a track click or a
+/// double-click reset those differ (the knob can read 57 while 50 was committed and is what the
+/// readout shows), and without this the knob stays where the pointer left it.
+pub(crate) fn end_max_extent_preview() {
+    if !crate::is_main_thread() {
+        return;
+    }
+    let was_active = MAX_EXTENT_PREVIEW.with(|preview| {
+        let mut preview = preview.borrow_mut();
+        let was = preview.active;
+        preview.active = false;
+        was
+    });
+    if was_active {
+        crate::keystroke_display::end_max_extent_preview();
+    }
 }
 
 /// Bind a control to the unified change callback (switches/popups/sliders).
@@ -584,6 +656,28 @@ fn apply_control_field(field: ControlField) {
                     // A remembered drag outranks the edge, so clear it: picking a position in
                     // Settings is a request to see the panel there now.
                     cfg.keystroke_display.position = None;
+                }
+                ControlField::KeystrokeDisplayMaxExtent => {
+                    let raw: isize = msg_send![u.keystroke_display_max_extent, integerValue];
+                    let percent =
+                        crate::config::keystroke_display_max_extent_percent_snap(raw.max(0) as u32);
+                    cfg.keystroke_display.max_extent_percent = percent;
+                    // Snap the control itself, so a stale click cannot leave the knob between the
+                    // steps the readout and the saved value speak.
+                    let _: () = msg_send![
+                        u.keystroke_display_max_extent,
+                        setIntegerValue: percent as isize
+                    ];
+                    crate::settings::page_builder::set_max_extent_readout(
+                        u.keystroke_display_max_extent_value,
+                        percent,
+                    );
+                    // The live preview the user asked for: the panel stays on screen and resizes
+                    // with the drag. It is a preview -- the config value above is the only thing
+                    // that persists, and the panel it draws uses virtual keycaps.
+                    if !crate::dev_flags::present("smoke-settings-collapsible-row") {
+                        preview_max_extent(percent);
+                    }
                 }
                 ControlField::MouseEnabled => {
                     let state: isize = msg_send![u.enable_mouse, state];
@@ -1431,6 +1525,16 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 u.keystroke_display_initial_position,
                 selectItemAtIndex: initial_position_idx
             ];
+            // The cap slider follows a reload or a defaults restore like every other control.
+            let max_extent = crate::config::keystroke_display_max_extent_percent_snap(
+                cfg.keystroke_display.max_extent_percent,
+            );
+            let _: () =
+                msg_send![u.keystroke_display_max_extent, setIntegerValue: max_extent as isize];
+            super::page_builder::set_max_extent_readout(
+                u.keystroke_display_max_extent_value,
+                max_extent,
+            );
 
             let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![u.thumbnails_enabled, selectItemAtIndex: thumbnail_idx];

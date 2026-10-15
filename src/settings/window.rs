@@ -883,6 +883,9 @@ pub(super) fn close_floating_editors() {
 }
 
 pub(super) fn hide_settings() {
+    // The panel size preview belongs to a live drag on this window: closing Settings must take it
+    // down (and restore the panel's window level) even if the drag never produced its mouse-up.
+    dispatch::end_max_extent_preview();
     // Defensive: wrap up any in-progress recording and every floating editor when the window closes.
     // The two panels are separate windows that outlive a `hide`, and each holds a dim layer added to
     // the settings content view -- which is what this function is about to stop owning.
@@ -1059,8 +1062,24 @@ unsafe fn settings_style_tree_is_valid(
     if is_slider {
         let ticks: isize = msg_send![view, numberOfTickMarks];
         if ticks != 0 {
-            log_info!("[smoke-settings-layout] slider has {ticks} tick marks");
-            return false;
+            // Tick marks are forbidden except on a stepped slider, and there only when AppKit is
+            // doing the snapping and the marks divide the range into whole equal steps: a
+            // tick-marked slider free to rest between the stops it draws is what the rule guards
+            // against.
+            let allows: bool = msg_send![view, allowsTickMarkValuesOnly];
+            let identifier: *mut AnyObject = msg_send![view, identifier];
+            let is_stepped = !identifier.is_null()
+                && crate::ffi::nsstring_to_rust(identifier) == widgets::STEPPED_SLIDER_IDENTIFIER;
+            let min: f64 = msg_send![view, minValue];
+            let max: f64 = msg_send![view, maxValue];
+            let step = (max - min) / (ticks as f64 - 1.0);
+            let whole_steps = step > 0.0 && (step - step.round()).abs() < 1e-9;
+            if !(is_stepped && allows && whole_steps) {
+                log_info!(
+                    "[smoke-settings-layout] slider has {ticks} tick marks (stepped={is_stepped}, snaps={allows}, step={step:.3})"
+                );
+                return false;
+            }
         }
     }
     let draws_text = if is_text_field {
@@ -2772,6 +2791,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             keystroke_display_tap_level: std::ptr::null_mut(),
             keystroke_display_position: std::ptr::null_mut(),
             keystroke_display_initial_position: std::ptr::null_mut(),
+            keystroke_display_max_extent: std::ptr::null_mut(),
+            keystroke_display_max_extent_value: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
