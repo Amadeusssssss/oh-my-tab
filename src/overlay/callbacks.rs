@@ -817,3 +817,16 @@ pub(super) unsafe fn update_thumbnail_scroller(
 pub(crate) extern "C" fn overlay_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn card_center_x_is_x_plus_half_the_width() {
+        let rects = [(0usize, 100.0, 40.0, 60.0), (1usize, 300.0, 40.0, 80.0)];
+        assert_eq!(card_center_x(&rects, 0), Some(130.0));
+        assert_eq!(card_center_x(&rects, 1), Some(340.0));
+        assert_eq!(card_center_x(&rects, 7), None);
+    }
+}

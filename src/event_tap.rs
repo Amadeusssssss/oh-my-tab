@@ -642,3 +642,43 @@ pub(crate) const K_CG_EVENT_SOURCE_UNIX_PROCESS_ID: i32 = 41;
 /// can recognize and skip our own synthetic events.
 #[allow(clippy::unusual_byte_groupings)]
 pub(crate) const SYNTHETIC_MARKER: i64 = 0x4F4D_5453_4352_4C;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    /// A restart clears the stop request only in `prepare_start`, after the previous tap thread was
+    /// joined; a late pseudo-event from the old thread must never be seen with the flag already
+    /// reset. This pins the ordering the runtime relies on.
+    #[test]
+    fn prepare_start_clears_a_previously_requested_stop() {
+        // A function-local static gives this test its own `'static` handle: `cancel_flag` needs the
+        // borrow, and a shared handle would let the two tests race their stop requests.
+        static CONTROL: OnceLock<TapThreadControl> = OnceLock::new();
+        let control = CONTROL.get_or_init(TapThreadControl::new);
+        control.prepare_start();
+        assert!(!control.is_stopping());
+        control.stop();
+        assert!(control.is_stopping());
+        control.prepare_start();
+        assert!(!control.is_stopping());
+    }
+
+    /// `cancel_flag` is the same atomic `is_stopping` reads: the tap callbacks and the watchdog
+    /// observe a stop without any further synchronization.
+    #[test]
+    fn the_cancel_flag_is_the_stop_flag() {
+        static CONTROL: OnceLock<TapThreadControl> = OnceLock::new();
+        let control = CONTROL.get_or_init(TapThreadControl::new);
+        control.prepare_start();
+        let flag = control.cancel_flag();
+        assert!(!flag.load(Ordering::SeqCst));
+        control.stop();
+        assert!(flag.load(Ordering::SeqCst));
+        assert!(control.is_stopping());
+        control.prepare_start();
+        assert!(!flag.load(Ordering::SeqCst));
+        assert!(!control.is_stopping());
+    }
+}

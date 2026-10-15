@@ -3286,3 +3286,127 @@ extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -
 extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clipboard::keyring::{self, KeyUnavailable};
+    use crate::clipboard::storage::{self, StorageState};
+    use std::sync::atomic::Ordering;
+
+    /// Restores process-global state on drop so a failing assertion cannot leak into the parallel
+    /// suite while the storage test lock is still held.
+    struct Restore<F: FnMut()>(F);
+
+    impl<F: FnMut()> Drop for Restore<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
+    fn text_entry(text: &str) -> ClipEntry {
+        ClipEntry {
+            text: text.to_string(),
+            image: None,
+            pinned: false,
+            source_app: String::new(),
+            source_key: String::new(),
+            copied_at: None,
+        }
+    }
+
+    #[test]
+    fn picker_inactive_compensation_alpha_follows_the_static() {
+        let _lock = storage::test_lock();
+        PICKER_GLASS_INACTIVE.store(false, Ordering::SeqCst);
+        assert_eq!(picker_inactive_compensation_alpha(), 0);
+        PICKER_GLASS_INACTIVE.store(true, Ordering::SeqCst);
+        assert_eq!(
+            picker_inactive_compensation_alpha(),
+            crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA
+        );
+        PICKER_GLASS_INACTIVE.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn selection_after_pin_follows_the_setting_and_the_filtered_list() {
+        let _lock = storage::test_lock();
+        let saved_config = CONFIG.read().unwrap().clone();
+        let saved_selection = picker_selection();
+        let saved_filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+        let _restore = Restore(move || {
+            *CONFIG.write().unwrap() = saved_config.clone();
+            set_picker_selection(saved_selection);
+            with_clipboard_ui(|ui| ui.filtered = saved_filtered.clone());
+        });
+
+        with_clipboard_ui(|ui| ui.filtered = vec![5, 7, 9]);
+
+        // (a) follow = true and the index is present: select its display position.
+        {
+            let mut cfg = CONFIG.read().unwrap().clone();
+            cfg.clipboard.pin_follow_selection = true;
+            *CONFIG.write().unwrap() = cfg;
+        }
+        set_picker_selection(0);
+        assert!(selection_after_pin(7));
+        assert_eq!(picker_selection(), 1);
+
+        // (b) follow = true but the index is absent: no move.
+        set_picker_selection(0);
+        assert!(!selection_after_pin(99));
+        assert_eq!(picker_selection(), 0);
+
+        // (c) follow = false: never move, even when present.
+        {
+            let mut cfg = CONFIG.read().unwrap().clone();
+            cfg.clipboard.pin_follow_selection = false;
+            *CONFIG.write().unwrap() = cfg;
+        }
+        set_picker_selection(0);
+        assert!(!selection_after_pin(7));
+        assert_eq!(picker_selection(), 0);
+    }
+
+    #[test]
+    fn empty_state_hint_prioritizes_storage_then_empty_then_no_match() {
+        let _lock = storage::test_lock();
+        let saved_state = storage::state();
+        let saved_history = CLIP_HISTORY.lock().unwrap().clone();
+        let saved_filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+        let _restore = Restore(move || {
+            match saved_state.clone() {
+                StorageState::Unavailable(reason) => storage::set_unavailable(reason),
+                StorageState::Blocked(reason) => storage::set_blocked(reason),
+                StorageState::Ready => storage::set_ready(keyring::test_key()),
+                // state() never reports this in a test process.
+                StorageState::Uninitialized => {}
+            }
+            *CLIP_HISTORY.lock().unwrap() = saved_history.clone();
+            with_clipboard_ui(|ui| ui.filtered = saved_filtered.clone());
+        });
+
+        // (a) A storage failure outranks every list state.
+        storage::set_unavailable(KeyUnavailable::Missing);
+        assert_eq!(
+            empty_state_hint(),
+            crate::clipboard::unavailable_copy().unwrap()
+        );
+
+        // From here the storage is healthy, so the list decides.
+        storage::set_ready(keyring::test_key());
+        CLIP_HISTORY.lock().unwrap().clear();
+        with_clipboard_ui(|ui| ui.filtered = Vec::new());
+        // (b) No history at all.
+        assert_eq!(empty_state_hint(), crate::i18n::t("clipboard.empty"));
+
+        // (c) History exists but the current query/filter matches nothing.
+        *CLIP_HISTORY.lock().unwrap() = vec![text_entry("copied")];
+        with_clipboard_ui(|ui| ui.filtered = Vec::new());
+        assert_eq!(empty_state_hint(), crate::i18n::t("clipboard.no_match"));
+
+        // (d) A matching row: no hint.
+        with_clipboard_ui(|ui| ui.filtered = vec![0]);
+        assert_eq!(empty_state_hint(), "");
+    }
+}

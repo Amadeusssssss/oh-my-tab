@@ -73,3 +73,24 @@ pub(crate) fn on_activation_resync() {
     crate::settings::resync_page_layout_for_scroller();
     HANDLING.store(false, Ordering::SeqCst);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes the tests that share the module-global RESERVED value.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn note_reserved_clamps_negative_and_round_trips_positive() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        note_reserved(0.0);
+        note_reserved(-12.5);
+        assert_eq!(reserved(), 0.0);
+        note_reserved(17.0);
+        assert_eq!(reserved(), 17.0);
+        // Restore the module default so no later test sees the probe value.
+        note_reserved(0.0);
+        assert_eq!(reserved(), 0.0);
+    }
+}

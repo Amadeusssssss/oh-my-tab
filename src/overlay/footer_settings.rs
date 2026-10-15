@@ -253,3 +253,66 @@ pub(crate) fn layout_and_repaint(panel_size: NSSize) {
         set_footer_settings_style(button.0, false);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Recompute the same corner-safe inset the frame uses, from the live config radius.
+    fn expected_inset(panel_size: NSSize) -> f64 {
+        let radius = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .appearance
+            .corner_radius;
+        crate::theme::footer_control_inset(
+            radius,
+            panel_size.width,
+            panel_size.height,
+            crate::theme::FOOTER_CONTROL_SIZE,
+            crate::theme::footer_band_h(),
+        )
+        .max(crate::theme::H_PADDING)
+    }
+
+    #[test]
+    fn footer_settings_frame_sits_in_the_footer_band_trailing_corner() {
+        let panel = NSSize::new(600.0, 400.0);
+        let rect = footer_settings_frame(panel);
+        let size = crate::theme::FOOTER_CONTROL_SIZE;
+        let band = crate::theme::footer_band_h();
+        let inset = expected_inset(panel);
+
+        assert_eq!(rect.size.width, size);
+        assert_eq!(rect.size.height, size);
+        assert_eq!(rect.origin.y, ((band - size) / 2.0).max(0.0));
+        assert_eq!(rect.origin.x, (panel.width - inset - size).max(0.0));
+
+        // A normal panel keeps the whole control inside, inset from the trailing edge.
+        assert!(rect.origin.x >= 0.0);
+        assert!(rect.origin.y >= 0.0);
+        assert!(rect.origin.x + rect.size.width <= panel.width);
+        assert!(rect.origin.y + rect.size.height <= panel.height);
+        assert_eq!(panel.width - (rect.origin.x + rect.size.width), inset);
+    }
+
+    #[test]
+    fn footer_settings_frame_clamps_x_for_a_tiny_panel() {
+        // Narrower than the inset plus the control, so the trailing layout would go negative.
+        let panel = NSSize::new(10.0, 400.0);
+        let rect = footer_settings_frame(panel);
+        assert_eq!(rect.origin.x, 0.0);
+        assert_eq!(rect.size.width, crate::theme::FOOTER_CONTROL_SIZE);
+    }
+
+    #[test]
+    fn arming_round_trips_and_ends_disarmed() {
+        // Process-global flag: end disarmed so no later test observes it armed.
+        disarm();
+        assert!(!is_armed());
+        arm();
+        assert!(is_armed());
+        disarm();
+        assert!(!is_armed());
+    }
+}

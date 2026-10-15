@@ -2102,3 +2102,91 @@ extern "C" fn detail_text_view_draw_rect(_self: *mut c_void, _cmd: Sel, rect: NS
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ext_for_image_uti_maps_known_families_case_insensitively() {
+        assert_eq!(ext_for_image_uti("public.jpeg"), "jpg");
+        assert_eq!(ext_for_image_uti("public.gif"), "gif");
+        assert_eq!(ext_for_image_uti("public.heic"), "heic");
+        assert_eq!(ext_for_image_uti("public.heif"), "heic");
+        assert_eq!(ext_for_image_uti("public.tiff"), "tif");
+        assert_eq!(ext_for_image_uti("org.webmproject.webp"), "webp");
+        assert_eq!(ext_for_image_uti("com.microsoft.bmp"), "bmp");
+        // The lookup lowercases before matching family substrings.
+        assert_eq!(ext_for_image_uti("PUBLIC.JPEG"), "jpg");
+        assert_eq!(ext_for_image_uti("Public.Heic"), "heic");
+        assert_eq!(ext_for_image_uti("PUBLIC.WEBP"), "webp");
+        // PNG and unrecognized UTIs share the fallback.
+        assert_eq!(ext_for_image_uti("public.png"), "png");
+        assert_eq!(ext_for_image_uti("com.example.foo"), "png");
+        assert_eq!(ext_for_image_uti(""), "png");
+    }
+
+    #[test]
+    fn detail_code_max_columns_reserves_safety_and_floors_at_24() {
+        // floor((640 - 12) / 8.66) = 72, minus the 4-column safety reserve = 68.
+        assert_eq!(detail_code_max_columns(DETAIL_CODE_MAX_W), 68);
+        // floor((400 - 12) / 8.66) = 44, minus 4 = 40.
+        assert_eq!(detail_code_max_columns(400.0), 40);
+        // A zero or negative budget never underflows below the floor.
+        assert_eq!(detail_code_max_columns(0.0), 24);
+        assert_eq!(detail_code_max_columns(-100.0), 24);
+        assert!(detail_code_max_columns(DETAIL_CODE_MAX_W) > detail_code_max_columns(400.0));
+    }
+
+    #[test]
+    fn detail_prepared_code_size_tracks_visual_lines_and_clamps() {
+        let cap = 2000.0;
+        let columns = detail_code_max_columns(DETAIL_CODE_MAX_W);
+
+        let one_line = prepare_code_for_soft_wrap("let x = 1;", columns);
+        let (w, h) = detail_prepared_code_size(&one_line, cap);
+        assert_eq!(w, DETAIL_CODE_MAX_W);
+        // One line sits below the panel minimum, so it clamps up to it.
+        assert_eq!(h, DETAIL_PANEL_MIN_H);
+
+        let two_lines = prepare_code_for_soft_wrap("let x = 1;\nlet y = 2;", columns);
+        let (_, h_two) = detail_prepared_code_size(&two_lines, cap);
+        assert_eq!(
+            h_two,
+            DETAIL_LINE_H * 2.0 + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H
+        );
+        assert!(h_two > h, "more hard lines must make the panel taller");
+
+        // The cap still clamps downward.
+        let (_, capped) = detail_prepared_code_size(&two_lines, DETAIL_PANEL_MIN_H);
+        assert_eq!(capped, DETAIL_PANEL_MIN_H);
+
+        // Soft wraps insert U+2028, which the sizing must count as visual lines.
+        let wrapped = prepare_code_for_soft_wrap(&"a".repeat(4000), columns);
+        assert!(
+            wrapped.text.contains('\u{2028}'),
+            "a long line must soft-wrap at the given budget"
+        );
+        let (_, h_wrapped) = detail_prepared_code_size(&wrapped, cap);
+        assert!(
+            h_wrapped > h_two,
+            "visual wraps must add panel height at the same cap"
+        );
+    }
+
+    #[test]
+    fn detail_unwrapped_code_size_counts_hard_lines_only() {
+        let cap = 2000.0;
+        let (w, h) = detail_unwrapped_code_size("a\nb", cap);
+        assert_eq!(w, DETAIL_CODE_MAX_W);
+        assert_eq!(
+            h,
+            DETAIL_LINE_H * 2.0 + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H
+        );
+        // A long single line stays one line; native horizontal scrolling handles width.
+        assert_eq!(
+            detail_unwrapped_code_size(&"x".repeat(4000), cap).1,
+            DETAIL_PANEL_MIN_H
+        );
+    }
+}

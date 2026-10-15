@@ -2298,3 +2298,46 @@ pub(super) unsafe fn finalize_settings_pages(
         .validate(settings_page_name(index));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_extent_slider_range_matches_the_config_constants() {
+        assert_eq!(
+            max_extent_slider_min(),
+            crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MIN as i64
+        );
+        assert_eq!(
+            max_extent_slider_max(),
+            crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_MAX as i64
+        );
+        assert!(max_extent_slider_min() < max_extent_slider_max());
+    }
+
+    #[test]
+    fn max_extent_slider_value_snaps_to_accepted_steps() {
+        // The config's own tests are the canonical expectations for these edges.
+        assert_eq!(max_extent_slider_value(0), 10);
+        assert_eq!(max_extent_slider_value(999), 100);
+        assert_eq!(max_extent_slider_value(54), 50);
+        assert_eq!(max_extent_slider_value(56), 60);
+        // An exact step boundary is preserved rather than moved.
+        for percent in [10u32, 50, 70, 100] {
+            assert_eq!(max_extent_slider_value(percent), percent as i64);
+        }
+    }
+
+    #[test]
+    fn max_extent_readout_is_the_snapped_percent() {
+        assert_eq!(max_extent_readout(50), "50%");
+        assert_eq!(max_extent_readout(0), "10%");
+        assert_eq!(max_extent_readout(999), "100%");
+        assert_eq!(max_extent_readout(54), "50%");
+        // The readout is user-facing text, never a raw translation/config key.
+        let readout = max_extent_readout(54);
+        assert!(!readout.contains("settings."));
+        assert!(!readout.contains("keystroke_display"));
+    }
+}

@@ -215,6 +215,29 @@ fn restore_all_defaults() {
 /// page the user is on when a page moves, or Clipboard's restore resets the Switcher.
 fn restore_page_defaults(page: SettingsPageId) {
     let old = CONFIG.read().unwrap().clone();
+    let cfg = restored_config_for_page(&old, page);
+    if let Ok(mut w) = CONFIG.write() {
+        *w = cfg.clone();
+    }
+    log_config_changes(&old, &CONFIG.read().unwrap());
+    persist_config_now();
+    log_debug!("[settings] page {page:?} restored to defaults");
+    if page == SettingsPageId::General {
+        // The General page involves theme/locale defaults: apply effects, then rebuild the
+        // settings window in place.
+        apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
+    } else {
+        // Other tabs: refill the controls (freeze states / conditional visibility refresh
+        // with load_settings_from) and apply the tab's side effects.
+        load_settings_values();
+        apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
+    }
+}
+
+/// The config a single page's "Restore Defaults" writes: `old` with only the fields that page
+/// owns replaced by their defaults. Kept pure so the page boundary (which settings a page may
+/// touch) is asserted without a settings window; `restore_page_defaults` applies the result.
+fn restored_config_for_page(old: &Config, page: SettingsPageId) -> Config {
     let mut cfg = old.clone();
     let d = Config::default();
     // Per-page config scope: partitioned by page ownership, strictly limited to this page.
@@ -267,20 +290,101 @@ fn restore_page_defaults(page: SettingsPageId) {
             cfg.updates = d.updates;
         }
     }
-    if let Ok(mut w) = CONFIG.write() {
-        *w = cfg.clone();
+    cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config where every page-owning group differs from its default, so a page restore that
+    /// touches a field it does not own becomes visible.
+    fn sentinel_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.appearance.theme = "light".into();
+        cfg.appearance.corner_radius = 7.0;
+        cfg.i18n.locale = "en".into();
+        cfg.logging.file_path = "/tmp/omt-sentinel.log".into();
+        cfg.windows.show_minimized = true;
+        cfg.layout.thumbnail_size = "120".into();
+        cfg.fonts.title_size = 16.0;
+        cfg.keyboard.modifier = "option".into();
+        cfg.clipboard.enabled = true;
+        cfg.clipboard.max_entries = 7;
+        cfg.mouse.enabled = true;
+        cfg.mouse.profiles[0].line_count = Some(9);
+        cfg.key_bindings.enabled = true;
+        cfg.keystroke_display.max_extent_percent = 80;
+        cfg.updates.automatically_check = false;
+        cfg
     }
-    log_config_changes(&old, &CONFIG.read().unwrap());
-    persist_config_now();
-    log_debug!("[settings] page {page:?} restored to defaults");
-    if page == SettingsPageId::General {
-        // The General page involves theme/locale defaults: apply effects, then rebuild the
-        // settings window in place.
-        apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
-    } else {
-        // Other tabs: refill the controls (freeze states / conditional visibility refresh
-        // with load_settings_from) and apply the tab's side effects.
-        load_settings_values();
-        apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
+
+    /// The whole `Config` a page restore must produce, written from the page-ownership promise
+    /// rather than copied from the production match: `old` with only the fields the page owns
+    /// replaced by their defaults. Comparing the whole value catches a restore that resets an
+    /// extra field or forgets an owned one, which per-group spot checks miss.
+    fn expected_after_restore(old: &Config, page: SettingsPageId) -> Config {
+        let mut expected = old.clone();
+        let d = Config::default();
+        match page {
+            SettingsPageId::General => {
+                expected.appearance = d.appearance;
+                expected.i18n = d.i18n;
+                expected.logging = d.logging;
+            }
+            SettingsPageId::Switcher => {
+                expected.windows = d.windows;
+                expected.layout = d.layout;
+                expected.fonts = d.fonts;
+                expected.keyboard = d.keyboard;
+                expected.appearance.corner_radius = d.appearance.corner_radius;
+            }
+            SettingsPageId::Mouse => {
+                expected.mouse.enabled = d.mouse.enabled;
+                // Tests never calibrate SELECTED_DEVICE, so the selected device is "All Mice"
+                // and its profile is index 0.
+                let dp = d
+                    .mouse
+                    .profiles
+                    .first()
+                    .cloned()
+                    .expect("a default profile");
+                let prof = &mut expected.mouse.profiles[0];
+                prof.reverse_scroll = dp.reverse_scroll;
+                prof.scroll_mode = dp.scroll_mode;
+                prof.line_count = dp.line_count;
+                prof.pointer = dp.pointer;
+                prof.smooth_scrolling = dp.smooth_scrolling;
+                prof.button_mappings = Default::default();
+                prof.button_mappings_enabled = dp.button_mappings_enabled;
+            }
+            SettingsPageId::Clipboard => expected.clipboard = d.clipboard,
+            SettingsPageId::KeyBindings => expected.key_bindings = d.key_bindings,
+            SettingsPageId::KeystrokeDisplay => expected.keystroke_display = d.keystroke_display,
+            SettingsPageId::About => expected.updates = d.updates,
+        }
+        expected
+    }
+
+    #[test]
+    fn every_page_restore_changes_exactly_its_own_scope() {
+        let pages = [
+            SettingsPageId::General,
+            SettingsPageId::Switcher,
+            SettingsPageId::Mouse,
+            SettingsPageId::Clipboard,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::About,
+        ];
+        for page in pages {
+            let old = sentinel_config();
+            let out = restored_config_for_page(&old, page);
+            assert_eq!(
+                out,
+                expected_after_restore(&old, page),
+                "restoring {page:?} must change exactly that page's fields"
+            );
+        }
     }
 }

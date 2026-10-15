@@ -527,7 +527,12 @@ pub(super) unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: 
 /// The panel's faint hover wash over the material: one value for the text actions and the
 /// borderless glyph buttons alike, so a control hovers like its neighbours in the same strip.
 fn panel_hover_wash() -> u32 {
-    let palette = clipboard_palette();
+    panel_hover_wash_for(clipboard_palette())
+}
+
+/// The wash for one palette. Pure so both modes can be asserted without flipping the global theme,
+/// which other tests read; `theme::ui_palette_for_mode` supplies the two palettes directly.
+fn panel_hover_wash_for(palette: crate::theme::UiPalette) -> u32 {
     (palette.hover_bg & 0xFFFF_FF00) | if palette.dark { 0x28 } else { 0x18 }
 }
 
@@ -1947,4 +1952,50 @@ pub(super) unsafe fn row_target() -> *mut AnyObject {
             CallbackTarget::new(obj)
         })
         .0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_two_history_clear_selectors_are_destructive() {
+        assert!(is_clear_history_destructive_action(
+            sel!(clearClipboardHistory:)
+        ));
+        assert!(is_clear_history_destructive_action(
+            sel!(clearClipboardAll:)
+        ));
+        assert!(!is_clear_history_destructive_action(sel!(deleteEntry:)));
+        // The storage clear-and-restart is a separate action; the panel's destructive hover set
+        // deliberately excludes it.
+        assert!(!is_clear_history_destructive_action(
+            sel!(clearClipboardStorage:)
+        ));
+    }
+
+    #[test]
+    fn the_panel_hover_wash_keeps_the_palette_rgb_and_picks_alpha_by_theme() {
+        // Both palettes are supplied directly, so neither branch depends on (or flips) the global
+        // theme that other tests read.
+        for dark in [false, true] {
+            let palette = crate::theme::ui_palette_for_mode(dark);
+            let wash = panel_hover_wash_for(palette);
+            assert_eq!(wash & 0xFFFF_FF00, palette.hover_bg & 0xFFFF_FF00);
+            assert_eq!(wash & 0xFF, if dark { 0x28 } else { 0x18 });
+        }
+    }
+
+    #[test]
+    fn the_clear_all_button_follows_the_separate_clear_all_setting() {
+        // CONFIG is process-global; the shared clipboard test lock keeps this in step with the
+        // other tests that save and restore it.
+        let _guard = crate::clipboard::storage::test_lock();
+        let saved = CONFIG.read().unwrap().clone();
+        CONFIG.write().unwrap().clipboard.separate_clear_all = false;
+        assert!(!clear_all_button_visible());
+        CONFIG.write().unwrap().clipboard.separate_clear_all = true;
+        assert!(clear_all_button_visible());
+        *CONFIG.write().unwrap() = saved;
+    }
 }

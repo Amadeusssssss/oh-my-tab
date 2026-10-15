@@ -2055,3 +2055,221 @@ pub(super) unsafe fn timer_target() -> *mut AnyObject {
     let obj: *mut AnyObject = msg_send![cls.0 as *const AnyObject, new];
     obj
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// APPLIED_NOTICE is process-global, so every test that writes it serializes on this lock.
+    static APPLIED_NOTICE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_and_reset_applied_notice() -> std::sync::MutexGuard<'static, ()> {
+        let guard = APPLIED_NOTICE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *APPLIED_NOTICE.lock().unwrap() = AppliedNotice::new();
+        guard
+    }
+
+    #[test]
+    fn unavailable_states_offer_the_keychain_grant() {
+        for reason in [
+            KeyUnavailable::Simulated,
+            KeyUnavailable::Missing,
+            KeyUnavailable::AccessDenied,
+            KeyUnavailable::Other,
+        ] {
+            assert_eq!(
+                storage_action_key(&StorageState::Unavailable(reason)),
+                StorageAction::GrantKeychain
+            );
+        }
+    }
+
+    #[test]
+    fn clearable_blocked_states_offer_clear_and_restart() {
+        for reason in [
+            BlockedReason::Damaged,
+            BlockedReason::ForeignKey,
+            BlockedReason::UnsupportedVersion,
+            BlockedReason::MigrationIncomplete,
+        ] {
+            assert_eq!(
+                storage_action_key(&StorageState::Blocked(reason)),
+                StorageAction::ClearAndRestart
+            );
+        }
+    }
+
+    #[test]
+    fn a_pending_purge_and_the_healthy_states_offer_no_action() {
+        assert_eq!(
+            storage_action_key(&StorageState::Blocked(BlockedReason::PurgePending)),
+            StorageAction::None
+        );
+        assert_eq!(
+            storage_action_key(&StorageState::Uninitialized),
+            StorageAction::None
+        );
+        assert_eq!(
+            storage_action_key(&StorageState::Ready),
+            StorageAction::None
+        );
+    }
+
+    #[test]
+    fn a_held_key_reports_granted_for_every_state() {
+        for state in [
+            StorageState::Uninitialized,
+            StorageState::Ready,
+            StorageState::Unavailable(KeyUnavailable::Missing),
+            StorageState::Blocked(BlockedReason::PurgePending),
+            StorageState::Blocked(BlockedReason::Damaged),
+        ] {
+            assert_eq!(
+                keychain_row_status_key(&state, true),
+                ("settings.keychain_status_granted", false),
+                "state {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_key_is_the_only_status_that_offers_the_action() {
+        assert_eq!(
+            keychain_row_status_key(
+                &StorageState::Unavailable(KeyUnavailable::AccessDenied),
+                false
+            ),
+            ("settings.keychain_status_missing", true)
+        );
+    }
+
+    #[test]
+    fn a_pending_purge_reports_cleanup_without_the_action() {
+        assert_eq!(
+            keychain_row_status_key(&StorageState::Blocked(BlockedReason::PurgePending), false),
+            ("settings.keychain_status_cleanup", false)
+        );
+    }
+
+    #[test]
+    fn other_blocked_states_report_unreadable_without_the_action() {
+        for reason in [
+            BlockedReason::Damaged,
+            BlockedReason::ForeignKey,
+            BlockedReason::UnsupportedVersion,
+            BlockedReason::MigrationIncomplete,
+        ] {
+            assert_eq!(
+                keychain_row_status_key(&StorageState::Blocked(reason), false),
+                ("settings.keychain_status_unreadable", false)
+            );
+        }
+    }
+
+    #[test]
+    fn uninitialized_and_ready_report_not_read() {
+        assert_eq!(
+            keychain_row_status_key(&StorageState::Uninitialized, false),
+            ("settings.keychain_status_not_read", false)
+        );
+        assert_eq!(
+            keychain_row_status_key(&StorageState::Ready, false),
+            ("settings.keychain_status_not_read", false)
+        );
+    }
+
+    #[test]
+    fn applied_action_labels_are_stable() {
+        assert_eq!(AppliedAction::Absent.label(), "absent");
+        assert_eq!(AppliedAction::Hidden.label(), "hidden");
+        assert_eq!(AppliedAction::Grant.label(), "grant");
+        assert_eq!(AppliedAction::Clear.label(), "clear");
+    }
+
+    #[test]
+    fn applied_notice_labels_start_unset() {
+        let _guard = lock_and_reset_applied_notice();
+        assert_eq!(
+            applied_notice_labels(),
+            ("unset", "unset", "unset", "unset")
+        );
+    }
+
+    #[test]
+    fn recording_a_surface_updates_only_its_own_slot() {
+        let _guard = lock_and_reset_applied_notice();
+        record_applied_action(NoticeSurface::SettingsBanner, AppliedAction::Grant);
+        assert_eq!(
+            applied_notice_labels(),
+            ("grant", "unset", "unset", "unset")
+        );
+        record_applied_action(NoticeSurface::PickerEmptyState, AppliedAction::Clear);
+        assert_eq!(
+            applied_notice_labels(),
+            ("grant", "clear", "unset", "unset")
+        );
+        record_applied_action(NoticeSurface::AboutRow, AppliedAction::Hidden);
+        assert_eq!(
+            applied_notice_labels(),
+            ("grant", "clear", "hidden", "unset")
+        );
+    }
+
+    #[test]
+    fn the_about_status_is_recorded_separately_from_the_about_action() {
+        let _guard = lock_and_reset_applied_notice();
+        record_applied_about_status("unreadable");
+        assert_eq!(
+            applied_notice_labels(),
+            ("unset", "unset", "unset", "unreadable")
+        );
+        record_applied_action(NoticeSurface::AboutRow, AppliedAction::Clear);
+        assert_eq!(
+            applied_notice_labels(),
+            ("unset", "unset", "clear", "unreadable")
+        );
+    }
+
+    #[test]
+    fn unset_is_not_the_absent_label() {
+        let _guard = lock_and_reset_applied_notice();
+        assert_eq!(applied_notice_labels().0, "unset");
+        record_applied_action(NoticeSurface::SettingsBanner, AppliedAction::Absent);
+        assert_eq!(applied_notice_labels().0, "absent");
+    }
+
+    #[test]
+    fn unavailable_copy_key_classifies_every_storage_state() {
+        for reason in [
+            KeyUnavailable::Simulated,
+            KeyUnavailable::Missing,
+            KeyUnavailable::AccessDenied,
+            KeyUnavailable::Other,
+        ] {
+            assert_eq!(
+                unavailable_copy_key(&StorageState::Unavailable(reason)),
+                Some("clipboard.unavailable_key")
+            );
+        }
+        assert_eq!(
+            unavailable_copy_key(&StorageState::Blocked(BlockedReason::PurgePending)),
+            Some("clipboard.unavailable_purge")
+        );
+        for reason in [BlockedReason::MigrationIncomplete, BlockedReason::Damaged] {
+            assert_eq!(
+                unavailable_copy_key(&StorageState::Blocked(reason)),
+                Some("clipboard.unavailable_history_retry")
+            );
+        }
+        for reason in [BlockedReason::ForeignKey, BlockedReason::UnsupportedVersion] {
+            assert_eq!(
+                unavailable_copy_key(&StorageState::Blocked(reason)),
+                Some("clipboard.unavailable_history")
+            );
+        }
+        assert_eq!(unavailable_copy_key(&StorageState::Uninitialized), None);
+        assert_eq!(unavailable_copy_key(&StorageState::Ready), None);
+    }
+}
