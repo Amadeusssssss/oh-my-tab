@@ -435,6 +435,11 @@ pub(super) unsafe fn build_keystroke_display_page(
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     );
     bind_control(target, ui.keystroke_display_enabled);
+    // The master switch keeps a card of its own, like the mouse, clipboard, and key-binding pages:
+    // the card boundary is what makes it read as the feature's on/off row instead of the first row
+    // of the options list. The options below open a second card with their own header.
+    canvas.card(&t("settings.header_keystroke_display"));
+    canvas.next_section();
 
     let mode_labels = [
         t("settings.keystroke_display_mode_all"),
@@ -444,7 +449,6 @@ pub(super) unsafe fn build_keystroke_display_page(
     let mode_refs: Vec<&str> = mode_labels.iter().map(|s| s.as_str()).collect();
     let mode_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(mode_metrics.row_h);
-    SettingsRow::separator_above_row(keystroke_display_view, y, mode_metrics.row_h, content_w);
     ui.keystroke_display_mode = SettingsRow::tall_with_height(
         keystroke_display_view,
         label_x,
@@ -608,7 +612,7 @@ pub(super) unsafe fn build_keystroke_display_page(
         ),
     );
     bind_control(target, ui.keystroke_display_max_extent);
-    canvas.card(&t("settings.header_keystroke_display"));
+    canvas.card(&t("settings.header_keystroke_display_options"));
 
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX] = canvas;
