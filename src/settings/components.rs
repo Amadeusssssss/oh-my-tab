@@ -736,21 +736,6 @@ impl SettingsControl {
         widgets::make_switch(right_x, y, h, checked)
     }
 
-    /// `default_value`: the value a double-click restores (None = double-click untouched).
-    #[allow(clippy::too_many_arguments)] // same parameter list as widgets::make_*.
-    pub(super) unsafe fn slider(
-        x: f64,
-        y: f64,
-        w: f64,
-        h: f64,
-        min: i64,
-        max: i64,
-        value: i64,
-        default_value: Option<f64>,
-    ) -> *mut AnyObject {
-        widgets::make_slider(x, y, w, h, min, max, value, default_value)
-    }
-
     /// Build a slider that can only rest on whole `step`s of its range (AppKit snapping).
     /// `default_value`: the value a double-click restores (None = double-click untouched).
     #[allow(clippy::too_many_arguments)] // same parameter list as widgets::make_*.

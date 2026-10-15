@@ -1158,6 +1158,37 @@ unsafe fn settings_style_tree_is_valid(
     true
 }
 
+/// The slider rows whose setting is a whole number of units must be stepped: a continuous control
+/// can rest between two values while the readout and the persisted field truncate to one of them.
+/// The style-tree walk only proves that a *ticked* slider is stepped, so this pins the control kind
+/// at the rows that need it -- a re-introduced plain integer slider fails this smoke.
+unsafe fn integer_sliders_are_stepped() -> bool {
+    with_settings_ui(|ui| {
+        let Some(ui) = ui.as_ref() else {
+            return false;
+        };
+        [
+            ui.card_text_size,
+            ui.status_bar_text_size,
+            ui.line_count,
+            ui.clipboard_auto_expire_days,
+        ]
+        .into_iter()
+        .all(|slider| {
+            if slider.is_null() {
+                return false;
+            }
+            let identifier: *mut AnyObject = msg_send![slider, identifier];
+            let is_stepped = !identifier.is_null()
+                && crate::ffi::nsstring_to_rust(identifier) == widgets::STEPPED_SLIDER_IDENTIFIER;
+            is_stepped && {
+                let allows: bool = msg_send![slider, allowsTickMarkValuesOnly];
+                allows
+            }
+        })
+    })
+}
+
 unsafe fn settings_rendered_font_sizes(view: *mut AnyObject, is_text_field: bool) -> Vec<f64> {
     let mut sizes = Vec::new();
     let mut uses_control_font = true;
@@ -1456,6 +1487,12 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             return false;
         }
         log_info!("[smoke-settings-layout] style tree passed");
+        if !integer_sliders_are_stepped() {
+            log_info!("[smoke-settings-layout] an integer slider does not snap to whole units");
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] integer sliders are stepped");
         // The clipboard switch deletes the saved history when it goes off, so the page must SAY so:
         // its consequence line has to be a visible label in the real view tree. It was previously
         // handed to a `described` row, whose subtitle this app never renders, and the warning

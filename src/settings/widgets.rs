@@ -2136,36 +2136,6 @@ pub(super) unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) ->
     sw
 }
 
-/// Integer slider (NSSlider, min..=max, step 1). alloc +1; caller releases after adding to parent.
-/// `default_value`: the value a double-click restores (None = this row has no default and a
-/// double-click is left alone).
-#[allow(clippy::too_many_arguments)] // geometry + range + value + default exceeds the 7-arg limit.
-pub(super) unsafe fn make_slider(
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    min: i64,
-    max: i64,
-    value: i64,
-    default_value: Option<f64>,
-) -> *mut AnyObject {
-    let slider: *mut AnyObject = msg_send![settings_slider_class(), alloc];
-    let slider: *mut AnyObject =
-        msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))];
-    // Send the action continuously while dragging: in live-apply mode runtime effects must
-    // follow the drag in real time.
-    let _: () = msg_send![slider, setContinuous: true];
-    let _: () = msg_send![slider, setMinValue: min as f64];
-    let _: () = msg_send![slider, setMaxValue: max as f64];
-    // Integer steps: 1 tick = 1 unit (same as LinearMouse's By Lines slider: 0...10 step 1).
-    let _: () = msg_send![slider, setNumberOfTickMarks: 0isize];
-    let _: () = msg_send![slider, setAllowsTickMarkValuesOnly: false];
-    let _: () = msg_send![slider, setIntegerValue: value];
-    apply_slider_default(slider, default_value);
-    slider
-}
-
 /// The tick count AppKit needs so that a stepped slider lands only on whole `step`s from `min` to
 /// `max` inclusive. At least two, because one mark is not a range and AppKit treats a single-mark
 /// slider as unstepped.
@@ -4296,7 +4266,7 @@ mod tests {
     #[ignore]
     fn slider_double_click_smoke() {
         unsafe {
-            let slider = super::make_slider(0.0, 0.0, 120.0, 20.0, 0, 10, 7, Some(3.0));
+            let slider = super::make_stepped_slider(0.0, 0.0, 120.0, 20.0, 0, 10, 1, 7, Some(3.0));
             assert_eq!(super::slider_default_value(slider), Some(3.0));
 
             // A double-click (clickCount = 2) restores the default 3.

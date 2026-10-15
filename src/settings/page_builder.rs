@@ -213,13 +213,14 @@ pub(super) unsafe fn build_switcher_page(
         described_row_h,
         &t("settings.row_card_text_size"),
         &t("settings.desc_card_text_size"),
-        SettingsControl::slider(
+        SettingsControl::stepped_slider(
             ctrl_x,
             y + 10.0,
             SettingsRow::slider_width(ctrl_w),
             row_h,
             TEXT_SIZE_MIN,
             TEXT_SIZE_MAX,
+            1,
             TEXT_SIZE_DEFAULT,
             // Double-click restores the default size (15pt).
             Some(TEXT_SIZE_DEFAULT as f64),
@@ -238,13 +239,14 @@ pub(super) unsafe fn build_switcher_page(
         described_row_h,
         &t("settings.row_status_bar_text_size"),
         &t("settings.desc_status_bar_text_size"),
-        SettingsControl::slider(
+        SettingsControl::stepped_slider(
             ctrl_x,
             y + 10.0,
             SettingsRow::slider_width(ctrl_w),
             row_h,
             TEXT_SIZE_MIN,
             TEXT_SIZE_MAX,
+            1,
             TEXT_SIZE_DEFAULT,
             // Double-click restores the default size (15pt).
             Some(TEXT_SIZE_DEFAULT as f64),
@@ -1113,15 +1115,16 @@ pub(super) unsafe fn build_mouse_page(
         label_w,
         &t("settings.row_line_count"),
         // Leaves the readout's width on the right for the read-only value label (see
-        // SettingsRow::slider_width). Integer slider 1..=10 (matches config validation;
-        // mirrors LinearMouse's By Lines slider interaction).
-        SettingsControl::slider(
+        // SettingsRow::slider_width). Stepped 1..=10 in whole lines (matches config validation;
+        // the range and interaction mirror LinearMouse's By Lines slider).
+        SettingsControl::stepped_slider(
             ctrl_x,
             y + 10.0,
             SettingsRow::slider_width(ctrl_w),
             row_h,
             1,
             10,
+            1,
             3,
             // Double-click restores the default line count (3).
             Some(3.0),
@@ -1710,13 +1713,14 @@ pub(super) unsafe fn build_clipboard_page(
         cy,
         label_w,
         &t("settings.row_clipboard_auto_expire_days"),
-        SettingsControl::slider(
+        SettingsControl::stepped_slider(
             ctrl_x,
             cy + 10.0,
             SettingsRow::slider_width(ctrl_w),
             row_h,
             CLIPBOARD_AUTO_EXPIRE_MIN,
             CLIPBOARD_AUTO_EXPIRE_MAX,
+            1,
             CLIPBOARD_AUTO_EXPIRE_DEFAULT,
             // Double-click restores the default (3 days).
             Some(CLIPBOARD_AUTO_EXPIRE_DEFAULT as f64),
