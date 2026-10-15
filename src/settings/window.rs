@@ -1341,6 +1341,25 @@ unsafe fn update_card_inside_document() -> bool {
     })
 }
 
+/// Whether a page's clip view is parked at its document's top, read from the live frames.
+///
+/// Fails when a reflow grows the document without moving the clip: the mouse page's
+/// materialize-after-scroll case, exercised here on the About page's update expansion.
+unsafe fn page_is_at_top(scroll: *mut AnyObject) -> bool {
+    if scroll.is_null() {
+        return false;
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let document: *mut AnyObject = msg_send![scroll, documentView];
+    if clip.is_null() || document.is_null() {
+        return false;
+    }
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let document_frame: NSRect = msg_send![document, frame];
+    let top = (document_frame.size.height - clip_bounds.size.height).max(0.0);
+    (clip_bounds.origin.y - top).abs() <= 0.5
+}
+
 /// The inline update flow's ownership state as the layout leaves it: what the flow itself hid,
 /// where its divider sits relative to the row above it, and how the card hugs the host.
 #[derive(Debug)]
@@ -1884,6 +1903,15 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         let compact = about_panel_snapshot();
         crate::settings::expand_update_section(UPDATE_CARD_EXPANSION_REQUEST);
         let _: () = msg_send![window, layoutIfNeeded];
+        // The sidebar just scrolled About to its top and the expansion grew the document under it,
+        // so reflow must follow the new top. Nothing re-tops the page here, so this fails when the
+        // clip is left "growth" below the top -- the mouse page's materialize-after-scroll defect,
+        // on a page this smoke can grow without steering.
+        if !page_is_at_top(pages[SETTINGS_ABOUT_PAGE_INDEX]) {
+            log_info!("[smoke-settings-layout] the expanded About page is not scrolled to its top");
+            hide_settings();
+            return false;
+        }
         let expanded_state = update_flow_state();
         let expanded = about_panel_snapshot();
         let first_inside = update_card_inside_document();

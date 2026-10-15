@@ -1012,6 +1012,25 @@ impl PageCanvas {
 
         let current: NSRect = msg_send![self.document, frame];
         if (current.size.height - doc_height).abs() > 0.5 {
+            // A page parked at its top stays there when a reflow changes the document height under
+            // it; see `top_following_origin` for why the mouse page needs it.
+            let scroll: *mut AnyObject = msg_send![self.document, enclosingScrollView];
+            let clip: *mut AnyObject = if scroll.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg_send![scroll, contentView]
+            };
+            let follow_top = if clip.is_null() {
+                None
+            } else {
+                let clip_bounds: NSRect = msg_send![clip, bounds];
+                top_following_origin(
+                    clip_bounds.origin.y,
+                    current.size.height,
+                    doc_height,
+                    clip_bounds.size.height,
+                )
+            };
             let _: () = msg_send![
                 self.document,
                 setFrame: NSRect::new(
@@ -1019,12 +1038,15 @@ impl PageCanvas {
                     NSSize::new(current.size.width, doc_height)
                 )
             ];
-            let scroll: *mut AnyObject = msg_send![self.document, enclosingScrollView];
-            if !scroll.is_null() {
-                let clip: *mut AnyObject = msg_send![scroll, contentView];
-                if !clip.is_null() {
-                    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+            if !clip.is_null() {
+                if let Some(origin_y) = follow_top {
+                    let clip_bounds: NSRect = msg_send![clip, bounds];
+                    let _: () = msg_send![
+                        clip,
+                        scrollToPoint: NSPoint::new(clip_bounds.origin.x, origin_y)
+                    ];
                 }
+                let _: () = msg_send![scroll, reflectScrolledClipView: clip];
             }
         }
 
@@ -1041,6 +1063,28 @@ impl PageCanvas {
                 None => previous.get(index).copied().unwrap_or(base),
             })
             .collect();
+    }
+}
+
+/// The clip origin a height change should restore, or `None` to leave the clip alone.
+///
+/// `Some(new_top)` when the clip was parked at the document's old top: a page the caller just
+/// asked to open at the top must follow the new top, or it ends up sitting exactly `growth` below
+/// it (the mouse page is materialized *after* the sidebar scrolled it to the top, and the
+/// materialization grows its document -- that is what opened the page mid-track). Any other
+/// position is the user's, and a reflow must not move it. Pure, so the decision is unit-testable
+/// without AppKit.
+fn top_following_origin(
+    clip_origin_y: f64,
+    old_document_h: f64,
+    new_document_h: f64,
+    clip_h: f64,
+) -> Option<f64> {
+    let old_top = (old_document_h - clip_h).max(0.0);
+    if (clip_origin_y - old_top).abs() <= 0.5 {
+        Some((new_document_h - clip_h).max(0.0))
+    } else {
+        None
     }
 }
 
@@ -1069,6 +1113,33 @@ mod tests {
             group,
             section,
         }
+    }
+
+    /// A clip parked at the old top follows the new top when the document changes height; any
+    /// other position is preserved.
+    #[test]
+    fn a_clip_at_the_top_follows_the_document_height() {
+        // Growing: the clip moves up by exactly the growth, so the page still opens at the top.
+        assert_eq!(
+            top_following_origin(400.0, 1000.0, 1200.0, 600.0),
+            Some(600.0)
+        );
+        // Shrinking: it follows the smaller top instead of being left past the end.
+        assert_eq!(
+            top_following_origin(400.0, 1000.0, 800.0, 600.0),
+            Some(200.0)
+        );
+        // A document no taller than the clip: the top is 0 in both directions.
+        assert_eq!(top_following_origin(0.0, 500.0, 550.0, 600.0), Some(0.0));
+        // The build-time case: the provisional document is exactly the viewport, then content grows.
+        assert_eq!(top_following_origin(0.0, 600.0, 900.0, 600.0), Some(300.0));
+        // Anywhere else in the page keeps its offset.
+        assert_eq!(top_following_origin(300.0, 1000.0, 1200.0, 600.0), None);
+        // Sub-pixel slack: the sidebar's scroll-to-top lands within half a point of the top.
+        assert_eq!(
+            top_following_origin(400.4, 1000.0, 1200.0, 600.0),
+            Some(600.0)
+        );
     }
 
     #[test]
