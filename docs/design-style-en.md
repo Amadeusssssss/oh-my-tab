@@ -190,7 +190,7 @@ The floating panels (switcher, clipboard, keystroke display) offer three materia
 | Material | Surface | Notes |
 | --- | --- | --- |
 | `liquid-glass` (default) | `NSGlassEffectView`, `glass_style` sub-option | Degrades to frost on macOS < 26 |
-| `frost` | `NSVisualEffectView`, behind-window, themed material, plus the theme-surface wash below | Neutral system blur; the glass sub-options do not apply |
+| `frost` | `NSVisualEffectView`, behind-window, a material pinned per mode (legacy `light` in light, `ultraDark` in dark); it paints no surface of its own | Neutral system blur; the glass sub-options do not apply |
 | `opaque` | `window_bg` fill, no blur | Also the forced fallback while the system's Reduce Transparency accessibility setting is on |
 
 Material only ever changes which surface sits behind the panel content — text colors, spacing,
@@ -281,12 +281,19 @@ Caption tier, 3:1, `filter row / footer captions`, black backdrop / white backdr
 
 | material | mode | contrast |
 | --- | --- | --- |
-| `frost` | light | 5.29:1 / 4.52-5.29:1, 4.59:1 / 3.95-4.59:1 |
+| `frost` | light ‡ | 5.29:1 / 4.52-5.29:1, 4.59:1 / 3.95-4.59:1 |
 | `frost` | dark | 5.87:1 / 5.16-5.87:1, 5.16:1 / 4.64-5.16:1 |
 | `liquid-glass` | light | 4.53:1 / 3.58-4.53:1, 8.79:1 / 5.97-8.79:1 |
 | `liquid-glass` | dark | 9.89:1 / 9.89:1, 5.87:1 / 5.87:1 |
 | `opaque` | light | 8.20:1 / 5.65-8.20:1 (both backdrops) |
 | `opaque` | dark | 10.10:1 / 10.10:1 (both backdrops) |
+
+‡ The light `frost` row was measured on `underWindowBackground` (21), the material that read a shade dark on the
+switcher in light mode. Light `frost` is now `hudWindow` (13) (`glass::FROST_MATERIAL_LIGHT`), the material the
+other macOS window switchers use; the pinned `light` (1) was retired after `panel-contrast.sh` measured its footer
+captions at 2.48:1 on a black backdrop, below this tier. With `hudWindow` the same regions measure 4.60-4.64:1
+(black) and 3.73-4.30:1 (white) on 2026-10-16, so the row below is still the historical (21) reading while the
+current material clears the tier. The dark row is unchanged (`ultraDark`, 9).
 
 The lowest measurement is 3.58:1. Three inks needed a deliberate adjustment, each found by this measurement rather
 than by reasoning: liquid glass takes a **dark tint in dark mode** (`glass::GLASS_TINT_DARK`; one tint cannot serve
@@ -297,9 +304,10 @@ lifts to 0.648, where the ink reached 2.45:1); and the **footer captions use `se
 palette's own surface rather than the material it is drawn on). `opaque` is the control: it does not move with the
 backdrop at all.
 
-**What this holds, and what it does not.** The scenario fails the run below 3:1, and it now passes for all twelve
-combinations, so these two roles hold the caption tier on `{frost, liquid-glass, opaque} x {light, dark} x {black,
-white}`. The limits: an ink whose own contribution is under 3 tone units is not visible to the diff at all (far
+**What this holds, and what it does not.** The scenario fails the run below 3:1. With the current `hudWindow`
+(13) light `frost` material the footer captions clear the tier in every cell measured on 2026-10-16 (black
+4.60-4.64:1, white 3.73-4.30:1, dark 4.64-5.16:1); the `filter-row` region itself is currently unmeasurable for
+every material, which is a stale sampling region rather than a contrast result (`docs/review-backlog.md` #36). The limits: an ink whose own contribution is under 3 tone units is not visible to the diff at all (far
 under this tier, but it is not a measurement); roles outside these two -- row titles, detail text, the keycap glyphs
 -- are targets, not enforced; and the scenario rewrites the theme, so `run-all.sh` runs it only with
 `--include-prefs`. `lib/png_stats.py --selftest` is the nine-case regression corpus, including the three
@@ -307,7 +315,7 @@ counterexamples that each defeated an earlier version of this measurement.
 
 | material | mode | filter row | footer band |
 | --- | --- | --- | --- |
-| `frost` | light | 5.29:1 / 4.58:1 | 4.40:1 / 3.85:1 |
+| `frost` | light ‡ | 5.29:1 / 4.58:1 | 4.40:1 / 3.85:1 |
 | `frost` | dark | 5.86:1 / 5.16:1 | 4.97:1 / 4.46:1 |
 | `liquid-glass` | light | 4.53:1 / 8.78:1 | 3.49:1 / 5.80:1 |
 | `liquid-glass` | dark | 9.88:1 / 5.86:1 | 9.52:1 / 5.64:1 |
@@ -329,12 +337,15 @@ enforced floor.
 
 | mode | material | black backdrop | white backdrop |
 | --- | --- | --- | --- |
-| light | `frost` | 5.39:1 | 4.61:1 |
+| light | `frost` ‡ | 5.39:1 | 4.61:1 |
 | light | `liquid-glass` | 4.47:1 | 8.60:1 |
 | light | `opaque` | 8.03:1 | 8.03:1 |
 | dark | `frost` | 5.82:1 | 5.27:1 |
 | dark | `liquid-glass` | 9.93:1 | 6.00:1 |
 | dark | `opaque` | 9.93:1 | 9.93:1 |
+
+‡ The light `frost` row is the retired `underWindowBackground` measurement noted above; the current `hudWindow`
+(13) material measured 4.60:1 on black and 4.30:1 on white (see the note above).
 
 Two surfaces needed a deliberate adjustment to get there, and both were found by this measurement rather than
 by reasoning: liquid glass takes a **dark tint in dark mode** (`glass::GLASS_TINT_DARK`; one tint cannot serve
@@ -376,8 +387,11 @@ from 15.63/10.10/6.40:1 to 3.38/2.18/1.38:1 and 4.68/3.03/1.92:1. No text color 
 surface — the best any single color achieves there is 5.71:1, under this table's own 12:1 and 7:1
 floors — so the **surface** is what gets pinned:
 
-- `frost` composites `window_bg` over the blur at an opacity that keeps the worst case legible
-  (a white backdrop still lands at gray 51 or darker).
+- `frost` pins its material per mode (`glass::FROST_MATERIAL_DARK` = legacy `ultraDark` 9,
+  `glass::FROST_MATERIAL_LIGHT` = legacy `light` 1) and paints no surface of its own: the material chooses the
+  tone and the dynamic system label ink carries the contrast (see the panel tier above). A `window_bg` wash over
+  the blur would pull the surface toward `window_bg` and make `frost` and `opaque` read as one setting, which is
+  why there is none.
 - `liquid-glass` takes its tint from `glass_tint` verbatim (default `eeeeee66`, a light neutral at 40%),
   in both modes. There is no user-facing colour picker: the value is a config field, and a hue outside the
   palette would invalidate the contrast table the vibrant ink is resolved against.

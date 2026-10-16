@@ -1104,11 +1104,12 @@ pub(super) fn smoke_runner() -> bool {
             "[keystroke-display-smoke] smoke launch isolation lost: key_provider={key_provider} pasteboard_monitored={pasteboard_monitored}"
         );
     }
-    // A `--panel-material=` launch switch selects exactly one surface, including development-only ones
-    // whose checks (system material present, palette surface painted) describe the shipped materials and
-    // not this surface. Structure and geometry are asserted either way; the shipped set is asserted in
-    // full only when no switch forced a material for this launch.
-    let dev_material_forced = crate::dev_flags::value("panel-material").is_some();
+    // A `--panel-material=` launch switch can name the development-only `backdrop` surface, whose checks
+    // (system material present, palette surface painted) describe the shipped materials and not that
+    // surface. Only that one is exempt: a switch naming a shipped material (`--panel-material=frost`) is
+    // still held to the shipped checks, or forcing a material would be a way to skip them.
+    let dev_only_material_forced =
+        crate::dev_flags::value("panel-material").is_some_and(|value| value == "backdrop");
     super::mapping::refresh_layout_cache();
     let option_q_is_unmodified = super::mapping::key_glyph(
         crate::event_tap::keyboard::VK_Q,
@@ -1291,10 +1292,10 @@ pub(super) fn smoke_runner() -> bool {
                 && backdrop_structure_valid(panel, badge_container)
                 // The frost mask belongs to the system frost material; a launch switch that forces the
                 // development-only blended surface has no material view to mask.
-                && (dev_material_forced || backdrop_frost_mask_valid())
+                && (dev_only_material_forced || backdrop_frost_mask_valid())
                 // The palette surface is painted by the shipped materials; the development-only blur
                 // surface paints nothing (its own check is the backdrop layer in `backdrop_structure_valid`).
-                && (dev_material_forced || backdrop_surface_matches_palette())
+                && (dev_only_material_forced || backdrop_surface_matches_palette())
                 && centroid_offsets.as_ref().is_some_and(|offsets| {
                     offsets.len() == cjk_badges.len()
                         && offsets.iter().all(|(offset, pixels)| {
@@ -1362,6 +1363,26 @@ pub(super) fn smoke_runner() -> bool {
             .appearance
             .theme
             .clone();
+        let original_material = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .appearance
+            .panel_material
+            .clone();
+        // The theme switch must exercise frost whatever the user's config is: the material loop above
+        // restored the original (default `liquid-glass`), and the frost read-back is what this check is
+        // for. A `--panel-material=` launch switch is already in force, so it names the material under
+        // test instead of exempting the check.
+        let theme_material =
+            crate::dev_flags::value("panel-material").unwrap_or_else(|| "frost".to_string());
+        {
+            let mut config = crate::config::CONFIG.write().unwrap();
+            config.appearance.panel_material = theme_material;
+        }
+        unsafe {
+            apply_backdrop_material();
+            apply_glass_properties();
+        }
         let other = if crate::theme::resolved_is_dark() {
             "light"
         } else {
@@ -1413,6 +1434,10 @@ pub(super) fn smoke_runner() -> bool {
         {
             let mut config = crate::config::CONFIG.write().unwrap();
             config.appearance.theme = original;
+            config.appearance.panel_material = original_material;
+        }
+        unsafe {
+            apply_backdrop_material();
         }
         crate::ui_coordinator::apply_theme_and_locale_refresh();
         changed && unsafe { backdrop_surface_matches_palette() }
@@ -1848,8 +1873,8 @@ pub(super) fn smoke_runner() -> bool {
         && grip_valid
         && config_restored
         && preview_valid
-        && (dev_material_forced || every_material_paints_its_surface)
-        && (dev_material_forced || theme_refresh_retints_surface))
+        && (dev_only_material_forced || every_material_paints_its_surface)
+        && (dev_only_material_forced || theme_refresh_retints_surface))
     {
         crate::log_info!(
             "[smoke-keystroke-display-panel] which: structure={valid} isolated={smoke_process_isolated} rail={rail_geometry_valid} row={row_split_valid} column_pair={column_pair_margins_valid} stream={stream_alignment_valid} grip={grip_valid} config={config_restored} surface={every_material_paints_its_surface} theme={theme_refresh_retints_surface}"
@@ -1865,8 +1890,8 @@ pub(super) fn smoke_runner() -> bool {
         && grip_valid
         && config_restored
         && preview_valid
-        && (dev_material_forced || every_material_paints_its_surface)
-        && (dev_material_forced || theme_refresh_retints_surface)
+        && (dev_only_material_forced || every_material_paints_its_surface)
+        && (dev_only_material_forced || theme_refresh_retints_surface)
 }
 
 fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -> bool {
@@ -2966,6 +2991,25 @@ unsafe fn backdrop_frost_mask_valid() -> bool {
     !mask.is_null()
 }
 
+/// Whether the installed effect view carries the pinned frost material for the *resolved* mode.
+///
+/// Read back from the view's own `material`, not from the constant the builder passed: the light side
+/// shipped `underWindowBackground` (21), which only the rendered panel showed to be a shade dark, so the
+/// pin has to be asserted on what is installed. The theme path re-sets the material in
+/// `glass::apply_live_properties`, and the surface checks below call this so a refresh that skipped it
+/// fails here instead of on screen.
+unsafe fn backdrop_frost_material_matches() -> bool {
+    let Some(backdrop) = installed_backdrop() else {
+        return false;
+    };
+    let Some(effect) = backdrop.effect_view else {
+        // No effect view means this installation is not frost; the material read-back is a frost check.
+        return !matches!(backdrop.material, crate::glass::PanelMaterial::Frost);
+    };
+    let installed: i64 = msg_send![effect.0, material];
+    installed == crate::glass::frost_material()
+}
+
 /// Whether the panel's surface currently carries the *current* theme's scrim / tint.
 ///
 /// The surface is written by `apply_glass_properties` from the palette, while the keycaps re-read the
@@ -2985,7 +3029,9 @@ unsafe fn backdrop_surface_matches_palette() -> bool {
         // rides on the keycap chips. The blur's structure is asserted separately
         // (`backdrop_frost_mask_valid`), which is what can actually break here.
         (Some(SurfaceExpectation::SystemBlur), crate::glass::PanelMaterial::Frost) => {
-            backdrop.effect_view.is_some()
+            // A live effect view is the structure; the pinned material is the look, and only reading it
+            // back catches a build or theme-refresh path that installs the retired value (21).
+            backdrop.effect_view.is_some() && backdrop_frost_material_matches()
         }
         (Some(SurfaceExpectation::SystemBlur), _) => false,
         (Some(SurfaceExpectation::Layer(expected)), _) => backdrop

@@ -110,13 +110,13 @@ extern "C" fn vibrant_label_allows_vibrancy(
 /// materials for the same reason (semantic materials follow the view's appearance, which a user-preference
 /// theme cannot rely on).
 ///
-/// Light mode uses the legacy **light** material (raw 1), the brightest of the pinned set; the adjacent
-/// `mediumLight` (8) still read a shade dark on the switcher in light mode. It replaced
-/// `underWindowBackground` (21), which is the material *under* a window background rather than a light
-/// floating-panel surface. Pinned materials keep the light look independent of the view's appearance, for
-/// the same reason the dark side avoids the semantic `hudWindow` (13).
+/// Light mode uses **hudWindow** (raw 13), the material the other macOS window switchers (BetterCmdTab,
+/// vorssaint) use for their floating panels. It replaced the pinned `light` (1): a behind-window `light`
+/// material let a dark backdrop pull the surface down, and `scripts/e2e/panel-contrast.sh` measured the
+/// footer captions at 2.48:1 there, below the panel tier; `hudWindow` keeps the surface high enough to
+/// clear it (4.60-4.64:1 measured).
 const FROST_MATERIAL_DARK: i64 = 9; // ultraDark (legacy)
-const FROST_MATERIAL_LIGHT: i64 = 1; // light (legacy)
+const FROST_MATERIAL_LIGHT: i64 = 13; // hudWindow
 
 /// One panel's backdrop options.
 ///
@@ -1657,6 +1657,22 @@ mod tests {
             "a retired look must not blank the glass"
         );
         assert_eq!(glass_style_index(""), 0);
+    }
+
+    /// The frost material is pinned per mode: dark is `ultraDark` (9), light is `hudWindow` (13). Light went
+    /// `underWindowBackground` (21) -> `light` (1) -> `hudWindow`; the pinned `light` looked right on a
+    /// light desktop but the contrast scenario measured its footer captions at 2.48:1 on a black backdrop,
+    /// and `hudWindow` clears the tier there. A later adjustment has to face this test and that scenario.
+    #[test]
+    fn frost_material_is_pinned_per_mode() {
+        assert_eq!(super::FROST_MATERIAL_DARK, 9);
+        assert_eq!(super::FROST_MATERIAL_LIGHT, 13);
+        let expected = if crate::theme::resolved_is_dark() {
+            9
+        } else {
+            13
+        };
+        assert_eq!(super::frost_material(), expected);
     }
 
     /// Backdrop options carry only the inactive-glass compensation now: there is no per-panel

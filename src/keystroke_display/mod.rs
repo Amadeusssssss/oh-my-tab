@@ -587,6 +587,55 @@ mod tests {
         assert_eq!(Config::default().keystroke_display.tap_level, "session");
     }
 
+    /// The ignored smoke spawns `target/debug/oh-my-tab`, which `cargo test` does not always rebuild:
+    /// a deliberately broken refresh path once passed here on a stale binary. Refuse to spawn when the
+    /// binary predates any file under `src/`, so the runner cannot report PASS against old code.
+    fn app_binary_is_fresh(app: &std::path::Path) -> bool {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        binary_is_fresh_than_tree(app, &root)
+    }
+
+    fn binary_is_fresh_than_tree(app: &std::path::Path, root: &std::path::Path) -> bool {
+        let Ok(binary_mtime) = std::fs::metadata(app).and_then(|meta| meta.modified()) else {
+            return false;
+        };
+        match newest_mtime(root) {
+            Ok(Some(newest)) => binary_mtime >= newest,
+            // A source tree that cannot be read (or holds nothing) means the check did not run: fail
+            // closed rather than let an unreadable tree pass the stale binary through.
+            Ok(None) | Err(_) => false,
+        }
+    }
+
+    fn newest_mtime(dir: &std::path::Path) -> std::io::Result<Option<std::time::SystemTime>> {
+        let mut newest: Option<std::time::SystemTime> = None;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            let candidate = if meta.is_dir() {
+                newest_mtime(&entry.path())?
+            } else {
+                Some(meta.modified()?)
+            };
+            if let Some(candidate) = candidate {
+                if newest.is_none_or(|current| candidate > current) {
+                    newest = Some(candidate);
+                }
+            }
+        }
+        Ok(newest)
+    }
+
+    /// Counter-example: a tree that cannot be read must not be treated as "the binary is fresh".
+    #[test]
+    fn an_unreadable_source_tree_does_not_pass_the_freshness_check() {
+        let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert!(!binary_is_fresh_than_tree(
+            &app,
+            std::path::Path::new("/nonexistent-oh-my-tab-source-tree")
+        ));
+    }
+
     #[test]
     #[ignore]
     fn panel_creation_and_badge_layout_smoke() {
@@ -599,6 +648,12 @@ mod tests {
         assert!(
             app.exists(),
             "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        assert!(
+            app_binary_is_fresh(&app),
+            "app binary {} is older than src/: run `cargo build` before this smoke, or it can pass \
+             against the previous implementation",
             app.display()
         );
         let instance_guard = crate::single_instance::acquire()
