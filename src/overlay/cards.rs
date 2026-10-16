@@ -569,9 +569,8 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![view, addSubview: container];
             release_obj(container); // view owns the container; drop our alloc +1
         } else {
-            // One shared derivation of the icon-only card's vertical layout: the card builder and
-            // `theme::icon_hover_target` both read it, so the pointer target cannot drift from
-            // what is actually drawn.
+            // One shared derivation of the icon-only card's vertical layout, so the icon, the two
+            // caption lines and the plate that wraps them cannot drift apart.
             let layout = crate::theme::icon_card_layout(card_width, card_h);
             let icon_x = layout.icon_x; // 15.0
             let icon_bottom = layout.icon_bottom; // 70.5
@@ -709,15 +708,9 @@ pub(crate) fn create_card_view(
         // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
         let opts: u64 = 0x01 | 0x80;
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        // `mouseEntered:` selects the card, so the area has to be the target `handle_hover_at`
-        // tests, not the card frame: the icon-only layout keeps ~35pt of blank inside its own
-        // bounds (theme::icon_hover_target).
-        let (hx, hy, hw, hh) = if use_new {
-            (0.0, 0.0, card_width, card_h)
-        } else {
-            crate::theme::icon_hover_target(card_width, card_h)
-        };
-        let bounds = NSRect::new(NSPoint::new(hx, hy), NSSize::new(hw, hh));
+        // The whole card is the hover target in both layouts: `theme::card_h` derives from the
+        // card's content, so there is no blank band inside a card to exclude.
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h));
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1

@@ -63,10 +63,10 @@ pub(crate) const THUMB_VISIBILITY_BADGE_TAG: isize = 0xE7F6;
 /// Tag for the scrim behind the icon-only card's close button. The button sits over the icon
 /// rather than over a filled plate, so the glyph needs its own chip to stay readable.
 pub(crate) const CLOSE_SCRIM_TAG: isize = 0xE7F7;
-/// Compile-time invariant: the thumbnail layout selects the whole card, so its ring reaches
-/// `theme::OVERLAY_RING_INSET` outside one, and the room the card area keeps below its last row
-/// must cover that or the footer's edge clips the ring. The icon-only plate nests inside its card
-/// and draws nothing outside it.
+/// Compile-time invariant: the thumbnail layout's ring reaches `theme::OVERLAY_RING_INSET` outside its
+/// card, and the room the card area keeps below its last row has to cover that or the footer's edge
+/// clips the ring. The icon-only plate sits at the card's own edge
+/// (`theme::SELECTION_CARD_INSET == 0`) and draws nothing outside it.
 const _: () = assert!(
     crate::theme::THUMB_BOTTOM_INSET >= crate::theme::OVERLAY_RING_INSET,
     "the card area's bottom inset must cover the thumbnail ring's outward reach"

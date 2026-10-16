@@ -83,7 +83,6 @@
 - **成功 toast 没有对照它实际显示的字符串做断言**（2026-10-14，设置导入/导出审查 R3，LOW——覆盖缺口，延后）。`bubble_metrics` 对 `BubbleKind::Success` 的形状有单元测试，且那两条设置 toast（「Settings exported.」/「Settings imported.」）在三个 locale 下都远短于 220pt 的单行预算，但没有任何东西在活的 cell 上测量这些具体字符串——将来更长的翻译或气泡宽度改动会静默截断。部分导入的说明刻意避开这条路径（它用 NSAlert 正因为它放不下）。触发：下次改动成功 toast 文案、tooltip 字体、或 `bubble_metrics` 时。
 
 - **`--tasks` 不显示 session 属于哪个后端**（2026-10-16，pi reviewer 集成，真实 pi 审查 R1，LOW——可见性增强，按仓库预算延后）。新增的 `session-backend` 文件记录了每个任务的 session 由 codex 还是 pi 签发，切换 reviewer 时旧 session 会被丢弃并在 `session-log.tsv` 记 `discarded`；但 `--tasks` 的 `state` 列只看 `session-log.tsv` 的最后一个事件，不读 `session-backend`，所以列表无法直接回答「这个任务现在挂在哪个后端上」，也不能解释那次丢弃。不影响 `--tasks` 已有的承诺（session / 健康 / 在会话内轮数），只是少了一个跨后端排查用的列。触发：下次改动 `--tasks` 的列或 `task_row` 时，或出现「切换 reviewer 后无法判断哪个 session 还活着」的实际困惑时。
-- **图标色板的两个比例背后没有可复现的仪器**（2026-10-16，图标选中样式审查 R1，LOW——仪器完善，延后）。`ICON_ARTWORK_RATIO`（412/512，在 10 个已装图标的 alpha>128 上逐个核对）与 `ICON_ARTWORK_CORNER_RATIO`（0.223，由「四角间隙 = 四边间隙」反推）目前只存在于 `/tmp` 里的一次性脚本，仓库里既没有可复现命令也没有反例；`theme` 里那条等宽断言只是把公式重述一遍，钉不住这两个数本身。触发：下次改动色板几何（环宽、圆角、inset）时，或这两个常数被质疑时。
 
 - **`handle_hover_at` 不比卡片视口裁剪命中区**（2026-10-16，图标选中样式审查 R1，MEDIUM——本次未在真机验证，延后）。它只逐张卡片比 frame：滚动时最后一排的 frame 本来就伸到视口下方（scroll teaser 的由来），所以指针停在底部标题栏上时，坐标换算到文档坐标后有可能落进那张卡，于是「点在状态栏上却选中了上面一行」。本条来自代码结构推断，未在真机复现。触发：下次改动 hover/tracking 路径时，或首次报告滚动时选中卡住、乱跳时。
 

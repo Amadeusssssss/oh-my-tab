@@ -491,26 +491,24 @@ and the window preview together — so the switcher's card area keeps an 8pt bot
 the footer band) would clip the ring on the last row. That inset comes out of the footer band's own
 height, not out of the card-size budget, and `overlay` asserts the coverage at compile time.
 
-An **icon-only** switcher tile does not use that ring. It marks selection with a *plate* that hugs the
-icon's visible **artwork**: the artwork plus `10.5pt` on every side (`theme::SELECTION_RING_WIDTH`), so the
-plate is *narrower* than the icon canvas and reads as a ring in the icon's own transparent margin, not as a
-slab behind it. It is filled with `selection_plate_bg` -- a heavier wash than a list row's
-`selection_bg`, because a whole icon has to read against translucent glass -- rimmed with `2pt` of `accent`
-(`theme::SELECTION_RING_STROKE`) and drawn on a
-**continuous** corner curve (`CALayer.cornerCurve`). Its radius is the artwork's own corner plus the ring
-width (`theme::icon_selection_plate_radius`), which is what keeps the ring as wide at the corners as along
-the edges; the plate's own side would pinch them. `ICON_ARTWORK_RATIO` is the artwork's share of the canvas
-(Apple's own `412/512`), and `ICON_ARTWORK_CORNER_RATIO` is the *circular* radius that matches a
-"continuous" icon corner -- smaller than the squircle's own parameter, because a squircle bulges closer to
-its box's corner than a circular arc does. The caption rows stay outside the plate, so the panel's material
-keeps showing behind the text.
+An **icon-only** switcher tile marks the same unit -- the whole card, icon and both caption rows -- with a
+plate that *is* the card's rectangle (`theme::SELECTION_CARD_INSET` is `0`). The icon grid packs cards edge
+to edge, so a card's own boundary is already the midpoint between its icon and its neighbour's, 15pt from
+each; any outward inset puts the plate nearer the neighbouring icon than its own and reads as selecting the
+wrong card. The thumbnail grid keeps a 14pt gap, which is why its ring can sit `3pt` outside its cards.
+Both are filled with `selection_plate_bg` (a heavier wash than a list row's `selection_bg`,
+because a whole icon has to read against translucent glass), rimmed with `2pt` of `accent`
+(`theme::SELECTION_RING_STROKE`) and drawn on a **continuous** corner curve (`CALayer.cornerCurve`). The
+icon-only plate's radius is its own token (`theme::SELECTION_PLATE_RADIUS`, 24pt) taken from the corner
+radius of the icon it wraps, *not* from `appearance.corner_radius`: the card paints nothing, so there is
+no second visible curve to stay parallel to, and that setting is the card's radius (capped at
+`radius-panel`) plus the panel's. The thumbnail ring keeps `card_radius + ring_inset`.
 
 The tile's height is exactly what its content needs (`theme::card_h`): icon canvas, both caption lines and
-the insets. A fixed base height plus a reserve used to leave ~35pt of blank inside the card -- the plate
-ended up 2pt above the caption while a band of nothing sat at the bottom. Its pointer-to-select target is
-still not the card frame but the content plus `SELECTION_HOVER_MARGIN` (`theme::icon_hover_target`) at the
-card's full width -- the captions are centred and truncate at that width, and the full width is what keeps
-neighbouring icons contiguous for the pointer.
+the insets. A fixed base height plus a text reserve used to leave ~35pt of blank inside the card -- the
+plate ended up 2pt above the caption while a band of nothing sat at the bottom. That blank was also why the
+pointer target had to be trimmed away from the card frame; with the card sized to its content, the whole
+card is the target in both layouts, so a hover can never select from a band that draws nothing.
 
 A small chip derives its radius from its own height rather than taking `radius-control`:
 `radius-control` is sized for 32pt controls, and on a 19pt chip it consumes 42% of the height and
