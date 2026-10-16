@@ -83,10 +83,15 @@ wait_for_state() {
     local expression="$1"
     local deadline=$((SECONDS + 25))
     while [ "$SECONDS" -lt "$deadline" ]; do
-        if python3 - "$state" "$expression" <<'PY' 2>/dev/null
+        if python3 - "$state" "$expression" "$repo_dir/scripts/e2e/lib" <<'PY' 2>/dev/null
 import json, sys
+# A duplicated member would make the gate read a different value than the app wrote,
+# so the state is parsed by the duplicate-rejecting loader (see lib/state_json.py).
+sys.path.insert(0, sys.argv[3])
+from state_json import load_state
 try:
-    s = json.load(open(sys.argv[1]))
+    with open(sys.argv[1]) as handle:
+        s = load_state(handle)
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0 if eval(sys.argv[2], {"s": s}) else 1)
@@ -138,16 +143,16 @@ echo "  clicking the gear in desktop pixels at (${click_x},${click_y})"
 cua click "{\"scope\": \"desktop\", \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"background\"}" >/dev/null
 
 # The assertion the broken gear would fail: the settings window must come up on its page.
-if ! wait_for_state "s.get('settings_window_visible') and s.get('selected_sidebar') == 5"; then
+if ! wait_for_state "s.get('settings_window_visible') and s.get('selected_sidebar_name') == 'keystroke-display'"; then
     page="$(python3 - "$state" <<'PY'
 import json, sys
 s = json.load(open(sys.argv[1]))
-print("visible" if s.get("settings_window_visible") else "not visible", s.get("selected_sidebar"))
+print("visible" if s.get("settings_window_visible") else "not visible", s.get("selected_sidebar_name"))
 PY
 )"
     problem "clicking the gear did not open the settings window on the Keystroke Display page (page: ${page})"
 else
-    echo "  settings opened: selected_sidebar=5"
+    echo "  settings opened: selected_sidebar_name=keystroke-display"
 fi
 
 # The panel is a HUD with no session to commit; it must be gone once the click is handled.

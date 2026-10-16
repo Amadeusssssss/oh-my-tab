@@ -629,10 +629,7 @@ pub(crate) fn show_and_pin_for_menu() {
         // honour the "next outside click closes it" contract, so it is refused rather than left in a
         // state the panel cannot keep.
         if !super::sync_outside_click_monitor() {
-            super::forget_pin();
-            super::refresh_pin_button();
-            crate::menu::refresh_clipboard_pin_item();
-            show_toast(&t("clipboard.toast_pin_unavailable"));
+            super::refuse_pin_unavailable();
             return;
         }
         super::refresh_pin_button();

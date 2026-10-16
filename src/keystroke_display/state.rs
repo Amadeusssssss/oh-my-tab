@@ -379,6 +379,10 @@ pub(crate) struct StateMachine {
     /// the rest of the session, so old keys being pushed out does not make the bar breathe.
     capped: bool,
     secure: bool,
+    /// Development hold-open: while set, the fade deadline is never armed, so a
+    /// --show-keystroke-display launch keeps the panel standing for a scenario's pointer
+    /// gesture. It belongs to the LAUNCH, not the stream (see reset_for_launch).
+    hold_open: bool,
 }
 
 struct KeyInput<'a> {
@@ -456,15 +460,33 @@ impl StateMachine {
 
     pub(crate) fn note_activity(&mut self, now: Instant) {
         if !self.secure && !self.badges.is_empty() {
-            self.deadline = Some(now + IDLE_FADE);
+            self.arm_deadline(now, IDLE_FADE);
         }
     }
 
-    /// Development only: stop the idle deadline from ever passing, so a `--show-keystroke-display`
-    /// launch keeps the panel standing for a scenario's pointer gesture. A normal launch never sets
-    /// the flag, so shipped behaviour is unchanged.
-    pub(crate) fn freeze_idle_deadline(&mut self) {
-        self.deadline = None;
+    /// Arm the fade deadline, unless the development hold-open mode suppresses it. Every site that
+    /// would otherwise start the fade goes through here, because a one-shot suppression would be
+    /// undone by the next key or hover (note_activity re-arms on both).
+    fn arm_deadline(&mut self, now: Instant, fade: Duration) {
+        if !self.hold_open {
+            self.deadline = Some(now + fade);
+        }
+    }
+
+    /// Rebuild the machine for a launch, re-seeding the development hold-open mode. The mode is a
+    /// property of the launch, so a reset must not silently drop it: the panel would fade out from
+    /// under the A2 scenario that is about to click its gear.
+    /// Development only: suppress the fade deadline for the rest of the launch.
+    pub(crate) fn set_hold_open(&mut self, hold_open: bool) {
+        self.hold_open = hold_open;
+        if hold_open {
+            self.deadline = None;
+        }
+    }
+
+    pub(crate) fn reset_for_launch(&mut self, hold_open: bool) {
+        *self = Self::default();
+        self.hold_open = hold_open;
     }
 
     pub(crate) fn secure_paused(&self) -> bool {
@@ -568,7 +590,7 @@ impl StateMachine {
             if let Some(index) = self.modifier_badge {
                 if let Some(badge) = self.badges.get(index) {
                     if badge.kind == BadgeKind::Modifier {
-                        self.deadline = Some(now + MODIFIER_ONLY_FADE);
+                        self.arm_deadline(now, MODIFIER_ONLY_FADE);
                     }
                 }
             }
@@ -578,7 +600,7 @@ impl StateMachine {
                     if badge.kind == BadgeKind::Modifier {
                         badge.kind = BadgeKind::ModifierReleased;
                     }
-                    self.deadline = Some(now + MODIFIER_ONLY_FADE);
+                    self.arm_deadline(now, MODIFIER_ONLY_FADE);
                 }
             }
         } else if self.modifier_badge.is_some() {
@@ -671,12 +693,12 @@ impl StateMachine {
                 glyph: cells.iter().map(|cell| cell.text()).collect(),
                 cells,
             });
-            self.deadline = Some(now + IDLE_FADE);
+            self.arm_deadline(now, IDLE_FADE);
             return;
         }
 
         self.modifier_badge = None;
-        self.deadline = Some(now + IDLE_FADE);
+        self.arm_deadline(now, IDLE_FADE);
         if keycode == keyboard::VK_SPACE {
             let Some(glyph) = glyph else {
                 self.last_key = None;
@@ -729,7 +751,7 @@ impl StateMachine {
         if let Some(group) = self.last_key.as_mut() {
             group.press_count = next_count;
         }
-        self.deadline = Some(now + IDLE_FADE);
+        self.arm_deadline(now, IDLE_FADE);
         true
     }
 
@@ -1417,5 +1439,53 @@ mod tests {
         assert!(state.panel_visible());
         assert!(state.tick(activity + IDLE_FADE));
         assert!(!state.panel_visible());
+    }
+    /// The development hold-open mode must survive activity: a one-shot suppression would be undone
+    /// by the very next key or hover, because both re-arm the deadline.
+    #[test]
+    fn the_hold_open_mode_survives_later_activity_and_clears_the_deadline() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        state.set_hold_open(true);
+        state.apply(down(12, 0, "a"), DisplayMode::All, now);
+        // A hover and a later key both go through note_activity; neither may re-arm the fade.
+        state.note_activity(now);
+        state.apply(down(13, 0, "b"), DisplayMode::All, now);
+        assert!(state.panel_visible(), "the keys must still be present");
+        assert_eq!(
+            state.deadline(),
+            None,
+            "the fade must not be armed while held open"
+        );
+        // Even long past the ordinary fade window the stream is intact.
+        assert!(!state.tick(now + IDLE_FADE * 10));
+        assert!(state.panel_visible());
+    }
+
+    /// The counter-example: without the mode the same sequence DOES fade, so the test above asserts
+    /// the mode rather than an unrelated change in how the deadline works.
+    #[test]
+    fn without_the_hold_open_mode_the_stream_still_fades() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        state.apply(down(12, 0, "a"), DisplayMode::All, now);
+        assert!(state.deadline().is_some(), "a normal launch arms the fade");
+        assert!(state.tick(now + IDLE_FADE * 10));
+        assert!(!state.panel_visible());
+    }
+
+    /// A reset rebuilds for a launch and must re-seed the mode rather than drop it: otherwise the
+    /// panel fades out from under the scenario that is about to click its gear.
+    #[test]
+    fn reset_for_launch_reseeds_the_hold_open_mode() {
+        let mut state = StateMachine::default();
+        state.set_hold_open(true);
+        state.reset_for_launch(true);
+        assert!(
+            state.hold_open,
+            "a reset during a held-open launch must keep holding"
+        );
+        state.reset_for_launch(false);
+        assert!(!state.hold_open, "a normal launch must not enable it");
     }
 }

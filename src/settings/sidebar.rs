@@ -168,18 +168,10 @@ pub(super) unsafe fn build_settings_sidebar(
     let sidebar_buttons =
         SettingsSidebar::build(sidebar_content, target, 12.0, btn_y0, btn_w, btn_h);
     for (index, button) in sidebar_buttons.into_iter().enumerate() {
-        match settings_page_identity(index) {
-            SettingsPageId::General => ui.sidebar_general = button,
-            SettingsPageId::Switcher => ui.sidebar_switcher = button,
-            SettingsPageId::Mouse => ui.sidebar_mouse = button,
-            SettingsPageId::Clipboard => ui.sidebar_clipboard = button,
-            SettingsPageId::KeyBindings => ui.sidebar_key_bindings = button,
-            SettingsPageId::KeystrokeDisplay => ui.sidebar_keystroke_display = button,
-            SettingsPageId::About => ui.sidebar_about = button,
-        }
+        ui.sidebar_buttons[index] = button;
     }
     widgets::set_sidebar_update_indicator(
-        ui.sidebar_about,
+        ui.sidebar_button(SettingsPageId::About),
         UPDATE_AVAILABLE.load(Ordering::SeqCst) || crate::restart::restart_required(),
     );
 

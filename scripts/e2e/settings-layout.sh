@@ -95,7 +95,7 @@ while time.time() < deadline:
     # the requested final page as well as a stable sequence so the initial General snapshot cannot
     # satisfy the settle check before the sidebar switch completes.
     # About is page 6 since the two shortcut pages merged into one.
-    if candidate and candidate.get("views") and candidate.get("selected_sidebar") == 6:
+    if candidate and candidate.get("views") and candidate.get("selected_sidebar_name") == "about":
         if candidate.get("seq") == last_seq:
             stable_reads += 1
             if stable_reads >= SETTLE_READS:
@@ -130,23 +130,33 @@ def geom(node: dict) -> dict:
 def roots(name: str) -> list[dict]:
     return [n for n in views if n["root"] == name]
 
+def root_of(page, kind="sidebar"):
+    # The view-root name for a page NAME, from the app's own derived map.
+    # The sidebar position is deliberately not written here: the app publishes settings_roots
+    # keyed by page name (derived from SETTINGS_PAGES), so reordering the table moves the root
+    # with the page instead of leaving a stale index in this script.
+    for entry in data["settings_roots"]:
+        if entry["page"] == page:
+            return entry[kind]
+    raise SystemExit("no settings_roots entry for page %r" % (page,))
+
 
 # --- 1) 侧栏高亮跟着选中页 ------------------------------------------------
 check(
-    data["selected_sidebar"] == 6,
+    data["selected_sidebar_name"] == "about",
     "the selected sidebar page is About",
-    f"selected_sidebar={data['selected_sidebar']}",
+    f"selected_sidebar_name={data['selected_sidebar_name']}",
 )
 pill = roots("sidebar_highlight")
-about_row = roots("sidebar_6_about")
-keystroke_display_row = roots("sidebar_5_keystroke_display")
-key_bindings_row = roots("sidebar_4_key_bindings")
+about_row = roots(root_of("about"))
+keystroke_display_row = roots(root_of("keystroke-display"))
+key_bindings_row = roots(root_of("key-bindings"))
 check(
     bool(key_bindings_row),
     "the sidebar carries the merged Key Bindings entry",
     f"key_bindings_row={key_bindings_row}",
 )
-general_row = roots("sidebar_0_general")
+general_row = roots(root_of("general"))
 check(
     bool(pill) and bool(about_row) and bool(keystroke_display_row) and bool(general_row),
     "all sidebar views are in the snapshot",
@@ -515,7 +525,7 @@ fi
 # are asserted on the real thing.
 mouse_state="/tmp/omt-e2e-settings-mouse.json"
 rm -f "$mouse_state" "${mouse_state%.json}.tmp"
-mouse_out="$("$repo_dir/scripts/dev-restart.sh" --open-settings=2 \
+mouse_out="$("$repo_dir/scripts/dev-restart.sh" --open-settings=mouse \
     --e2e-state="$mouse_state" --no-onboarding 2>&1)"
 echo "$mouse_out" | grep -q "^restart ok" || {
     echo "$mouse_out" | tail -20 >&2
@@ -550,7 +560,7 @@ while time.time() < deadline:
     if (
         candidate
         and candidate.get("views")
-        and candidate.get("selected_sidebar") == 2
+        and candidate.get("selected_sidebar_name") == "mouse"
         and candidate.get("settings_mouse_page_materialized")
     ):
         if candidate.get("seq") == last_seq:

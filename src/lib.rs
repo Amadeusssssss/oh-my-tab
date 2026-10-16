@@ -40,6 +40,7 @@ mod space_swipe;
 mod space_transition;
 mod theme;
 mod thumbnail;
+mod ui;
 mod ui_coordinator;
 mod update_notice;
 mod updater;

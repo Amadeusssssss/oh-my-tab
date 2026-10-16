@@ -75,10 +75,10 @@ while time.time() < deadline:
         and last.get("seq", 0) > baseline_seq
         and last.get("settings_window_visible")
     ):
-        if last.get("selected_sidebar") != 0:
+        if last.get("selected_sidebar_name") != "general":
             raise SystemExit(
                 "e2e reopen-settings: FAIL: Settings opened on an unexpected page "
-                f"({last.get('selected_sidebar')})"
+                f"({last.get('selected_sidebar_name')})"
             )
         print(
             "e2e reopen-settings: PASS: Settings visible after LaunchServices reopen "

@@ -87,13 +87,15 @@ impl SettingsPageId {
     /// refresh read one list, not two.
     pub(super) fn title_key(self) -> &'static str {
         match self {
-            SettingsPageId::General => "settings.sidebar_general",
-            SettingsPageId::Switcher => "settings.sidebar_switcher",
-            SettingsPageId::Mouse => "settings.sidebar_mouse",
-            SettingsPageId::Clipboard => "settings.sidebar_clipboard",
-            SettingsPageId::KeyBindings => "settings.sidebar_key_bindings",
-            SettingsPageId::KeystrokeDisplay => "settings.sidebar_keystroke_display",
-            SettingsPageId::About => "settings.sidebar_about",
+            SettingsPageId::General => "settings.sidebar_button(SettingsPageId::General)",
+            SettingsPageId::Switcher => "settings.sidebar_button(SettingsPageId::Switcher)",
+            SettingsPageId::Mouse => "settings.sidebar_button(SettingsPageId::Mouse)",
+            SettingsPageId::Clipboard => "settings.sidebar_button(SettingsPageId::Clipboard)",
+            SettingsPageId::KeyBindings => "settings.sidebar_button(SettingsPageId::KeyBindings)",
+            SettingsPageId::KeystrokeDisplay => {
+                "settings.sidebar_button(SettingsPageId::KeystrokeDisplay)"
+            }
+            SettingsPageId::About => "settings.sidebar_button(SettingsPageId::About)",
         }
     }
 }
@@ -374,42 +376,34 @@ static REC_TAP: LazyLock<RecTapMutex> = LazyLock::new(|| RecTapMutex(Mutex::new(
 // Holds pointers to the settings window's controls (non-modal, reused, hidden not destroyed).
 pub(super) struct SettingsUi {
     window: *mut AnyObject,
-    sidebar_general: *mut AnyObject,            // General (tag=0)
-    sidebar_switcher: *mut AnyObject,           // App switcher overlay (tag=1)
-    sidebar_mouse: *mut AnyObject,              // Mouse (tag=2)
-    sidebar_clipboard: *mut AnyObject,          // Clipboard history (tag=3)
-    sidebar_key_bindings: *mut AnyObject,       // Key bindings (tag=4)
-    sidebar_keystroke_display: *mut AnyObject,  // Keystroke display (tag=5)
-    sidebar_about: *mut AnyObject,              // About (tag=6)
     sidebar_highlight: *mut AnyObject, // NSView: selected-row highlight background (layer-backed)
-    general_view: *mut AnyObject,      // General page container
-    switcher_view: *mut AnyObject,     // App switcher page container
-    mouse_view: *mut AnyObject,        // Mouse page container
-    clipboard_view: *mut AnyObject,    // Clipboard page container
-    key_bindings_view: *mut AnyObject, // Key-bindings page container
-    keystroke_display_view: *mut AnyObject, // Keystroke-display page container
-    about_view: *mut AnyObject,        // About page container
-    about_subtitle: *mut AnyObject,    // About-page version label
-    theme: *mut AnyObject,             // NSPopUpButton: auto / light / dark
-    panel_material: *mut AnyObject,    // NSPopUpButton: liquid-glass / frost / opaque
-    glass_style: *mut AnyObject,       // NSPopUpButton: regular / clear (liquid glass only)
-    corner_radius: *mut AnyObject,     // NSTextField
-    modifier: *mut AnyObject,          // NSPopUpButton: option / command
-    locale: *mut AnyObject,            // NSPopUpButton: auto / en / zh-Hans / zh-Hant
-    show_minimized: *mut AnyObject,    // show minimized windows
+    /// The sidebar buttons, indexed by sidebar order. Keyed by POSITION and filled and read
+    /// through the page identity (`settings_page_index`), so adding or moving a page changes no field
+    /// list in two places -- the mapping exists once.
+    sidebar_buttons: [*mut AnyObject; SETTINGS_PAGE_COUNT],
+    /// The page scroll views, indexed the same way as `sidebar_buttons`.
+    page_views: [*mut AnyObject; SETTINGS_PAGE_COUNT],
+    about_subtitle: *mut AnyObject, // About-page version label
+    theme: *mut AnyObject,          // NSPopUpButton: auto / light / dark
+    panel_material: *mut AnyObject, // NSPopUpButton: liquid-glass / frost / opaque
+    glass_style: *mut AnyObject,    // NSPopUpButton: regular / clear (liquid glass only)
+    corner_radius: *mut AnyObject,  // NSTextField
+    modifier: *mut AnyObject,       // NSPopUpButton: option / command
+    locale: *mut AnyObject,         // NSPopUpButton: auto / en / zh-Hans / zh-Hant
+    show_minimized: *mut AnyObject, // show minimized windows
     show_hidden_app_windows: *mut AnyObject, // show hidden-app windows
     show_other_desktops: *mut AnyObject, // show windows on other macOS desktops (Spaces)
     thumbnails_enabled: *mut AnyObject, // window display mode
     focused_thumbnail_prewarm: *mut AnyObject, // focused thumbnail prewarm
     show_app_name_in_cards: *mut AnyObject, // app name in card titles
-    thumbnail_size: *mut AnyObject,    // NSPopUpButton: auto / 120% / ... / 75%
-    card_text_size: *mut AnyObject,    // card text size
+    thumbnail_size: *mut AnyObject, // NSPopUpButton: auto / 120% / ... / 75%
+    card_text_size: *mut AnyObject, // card text size
     card_text_size_value_label: *mut AnyObject, // card text-size value
     status_bar_text_size: *mut AnyObject, // footer text size
     status_bar_text_size_value_label: *mut AnyObject, // footer text-size value
-    windows_enabled: *mut AnyObject,   // app-switcher master switch
-    overlay_position: *mut AnyObject,  // overlay position (follow active window / main screen)
-    activation_mode: *mut AnyObject,   // activation mode (hover / click)
+    windows_enabled: *mut AnyObject, // app-switcher master switch
+    overlay_position: *mut AnyObject, // overlay position (follow active window / main screen)
+    activation_mode: *mut AnyObject, // activation mode (hover / click)
     // In-overlay action keys (Cmd+W / M / H / Q on the highlighted card); all default off.
     panel_close_enabled: *mut AnyObject,
     panel_minimize_enabled: *mut AnyObject,
@@ -522,6 +516,18 @@ pub(super) struct SettingsUi {
     /// The About page's keychain-access row: its status label and its "grant access" button.
     keychain_access_status: *mut AnyObject,
     keychain_access_button: *mut AnyObject,
+}
+
+impl SettingsUi {
+    /// The sidebar button for a page, or null when the window is not built yet.
+    pub(super) fn sidebar_button(&self, page: SettingsPageId) -> *mut AnyObject {
+        self.sidebar_buttons[settings_page_index(page)]
+    }
+
+    /// The page scroll view for a page, or null when the page has not been built yet.
+    pub(super) fn page_view(&self, page: SettingsPageId) -> *mut AnyObject {
+        self.page_views[settings_page_index(page)]
+    }
 }
 
 /// One button-mapping row (read-only display):
@@ -678,7 +684,7 @@ pub(crate) fn refresh_permission_restart_state() {
 
 unsafe fn set_about_sidebar_indicator(ui: &SettingsUi) {
     widgets::set_sidebar_update_indicator(
-        ui.sidebar_about,
+        ui.sidebar_button(SettingsPageId::About),
         UPDATE_AVAILABLE.load(Ordering::SeqCst) || crate::restart::restart_required(),
     );
 }
@@ -894,7 +900,7 @@ fn start_inline_update_check() {
 pub(crate) fn page_reserved_now() -> f64 {
     let scroll = with_settings_ui(|ui| {
         ui.as_ref()
-            .map(|ui| ui.about_view)
+            .map(|ui| ui.page_view(SettingsPageId::About))
             .unwrap_or(std::ptr::null_mut())
     });
     if scroll.is_null() {
@@ -906,7 +912,7 @@ pub(crate) fn page_reserved_now() -> f64 {
 pub(crate) fn resync_page_layout_for_scroller() {
     let scroll = with_settings_ui(|ui| {
         ui.as_ref()
-            .map(|ui| ui.about_view)
+            .map(|ui| ui.page_view(SettingsPageId::About))
             .unwrap_or(std::ptr::null_mut())
     });
     if scroll.is_null() {
@@ -942,6 +948,37 @@ pub(crate) fn e2e_view_roots() -> Vec<(String, *mut AnyObject)> {
         }
         None => Vec::new(),
     })
+}
+
+/// A2 E2E: the selected sidebar page's stable NAME, so a scenario asserts the page it means
+/// rather than a sidebar position. The position is derived from SETTINGS_PAGES and moves when the
+/// table is reordered; the name does not.
+pub(crate) fn e2e_selected_sidebar_name() -> &'static str {
+    settings_page_name(e2e_selected_sidebar())
+}
+
+/// A2 E2E: the page the settings window was last ordered front on, by name (None if it never was
+/// presented). Same reasoning as e2e_selected_sidebar_name: the historic-first-frame semantics are
+/// unchanged, only the spelling is stable.
+pub(crate) fn e2e_presented_page_name() -> Option<&'static str> {
+    e2e_presented_page().map(settings_page_name)
+}
+
+/// A2 E2E: the view-root names keyed by page NAME -- (name, sidebar_root, page_root). A scenario
+/// addresses a page's root by name and never writes the sidebar position into a script. The
+/// strings still carry the index because the app builds them that way; this map is what keeps a
+/// reorder from leaving a stale index behind in a scenario.
+pub(crate) fn e2e_root_names_by_page() -> Vec<(&'static str, String, String)> {
+    let (sidebar, page) = view_root_names();
+    (0..SETTINGS_PAGE_COUNT)
+        .map(|index| {
+            (
+                settings_page_name(index),
+                sidebar[index].clone(),
+                page[index].clone(),
+            )
+        })
+        .collect()
 }
 
 /// A2 E2E: the currently selected sidebar page index.
@@ -1005,7 +1042,7 @@ pub(crate) fn open_about_updates() {
     unsafe {
         with_settings_ui(|ui| {
             if let Some(u) = ui.as_ref() {
-                scroll_page_to_top(u.about_view);
+                scroll_page_to_top(u.page_view(SettingsPageId::About));
             }
         });
     }
@@ -1054,7 +1091,7 @@ pub(crate) fn expand_update_section(window_h: f64) {
                 setFrameSize: NSSize::new(host_frame.size.width, window_h)
             ];
             let _: () = msg_send![ui.window, layoutIfNeeded];
-            debug_validate_settings_page(ui.about_view, "about-expanded");
+            debug_validate_settings_page(ui.page_view(SettingsPageId::About), "about-expanded");
         }
     });
 }
@@ -2383,17 +2420,36 @@ mod tests {
             .chain(page.iter())
             .map(String::as_str)
             .collect();
-        // The spellings the A2 scripts already assert (settings-layout.sh / scrollbar-style-flip.sh).
+        // Asserted through the name-keyed map the scripts actually read, not a hand-written list: a
+        // page reorder moves the strings AND the map together, so this cannot pass while a script's
+        // lookup would break. Every published root is one of the derived strings.
+        for (index, (name, sidebar_root, page_root)) in
+            super::e2e_root_names_by_page().into_iter().enumerate()
+        {
+            assert_eq!(name, super::settings_page_name(index));
+            assert_eq!(sidebar_root, sidebar[index]);
+            assert_eq!(page_root, page[index]);
+            let stem = name.replace('-', "_");
+            assert_eq!(sidebar_root, format!("sidebar_{index}_{stem}"));
+            assert_eq!(page_root, format!("page_{index}_{stem}"));
+            assert!(roots.contains(&sidebar_root.as_str()));
+            assert!(roots.contains(&page_root.as_str()));
+        }
+        // The pages the A2 scripts anchor on must be published by NAME, so a reorder cannot drop one
+        // silently.
         for expected in [
-            "sidebar_0_general",
-            "sidebar_4_key_bindings",
-            "sidebar_5_keystroke_display",
-            "sidebar_6_about",
-            "page_0_general",
-            "page_2_mouse",
-            "page_6_about",
+            "general",
+            "mouse",
+            "key-bindings",
+            "keystroke-display",
+            "about",
         ] {
-            assert!(roots.contains(&expected), "{expected} is missing");
+            assert!(
+                super::e2e_root_names_by_page()
+                    .iter()
+                    .any(|(name, _, _)| *name == expected),
+                "no published root for page {expected}"
+            );
         }
     }
 

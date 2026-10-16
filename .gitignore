@@ -9,3 +9,6 @@ dist/
 
 # Independent-review state and evidence (scripts/codex-review.sh).
 .agent-review/
+
+# Python bytecode from the e2e helper library (scripts/e2e/lib).
+__pycache__/

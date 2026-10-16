@@ -81,6 +81,9 @@ pub(crate) fn e2e_geometry() -> Option<E2ePanelGeometry> {
 pub(crate) fn show_for_development() {
     crate::debug_assert_main_thread();
     start();
+    // Hold the panel open for the scenario's pointer gesture: without this it fades 1.8s after
+    // the seeded key below, which is correct behaviour but removes the control under test.
+    STATE.with(|state| state.borrow_mut().set_hold_open(true));
     let now = Instant::now();
     let mode =
         DisplayMode::from_config(&crate::config::CONFIG.read().unwrap().keystroke_display.mode);
@@ -323,13 +326,6 @@ fn process_tick() -> bool {
                 config.max_extent_percent,
             );
             changed |= state.trim_to_extent(budget, orientation);
-            // Development only (--show-keystroke-display): hold the panel open so an A2 scenario can
-            // click its settings gear. Without this the panel fades 1.8s after the seeded key, which
-            // is correct behaviour but removes the control under test. A normal launch never sets
-            // the flag, so shipped behaviour is unchanged.
-            if crate::dev_flags::present("show-keystroke-display") {
-                state.freeze_idle_deadline();
-            }
         }
         (
             state.badges().to_vec(),
@@ -393,7 +389,10 @@ pub(crate) fn process_tick_for_test() -> bool {
 fn reset_on_main() {
     crate::debug_assert_main_thread();
     panel::reset();
-    STATE.with(|state| *state.borrow_mut() = StateMachine::default());
+    // The development hold-open mode is a property of the launch, so a reset re-seeds it rather
+    // than dropping it (see StateMachine::reset_for_launch).
+    let hold_open = crate::dev_flags::present("show-keystroke-display");
+    STATE.with(|state| state.borrow_mut().reset_for_launch(hold_open));
     PANEL_HOVER.with(|hover| hover.borrow_mut().reset());
     if crate::e2e_state::is_enabled() {
         crate::e2e_state::record("keystroke_display");

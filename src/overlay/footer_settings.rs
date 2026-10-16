@@ -25,8 +25,8 @@ use std::sync::OnceLock;
 
 use super::*;
 use crate::ffi::{
-    class_addMethod, hex_to_cg_color, layer_set_background, make_nsstring, objc_allocateClassPair,
-    objc_registerClassPair, release_obj, CFRelease,
+    class_addMethod, make_nsstring, objc_allocateClassPair, objc_registerClassPair, release_obj,
+    CFRelease,
 };
 use crate::ffi::{MainThreadSlot, StaticClass};
 
@@ -96,16 +96,9 @@ extern "C" fn footer_settings_mouse_down(_self: *mut c_void, _cmd: Sel, event: *
     crate::callback_guard::void("footer_settings_mouse_down", || unsafe {
         arm();
         set_footer_settings_style(_self as *mut AnyObject, true);
-        // NSButton's own mouseDown: runs the highlight/press tracking loop. Overriding it without
-        // calling super replaced that loop entirely, so the button never tracked the press and
-        // never dispatched its action -- it looked right and did nothing when clicked.
-        type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
-        let call: MouseDown = std::mem::transmute(objc_msgSendSuper as *const ());
-        call(&mut sup, sel!(mouseDown:), event);
+        // NSButton's own mouseDown: runs the highlight/press tracking loop without which the button
+        // never tracks the press and never dispatches its action.
+        crate::ui::corner_glyph::call_super_mouse_down(_self, sel!(mouseDown:), event);
     });
 }
 
@@ -128,25 +121,9 @@ extern "C" fn footer_settings_exited(_self: *mut c_void, _cmd: Sel, _event: *mut
 /// faint wash. It never borrows the close button's destructive red -- that colour says "this
 /// destroys something", and opening settings destroys nothing.
 pub(crate) unsafe fn set_footer_settings_style(button: *mut AnyObject, hovered: bool) {
-    if button.is_null() {
-        return;
-    }
-    let palette = ui_palette();
-    let (tint, role) = if hovered {
-        (palette.primary_text, crate::glass::PanelInk::Primary)
-    } else {
-        (palette.secondary_text, crate::glass::PanelInk::Secondary)
-    };
-    let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if !layer.is_null() {
-        let background = if hovered {
-            palette.hover_bg
-        } else {
-            0x00000000
-        };
-        layer_set_background(layer, hex_to_cg_color(background));
-    }
+    // The shared corner-glyph recipe, so this gear paints the same wash as the picker and the
+    // keystroke panel. It used the raw hover token, which omits the per-mode alpha tuning.
+    crate::ui::corner_glyph::set_glyph_button_style(button, ui_palette(), hovered);
 }
 
 /// The gear's frame inside the panel: the trailing corner of the footer band, the corner-safe inset
@@ -234,12 +211,7 @@ pub(crate) fn refresh_localized_strings() {
         return;
     };
     unsafe {
-        let label = make_nsstring(&crate::i18n::t("overlay.open_settings"));
-        let _: () = msg_send![button.0, setAccessibilityLabel: label];
-        CFRelease(label as *const c_void);
-        let tooltip = make_nsstring(&crate::i18n::t("overlay.open_settings"));
-        let _: () = msg_send![button.0, setToolTip: tooltip];
-        CFRelease(tooltip as *const c_void);
+        crate::ui::corner_glyph::refresh_glyph_button_strings(button.0, "overlay.open_settings");
     }
 }
 

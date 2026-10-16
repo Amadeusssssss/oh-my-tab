@@ -541,27 +541,10 @@ fn panel_hover_wash_for(palette: crate::theme::UiPalette) -> u32 {
 /// neutral ink that darkens with the same wash the text actions use, never the close button's
 /// destructive red. See the corner-glyph-button exception in `docs/design-style-en.md` §10.
 pub(super) unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: bool) {
-    if button.is_null() {
-        return;
-    }
-    let palette = clipboard_palette();
-    // Panel ink, not a raw palette colour: on frost the material decides the ink (same reason the
-    // filter pills route through `panel_ink`).
-    let (tint, role) = if hovered {
-        (palette.primary_text, crate::glass::PanelInk::Primary)
-    } else {
-        (palette.secondary_text, crate::glass::PanelInk::Secondary)
-    };
-    let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if !layer.is_null() {
-        let background = if hovered {
-            panel_hover_wash()
-        } else {
-            0x00000000
-        };
-        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-    }
+    // The shared corner-glyph recipe. The picker already applied the mode-tuned wash (its own
+    // panel_hover_wash, numerically the same value); routing all three through one function is what
+    // makes them provably one family rather than three copies that happen to agree.
+    crate::ui::corner_glyph::set_glyph_button_style(button, clipboard_palette(), hovered);
 }
 
 /// The header's pin button. It is the corner row's third glyph and keeps that family - no bezel,
@@ -875,13 +858,8 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *m
             set_settings_button_style(button, true);
         }
 
-        type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
-        let call: MouseDown = std::mem::transmute(objc_msgSendSuper as *const ());
-        call(&mut sup, sel!(mouseDown:), event);
+        // NSButton's own mouseDown: runs the highlight/press tracking loop (the shared trampoline).
+        crate::ui::corner_glyph::call_super_mouse_down(_self, sel!(mouseDown:), event);
 
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(button, true);

@@ -5,31 +5,15 @@ use crate::clipboard::{
     record_applied_about_status, record_applied_action, AppliedAction, NoticeSurface,
 };
 
-/// The sidebar buttons, indexed by sidebar order. The order is `SETTINGS_PAGES`; the identity
-/// chooses the control, so the two cannot drift.
+/// The sidebar buttons, indexed by sidebar order. The slots are stored in that order, so this is
+/// the array itself -- there is no second per-page mapping left to drift from it.
 pub(super) fn sidebar_buttons(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
-    settings_page_ids().map(|page| match page {
-        SettingsPageId::General => ui.sidebar_general,
-        SettingsPageId::Switcher => ui.sidebar_switcher,
-        SettingsPageId::Mouse => ui.sidebar_mouse,
-        SettingsPageId::Clipboard => ui.sidebar_clipboard,
-        SettingsPageId::KeyBindings => ui.sidebar_key_bindings,
-        SettingsPageId::KeystrokeDisplay => ui.sidebar_keystroke_display,
-        SettingsPageId::About => ui.sidebar_about,
-    })
+    ui.sidebar_buttons
 }
 
 /// The page scroll views, indexed by sidebar order. Same rule as [`sidebar_buttons`].
 pub(super) fn page_scroll_views(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
-    settings_page_ids().map(|page| match page {
-        SettingsPageId::General => ui.general_view,
-        SettingsPageId::Switcher => ui.switcher_view,
-        SettingsPageId::Mouse => ui.mouse_view,
-        SettingsPageId::Clipboard => ui.clipboard_view,
-        SettingsPageId::KeyBindings => ui.key_bindings_view,
-        SettingsPageId::KeystrokeDisplay => ui.keystroke_display_view,
-        SettingsPageId::About => ui.about_view,
-    })
+    ui.page_views
 }
 
 /// Which warning a page's top strip carries.
@@ -161,7 +145,7 @@ pub(super) unsafe fn refresh_settings_warning_banner(ui: &SettingsUi) {
     // adjusting whichever page was showing) keeps this idempotent: a page switch cannot leave one
     // page short and another long. The full height comes from the pages' parent, which is live:
     // a window resize must not be undone by the next refresh.
-    let parent: *mut AnyObject = msg_send![ui.general_view, superview];
+    let parent: *mut AnyObject = msg_send![ui.page_view(SettingsPageId::General), superview];
     let base_h = if parent.is_null() {
         ui.page_viewport_h
     } else {
@@ -816,7 +800,7 @@ fn show_settings_inner(
                 } else {
                     // Scroll the visible page (General on open) to the top after layout, so the
                     // scrollbar starts at the top of the track instead of the middle.
-                    scroll_page_to_top(u.general_view);
+                    scroll_page_to_top(u.page_view(SettingsPageId::General));
                 }
                 refresh_settings_warning_banner(u);
             }
@@ -974,7 +958,7 @@ struct AboutPanelSnapshot {
 unsafe fn about_panel_snapshot() -> Option<AboutPanelSnapshot> {
     with_settings_ui(|ui| {
         let ui = ui.as_ref()?;
-        let document: *mut AnyObject = msg_send![ui.about_view, documentView];
+        let document: *mut AnyObject = msg_send![ui.page_view(SettingsPageId::About), documentView];
         if document.is_null() {
             return None;
         }
@@ -1321,7 +1305,7 @@ unsafe fn update_card_inside_document() -> bool {
         let Some(ui) = ui.as_ref() else {
             return false;
         };
-        let document: *mut AnyObject = msg_send![ui.about_view, documentView];
+        let document: *mut AnyObject = msg_send![ui.page_view(SettingsPageId::About), documentView];
         if document.is_null() {
             return false;
         }
@@ -1409,7 +1393,7 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
         if ui.update_card.is_null() || ui.update_host.is_null() || ui.update_divider.is_null() {
             return None;
         }
-        let document: *mut AnyObject = msg_send![ui.about_view, documentView];
+        let document: *mut AnyObject = msg_send![ui.page_view(SettingsPageId::About), documentView];
         let doc_frame: NSRect = msg_send![document, frame];
         // The canvas sets a card's frame to its visible rect, so `origin.y` is the card's bottom.
         let card: NSRect = msg_send![ui.update_card, frame];
@@ -1504,7 +1488,8 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             let Some(ui) = ui.as_ref() else {
                 return false;
             };
-            let sidebar_content: *mut AnyObject = msg_send![ui.sidebar_general, superview];
+            let sidebar_content: *mut AnyObject =
+                msg_send![ui.sidebar_button(SettingsPageId::General), superview];
             !sidebar_content.is_null() && !settings_sidebar_has_redundant_heading(sidebar_content)
         });
         if !sidebar_heading_absent {
@@ -2179,7 +2164,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         let states = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let keystroke_page_document: *mut AnyObject =
-                msg_send![ui.keystroke_display_view, documentView];
+                msg_send![ui.page_view(SettingsPageId::KeystrokeDisplay), documentView];
             let controls_on_keystroke_page = [
                 ui.keystroke_display_enabled,
                 ui.keystroke_display_mode,
@@ -2439,7 +2424,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
             let previous: NSRect = msg_send![ui.clipboard_delete_after_paste, frame];
             let next: NSRect = msg_send![ui.clipboard_max_entries, frame];
             let auto_expire: NSRect = msg_send![ui.clipboard_auto_expire_days, frame];
-            let document: *mut AnyObject = msg_send![ui.clipboard_view, documentView];
+            let document: *mut AnyObject =
+                msg_send![ui.page_view(SettingsPageId::Clipboard), documentView];
             let document_height: NSRect = msg_send![document, frame];
             Some((previous, next, auto_expire, document_height.size.height))
         });
@@ -2472,7 +2458,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
                 msg_send![ui.clipboard_clear_system_pasteboard_after_paste, isHidden];
             let next: NSRect = msg_send![ui.clipboard_max_entries, frame];
             let auto_expire: NSRect = msg_send![ui.clipboard_auto_expire_days, frame];
-            let document: *mut AnyObject = msg_send![ui.clipboard_view, documentView];
+            let document: *mut AnyObject =
+                msg_send![ui.page_view(SettingsPageId::Clipboard), documentView];
             let document_height: NSRect = msg_send![document, frame];
             Some((
                 previous,
@@ -2562,7 +2549,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         select_sidebar(2);
         let mouse_before = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
-            let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
+            let document: *mut AnyObject =
+                msg_send![ui.page_view(SettingsPageId::Mouse), documentView];
             let document_frame: NSRect = msg_send![document, frame];
             Some((
                 document_frame.size.height,
@@ -2587,7 +2575,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         });
         let mouse_collapsed = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
-            let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
+            let document: *mut AnyObject =
+                msg_send![ui.page_view(SettingsPageId::Mouse), documentView];
             let document_frame: NSRect = msg_send![document, frame];
             let line_hidden: bool = msg_send![ui.line_count, isHidden];
             let pointer_hidden: bool = msg_send![ui.pointer_accel_slider, isHidden];
@@ -2602,7 +2591,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         });
         let mouse_after_upper = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
-            let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
+            let document: *mut AnyObject =
+                msg_send![ui.page_view(SettingsPageId::Mouse), documentView];
             let document_frame: NSRect = msg_send![document, frame];
             let line_hidden: bool = msg_send![ui.line_count, isHidden];
             let pointer_hidden: bool = msg_send![ui.pointer_accel_slider, isHidden];
@@ -2633,7 +2623,8 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         });
         let mouse_document_restored = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
-            let document: *mut AnyObject = msg_send![ui.mouse_view, documentView];
+            let document: *mut AnyObject =
+                msg_send![ui.page_view(SettingsPageId::Mouse), documentView];
             let document_frame: NSRect = msg_send![document, frame];
             let line_hidden: bool = msg_send![ui.line_count, isHidden];
             let pointer_hidden: bool = msg_send![ui.pointer_accel_slider, isHidden];
@@ -2862,21 +2853,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             permission_warning_button: std::ptr::null_mut(),
             page_viewport_h,
             window,
-            sidebar_general: std::ptr::null_mut(),
-            sidebar_switcher: std::ptr::null_mut(),
-            sidebar_mouse: std::ptr::null_mut(),
-            sidebar_clipboard: std::ptr::null_mut(),
-            sidebar_key_bindings: std::ptr::null_mut(),
-            sidebar_keystroke_display: std::ptr::null_mut(),
-            sidebar_about: std::ptr::null_mut(),
             sidebar_highlight: std::ptr::null_mut(),
-            general_view: std::ptr::null_mut(),
-            switcher_view: std::ptr::null_mut(),
-            mouse_view: std::ptr::null_mut(),
-            clipboard_view: std::ptr::null_mut(),
-            key_bindings_view: std::ptr::null_mut(),
-            keystroke_display_view: std::ptr::null_mut(),
-            about_view: std::ptr::null_mut(),
+            sidebar_buttons: [std::ptr::null_mut(); SETTINGS_PAGE_COUNT],
+            page_views: [std::ptr::null_mut(); SETTINGS_PAGE_COUNT],
             about_subtitle: std::ptr::null_mut(),
             accessibility_permission_status: std::ptr::null_mut(),
             accessibility_permission_button: std::ptr::null_mut(),
@@ -3082,15 +3061,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             );
             page_roots[index] = built.scroll;
             page_documents[index] = built.document;
-            match page {
-                SettingsPageId::General => ui.general_view = built.scroll,
-                SettingsPageId::Switcher => ui.switcher_view = built.scroll,
-                SettingsPageId::Mouse => ui.mouse_view = built.scroll,
-                SettingsPageId::Clipboard => ui.clipboard_view = built.scroll,
-                SettingsPageId::KeyBindings => ui.key_bindings_view = built.scroll,
-                SettingsPageId::KeystrokeDisplay => ui.keystroke_display_view = built.scroll,
-                SettingsPageId::About => ui.about_view = built.scroll,
-            }
+            ui.page_views[settings_page_index(page)] = built.scroll;
         }
         // Record this page's measured footprint for the next build (0 = overlay).
         crate::scroller::note_reserved(crate::scroller::reserved_width(

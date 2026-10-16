@@ -1527,10 +1527,7 @@ pub(super) extern "C" fn toggle_panel_pin(_self: *mut c_void, _cmd: Sel, _sender
             // the panel), so a pin that cannot arm it is refused outright rather than left in a state
             // it cannot honour.
             if !sync_outside_click_monitor() {
-                super::forget_pin();
-                refresh_pin_button();
-                crate::menu::refresh_clipboard_pin_item();
-                show_toast(&t("clipboard.toast_pin_unavailable"));
+                refuse_pin_unavailable();
                 return;
             }
             apply_pin_window_properties();
@@ -1539,6 +1536,17 @@ pub(super) extern "C" fn toggle_panel_pin(_self: *mut c_void, _cmd: Sel, _sender
         // The menu item mirrors the pin, so the two surfaces cannot drift apart.
         crate::menu::refresh_clipboard_pin_item();
     });
+}
+
+/// Refuse a pin whose click monitor could not be armed. The monitor is what makes unpinning
+/// meaningful -- the next outside click closes the panel -- so a pin that cannot arm it is undone
+/// outright rather than left in a state the panel cannot honour. Shared by the corner button and
+/// the menu-bar action so the two surfaces cannot drift apart in what they undo or say.
+pub(super) unsafe fn refuse_pin_unavailable() {
+    super::forget_pin();
+    refresh_pin_button();
+    crate::menu::refresh_clipboard_pin_item();
+    show_toast(&t("clipboard.toast_pin_unavailable"));
 }
 
 /// Reflect the pin on the corner button.

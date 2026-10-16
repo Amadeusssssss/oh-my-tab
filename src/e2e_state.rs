@@ -980,18 +980,6 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     // padded rect the shadow needs. An A2 scenario that measures the shadow's outer tail needs the window's
     // edge, and one that measures the outline or the panel's interior needs the panel's -- reporting both is
     // what keeps the two measurements from being taken against the wrong rect.
-    // The switcher footer's settings gear: its rect in the panel's own points (AppKit bottom-left
-    // origin) plus whether it clears the status text. AX cannot express a subview's frame, so the
-    // app states it; the A2 scenario asserts the click target really is where the panel says.
-    json.push_str(&format!(
-        "  \"switcher_footer_settings\": {},\n",
-        match crate::overlay::footer_settings_rect_for_e2e() {
-            Some((x, y, w, h, clear)) => format!(
-                "{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}, \"clears_text\": {clear}}}"
-            ),
-            None => "null".to_string(),
-        }
-    ));
     json.push_str(&format!(
         "  \"clipboard_picker_window\": {},\n",
         match crate::clipboard::picker_window_frame_top_left() {
@@ -1314,6 +1302,30 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"selected_sidebar\": {},\n",
         crate::settings::e2e_selected_sidebar()
     ));
+    // The same selection by its stable page name: a scenario asserts the page it means, and the
+    // position (which SETTINGS_PAGES can reorder) stops being written into scripts.
+    json.push_str(&format!(
+        "  \"selected_sidebar_name\": {},\n",
+        json_string(crate::settings::e2e_selected_sidebar_name())
+    ));
+    // The view roots keyed by page name, derived from the same table the app builds them from.
+    json.push_str("  \"settings_roots\": [");
+    for (index, (name, sidebar_root, page_root)) in crate::settings::e2e_root_names_by_page()
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            "\n    {{\"page\": {}, \"sidebar\": {}, \"root\": {}}}",
+            json_string(name),
+            json_string(&sidebar_root),
+            json_string(&page_root)
+        ));
+    }
+    json.push(']');
+    json.push(',');
     // The page the settings window was on when it was last ordered front: `selected_sidebar` alone cannot
     // tell "opened on the clipboard page" from "opened on General and then switched", because the two
     // selections happen inside one run-loop turn.
@@ -1395,6 +1407,10 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     json.push_str(&format!(
         "  \"settings_presented_page\": {},\n",
         presented_page.map_or("null".to_string(), |page| page.to_string())
+    ));
+    json.push_str(&format!(
+        "  \"settings_presented_page_name\": {},\n",
+        crate::settings::e2e_presented_page_name().map_or("null".to_string(), json_string)
     ));
     json.push_str("  \"pages\": [");
     for (index, page) in collect_pages().iter().enumerate() {

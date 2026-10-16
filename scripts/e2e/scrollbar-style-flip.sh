@@ -124,7 +124,8 @@ def observe(label: str) -> dict:
     data = frame()
     if not data:
         raise SystemExit(f"e2e scrollbar-style-flip: FAIL: no geometry frame after {label}")
-    page = next((entry for entry in data["pages"] if entry["root"] == "page_6_about"), None)
+    about_root = next(e["root"] for e in data["settings_roots"] if e["page"] == "about")
+    page = next((entry for entry in data["pages"] if entry["root"] == "about_root"), None)
     if page is None:
         raise SystemExit(f"e2e scrollbar-style-flip: FAIL: About page missing after {label}")
     return {
@@ -135,7 +136,7 @@ def observe(label: str) -> dict:
         "switches": [
             (round(n["frame"][2], 1), round(n["frame"][3], 1))
             for n in data["views"]
-            if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
+            if n["root"] == about_root and n["class"] == "OhMyTabHtmlSwitch"
         ],
         "content_right": content_right_edge(data),
     }
@@ -149,7 +150,7 @@ def content_right_edge(data: dict) -> float:
     views = data["views"]
     edges = []
     for node in views:
-        if node["root"] != "page_6_about":
+        if node["root"] != about_root:
             continue
         if node["class"] == "NSButtonTextField":
             parent = views[node["parent"]]

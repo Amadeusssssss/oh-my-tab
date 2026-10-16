@@ -23,7 +23,7 @@ use crate::ffi::{
     AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetType, AXValueGetValue, CFRelease,
     CFStringCreateWithCString, CGRect,
 };
-use crate::ffi::{objc_msgSendSuper, MainThreadSlot, ObjcSuper, StaticClass};
+use crate::ffi::{MainThreadSlot, StaticClass};
 
 /// Panel extent across the stream: one badge plus this padding on each side (34 + 2*10).
 const PANEL_H: f64 = 54.0;
@@ -1467,6 +1467,40 @@ pub(super) fn smoke_runner() -> bool {
                 return false;
             }
         }
+        // The gear paints the SHARED corner-glyph wash when hovered and is transparent when not --
+        // compared against the value the shared function computes, not merely against "something
+        // different". The RGB-only reader is included as a documented counter-example: it accepts the
+        // raw palette fill (whose RGB is identical to the wash), which is why the RGBA reader exists.
+        let palette = crate::theme::ui_palette();
+        let shared = crate::ui::corner_glyph::hover_wash(palette);
+        let raw = palette.hover_bg;
+        let layer: *mut AnyObject = unsafe { msg_send![settings_view, layer] };
+        unsafe { set_settings_button_style(settings_view, true) };
+        if !unsafe { layer_background_matches_rgba(layer, shared) } {
+            eprintln!("[keystroke-display-smoke] the gear did not paint the shared hover wash");
+            return false;
+        }
+        unsafe { set_settings_button_style(settings_view, false) };
+        if !unsafe { layer_background_matches_rgba(layer, 0x0000_0000) } {
+            eprintln!("[keystroke-display-smoke] the gear is not transparent when not hovered");
+            return false;
+        }
+        // The counter-example: paint the raw fill and require the RGB-only reader to accept it while
+        // the RGBA reader rejects it. Then restore the shared wash, leaving the panel normal.
+        unsafe { crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(raw)) };
+        if raw & 0xFFFF_FF00 != shared & 0xFFFF_FF00 {
+            eprintln!("[keystroke-display-smoke] the counter-example is not RGB-identical");
+            return false;
+        }
+        if !unsafe { layer_background_matches(layer, shared) } {
+            eprintln!("[keystroke-display-smoke] the RGB-only reader should be blind to the raw alpha");
+            return false;
+        }
+        if unsafe { layer_background_matches_rgba(layer, shared) } {
+            eprintln!("[keystroke-display-smoke] the RGBA reader accepted the raw fill; it cannot decide");
+            return false;
+        }
+        unsafe { set_settings_button_style(settings_view, false) };
         true
     })
     }
@@ -2220,16 +2254,9 @@ extern "C" fn settings_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_v
     crate::callback_guard::void("settings_mouse_down", || unsafe {
         PANEL.with(|panel| panel.borrow_mut().settings_armed = true);
         set_settings_button_style(_self as *mut AnyObject, true);
-        // NSButton's own mouseDown: runs the highlight/press tracking loop. Overriding it without
-        // calling super replaced that loop entirely, so the button never tracked the press and
-        // never dispatched its action -- it looked right and did nothing when clicked.
-        type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
-        let call: MouseDown = std::mem::transmute(objc_msgSendSuper as *const ());
-        call(&mut sup, sel!(mouseDown:), event);
+        // NSButton's own mouseDown: runs the highlight/press tracking loop without which the button
+        // never tracks the press and never dispatches its action.
+        crate::ui::corner_glyph::call_super_mouse_down(_self, sel!(mouseDown:), event);
     });
 }
 
@@ -2324,12 +2351,10 @@ pub(crate) unsafe fn refresh_cached_controls() {
         let Some(button) = state.settings_view else {
             return;
         };
-        let label = make_nsstring(&crate::i18n::t("keystroke_display.open_settings"));
-        let _: () = msg_send![button, setAccessibilityLabel: label];
-        CFRelease(label as *const c_void);
-        let tooltip = make_nsstring(&crate::i18n::t("keystroke_display.open_settings"));
-        let _: () = msg_send![button, setToolTip: tooltip];
-        CFRelease(tooltip as *const c_void);
+        crate::ui::corner_glyph::refresh_glyph_button_strings(
+            button,
+            "keystroke_display.open_settings",
+        );
         set_settings_button_style(button, false);
     });
 }
@@ -2337,25 +2362,8 @@ pub(crate) unsafe fn refresh_cached_controls() {
 /// Normal/hover for the HUD's settings gear: a neutral ink over one faint wash, matching the other
 /// floating panels' corner glyph buttons.
 unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: bool) {
-    if button.is_null() {
-        return;
-    }
-    let palette = crate::theme::ui_palette();
-    let (tint, role) = if hovered {
-        (palette.primary_text, crate::glass::PanelInk::Primary)
-    } else {
-        (palette.secondary_text, crate::glass::PanelInk::Secondary)
-    };
-    let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if !layer.is_null() {
-        let background = if hovered {
-            palette.hover_bg
-        } else {
-            0x00000000
-        };
-        layer_set_background(layer, hex_to_cg_color(background));
-    }
+    // The shared corner-glyph recipe (was the raw hover token, which omits the per-mode tuning).
+    crate::ui::corner_glyph::set_glyph_button_style(button, crate::theme::ui_palette(), hovered);
 }
 
 /// Build the HUD's settings gear. Returns a +1 reference; the caller adds it to the backdrop and
@@ -2527,21 +2535,42 @@ pub(super) const HEAD_STREAM_RESERVE: f64 = HEAD_GRIP_RESERVE + GRIP_STREAM_GAP;
 pub(super) const STREAM_BUDGET_DEDUCTION: f64 =
     HEAD_STREAM_RESERVE + TAIL_SETTINGS_RESERVE - PANEL_SIDE_PADDING * 2.0;
 
+/// The corner-safe inset for the gear on the stream's trailing edge, in the direction that
+/// edge faces: horizontal for a row, vertical for a column.
+///
+/// A column's trailing edge is the bottom, so the frame is the row's rotated 90 degrees: the
+/// panel's width becomes the extent the control is centred ACROSS. That cross extent is what the
+/// [`crate::theme::footer_control_inset`]'s `band_h` argument means, so passing the panel's height
+/// (the flow extent) there collapses the centring term and silently moves the control. A panel has
+/// no separate footer band, unlike the switcher's overlay, which is why the rotation is adapted
+/// here instead of widening the shared function.
+fn trailing_edge_inset(orientation: Orientation, panel_size: NSSize, control: f64) -> f64 {
+    let radius = crate::glass::PANEL_CORNER_RADIUS;
+    if orientation.is_vertical() {
+        crate::theme::footer_control_inset(
+            radius,
+            panel_size.height,
+            panel_size.width,
+            control,
+            panel_size.width,
+        )
+    } else {
+        crate::theme::footer_control_inset(
+            radius,
+            panel_size.width,
+            panel_size.height,
+            control,
+            panel_size.height,
+        )
+    }
+}
+
 /// Where the settings button sits inside the panel: the stream's TRAILING end -- the trailing edge
 /// of a row, the bottom of a column -- which is the corner a user reaches for.
 fn settings_button_frame(orientation: Orientation, panel_size: NSSize) -> NSRect {
-    let rx = crate::glass::PANEL_CORNER_RADIUS.min(panel_size.width / 2.0);
-    let ry = crate::glass::PANEL_CORNER_RADIUS.min(panel_size.height / 2.0);
     if orientation.is_vertical() {
         // Column: the stream runs downward, so the trailing end is the bottom edge.
-        let inset = crate::theme::footer_control_inset(
-            crate::glass::PANEL_CORNER_RADIUS,
-            panel_size.height,
-            panel_size.width,
-            SETTINGS_BTN_SIZE,
-            panel_size.height,
-        );
-        let _ = (rx, ry);
+        let inset = trailing_edge_inset(orientation, panel_size, SETTINGS_BTN_SIZE);
         let m = SETTINGS_BTN_CROSS_INSET.max(inset);
         NSRect::new(
             NSPoint::new(((panel_size.width - SETTINGS_BTN_SIZE) / 2.0).max(0.0), m),
@@ -2549,13 +2578,7 @@ fn settings_button_frame(orientation: Orientation, panel_size: NSSize) -> NSRect
         )
     } else {
         // Row: the stream runs rightward, so the trailing end is the right edge.
-        let inset = crate::theme::footer_control_inset(
-            crate::glass::PANEL_CORNER_RADIUS,
-            panel_size.width,
-            panel_size.height,
-            SETTINGS_BTN_SIZE,
-            panel_size.height,
-        );
+        let inset = trailing_edge_inset(orientation, panel_size, SETTINGS_BTN_SIZE);
         let m = SETTINGS_BTN_CROSS_INSET.max(inset);
         NSRect::new(
             NSPoint::new(
@@ -3029,6 +3052,38 @@ unsafe fn layer_background_matches(layer: *mut AnyObject, expected: u32) -> bool
     close(*components, (expected >> 24) & 0xFF)
         && close(*components.add(1), (expected >> 16) & 0xFF)
         && close(*components.add(2), (expected >> 8) & 0xFF)
+}
+
+/// Read a CALayer's background CGColor and compare RGBA, alpha included.
+///
+/// Separate from [`layer_background_matches`] rather than replacing it: every existing caller
+/// compares an opaque palette surface, where the alpha is always 1.0 and comparing it would add a
+/// false failure mode. The corner-glyph wash is the one assertion whose entire point is an alpha
+/// that differs from a candidate implementation's while the RGB is identical -- the raw palette fill
+/// and the mode-tuned wash share their three bytes and differ only here -- so it needs the stricter
+/// reader. Comparing RGB alone would pass against either, which is a gate that cannot decide.
+unsafe fn layer_background_matches_rgba(layer: *mut AnyObject, expected: u32) -> bool {
+    if layer.is_null() {
+        return false;
+    }
+    let color = crate::ffi::layer_background_color(layer);
+    if color.is_null() {
+        return false;
+    }
+    // RGBA is what ffi::hex_to_cg_color produces (NSColor -> CGColor); a 3-component colour cannot
+    // be the wash this compares against, so it is not a match.
+    if crate::ffi::CGColorGetNumberOfComponents(color) < 4 {
+        return false;
+    }
+    let components = crate::ffi::CGColorGetComponents(color);
+    if components.is_null() {
+        return false;
+    }
+    let close = |value: f64, byte: u32| (value - (byte as f64 / 255.0)).abs() <= 1.5 / 255.0;
+    close(*components, (expected >> 24) & 0xFF)
+        && close(*components.add(1), (expected >> 16) & 0xFF)
+        && close(*components.add(2), (expected >> 8) & 0xFF)
+        && close(*components.add(3), expected & 0xFF)
 }
 
 /// Read the system glass view's tint color and compare it with the configured tint token.
@@ -3768,10 +3823,11 @@ mod tests {
         accent_keycap_surface, centered_stream_cursor, content_sized_panel_length,
         default_edge_frame, max_extent_for_percent, neutral_keycap_surface, opaque_over,
         preview_badges, resize_frame_preserving_center, resolve_panel_frame, stream_axis_reserves,
-        target_screen_index, uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry,
-        BADGE_GAP, BADGE_H, HEAD_GRIP_RESERVE, HEAD_STREAM_RESERVE, MIN_PANEL_STREAM_EXTENT,
-        PANEL_SIDE_PADDING, PREVIEW_MAX_BADGES, PREVIEW_PHRASE, SETTINGS_BTN_CROSS_INSET,
-        SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE, STREAM_BUDGET_DEDUCTION, TAIL_SETTINGS_RESERVE,
+        target_screen_index, trailing_edge_inset, uses_accent_fill, Badge, BadgeCell, Orientation,
+        ScreenGeometry, BADGE_GAP, BADGE_H, HEAD_GRIP_RESERVE, HEAD_STREAM_RESERVE,
+        MIN_PANEL_STREAM_EXTENT, PANEL_SIDE_PADDING, PREVIEW_MAX_BADGES, PREVIEW_PHRASE,
+        SETTINGS_BTN_CROSS_INSET, SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE, STREAM_BUDGET_DEDUCTION,
+        TAIL_SETTINGS_RESERVE,
     };
     use crate::config::KeystrokeDisplayPosition;
     use crate::keystroke_display::state::{
@@ -4302,5 +4358,45 @@ mod tests {
 
         assert_eq!(expanded.origin, NSPoint::new(700.0, 38.0));
         assert!(expanded.origin.x + expanded.size.width <= visible.origin.x + visible.size.width);
+    }
+
+    /// A column's trailing edge is the row's rotated 90 degrees, so the inset computed for a
+    /// transposed panel must be identical. This is the correspondence the frame relies on.
+    #[test]
+    fn the_hud_trailing_inset_rotates_with_the_orientation() {
+        for (w, h) in [(152.0, 54.0), (54.0, 152.0), (300.0, 40.0), (40.0, 300.0)] {
+            let column =
+                trailing_edge_inset(Orientation::Vertical, NSSize::new(w, h), SETTINGS_BTN_SIZE);
+            let row = trailing_edge_inset(
+                Orientation::Horizontal,
+                NSSize::new(h, w),
+                SETTINGS_BTN_SIZE,
+            );
+            assert!(
+                (column - row).abs() < 1e-9,
+                "column {column} vs the transposed row {row} for {w}x{h}"
+            );
+        }
+    }
+
+    /// The counter-example the review asked for: the band argument must be the CROSS extent. With a
+    /// narrow panel the two arguments disagree, so passing the flow extent moves the gear.
+    ///
+    /// A narrow cross extent is load-bearing: at the shipped radius and a >= 32pt cross extent the
+    /// per-axis clamp makes the two arguments agree, which is why the defect stayed latent.
+    #[test]
+    fn the_hud_trailing_inset_uses_the_cross_extent_as_the_band() {
+        let (width, height) = (28.0, 400.0);
+        let control = SETTINGS_BTN_SIZE;
+        let radius = crate::glass::PANEL_CORNER_RADIUS;
+        let panel = NSSize::new(width, height);
+        let correct = trailing_edge_inset(Orientation::Vertical, panel, control);
+        // Same radius, same panel and same control -- only the band argument differs: the flow
+        // extent (height) instead of the cross extent (width).
+        let wrong = crate::theme::footer_control_inset(radius, height, width, control, height);
+        assert!(
+            correct > wrong + 1.0,
+            "the cross-extent band must inset more than the flow-extent band: {correct} vs {wrong}"
+        );
     }
 }
