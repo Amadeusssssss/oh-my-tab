@@ -31,6 +31,8 @@ pub(super) enum RowGroup {
     ThumbnailOnly,
     /// "Clear the matching system-pasteboard entry" on the Clipboard page.
     ClipboardDeleteChild,
+    /// The Liquid-Glass-only "glass style" sub-option on the General page.
+    GlassStyle,
 }
 
 /// One laid-out row.

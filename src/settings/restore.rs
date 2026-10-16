@@ -204,16 +204,21 @@ fn restore_all_defaults() {
 
     // Reset the mouse-page device selection (first device if any; clear if none).
     *SELECTED_DEVICE.lock().unwrap() = None;
-    // Apply every tab's runtime side effects in one pass, then rebuild the settings window
-    // in place (theme/locale may have changed).
+    // Apply every tab's runtime side effects in one pass. When that needs a settings rebuild it does
+    // it; otherwise refill every control in place, so a field the narrow syncs do not cover cannot
+    // keep showing the pre-restore value.
+    let rebuilt = crate::runtime_config::settings_window_rebuild_required(&old, &defaults);
     apply_config_change(&old, &defaults, ConfigChangeSource::RestoreDefaults);
+    if !rebuilt {
+        load_settings_values();
+    }
 }
 
 /// Restore every default of one page in one atomic update (other pages untouched).
 ///
 /// Keyed by the page's IDENTITY, not its sidebar number: the scope of a restore has to follow the
 /// page the user is on when a page moves, or Clipboard's restore resets the Switcher.
-fn restore_page_defaults(page: SettingsPageId) {
+pub(crate) fn restore_page_defaults(page: SettingsPageId) {
     let old = CONFIG.read().unwrap().clone();
     let cfg = restored_config_for_page(&old, page);
     if let Ok(mut w) = CONFIG.write() {
@@ -223,9 +228,13 @@ fn restore_page_defaults(page: SettingsPageId) {
     persist_config_now();
     log_debug!("[settings] page {page:?} restored to defaults");
     if page == SettingsPageId::General {
-        // The General page involves theme/locale defaults: apply effects, then rebuild the
-        // settings window in place.
+        // General owns appearance/locale/logging. Rebuild when those need it, otherwise refill the
+        // controls in place: a material-only restore must not rebuild the whole window.
+        let rebuilt = crate::runtime_config::settings_window_rebuild_required(&old, &cfg);
         apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
+        if !rebuilt {
+            load_settings_values();
+        }
     } else {
         // Other tabs: refill the controls (freeze states / conditional visibility refresh
         // with load_settings_from) and apply the tab's side effects.

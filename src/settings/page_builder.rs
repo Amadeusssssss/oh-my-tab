@@ -813,45 +813,42 @@ pub(super) unsafe fn build_general_page(
         ),
     );
     bind_control(target, ui.panel_material);
-    // The glass style is a Liquid-Glass sub-option: it is only built (and thus only occupies layout
-    // space) while that material is selected. A material change rebuilds the settings content via the
-    // settings_appearance path, so the row comes and goes live. The private `_variant` is deliberately
-    // NOT a user choice: two attempts at labelling it from a brightness sample were wrong (variant 19
-    // measures the *most* transparent and renders broken rainbow edges), so it stays a config/dev knob
-    // until a backdrop-differential measurement exists.
-    let liquid_glass_selected =
-        crate::config::effective_panel_material().as_str() == "liquid-glass";
-    if liquid_glass_selected {
-        // The two looks this app has always had: `regular` (index 0) and `clear` (index 1). The index is
-        // the config value (see `ControlField::GlassStyle`).
-        let glass_style_labels = [
-            t("settings.glass_style_regular"),
-            t("settings.glass_style_clear"),
-        ];
-        let glass_style_label_refs: Vec<&str> =
-            glass_style_labels.iter().map(String::as_str).collect();
-        let glass_style_metrics = SettingsSelect::metrics();
-        let y = canvas.next_block(glass_style_metrics.row_h);
-        SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
-        ui.glass_style = SettingsRow::described(
-            general_view,
-            label_x,
-            y,
-            ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-            glass_style_metrics.row_h,
-            &t("settings.row_glass_style"),
-            &t("settings.desc_glass_style"),
-            SettingsControl::popup(
-                ctrl_x,
-                y + 10.0,
-                ctrl_w,
-                glass_style_metrics.control_h,
-                &glass_style_label_refs,
-                0,
-            ),
-        );
-        bind_control(target, ui.glass_style);
-    }
+    // The glass style is a Liquid-Glass sub-option. It is always built and shown or hidden as a
+    // `RowGroup` (see `update_conditional_rows`), so switching the panel material reflows this one
+    // row in place instead of rebuilding the whole settings content. The private `_variant` is
+    // deliberately NOT a user choice: two attempts at labelling it from a brightness sample were
+    // wrong (variant 19 measures the *most* transparent and renders broken rainbow edges), so it
+    // stays a config/dev knob until a backdrop-differential measurement exists.
+    canvas.group_begin(RowGroup::GlassStyle);
+    // The two looks this app has always had: `regular` (index 0) and `clear` (index 1). The index is
+    // the config value (see `ControlField::GlassStyle`).
+    let glass_style_labels = [
+        t("settings.glass_style_regular"),
+        t("settings.glass_style_clear"),
+    ];
+    let glass_style_label_refs: Vec<&str> = glass_style_labels.iter().map(String::as_str).collect();
+    let glass_style_metrics = SettingsSelect::metrics();
+    let y = canvas.next_block(glass_style_metrics.row_h);
+    SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
+    ui.glass_style = SettingsRow::described(
+        general_view,
+        label_x,
+        y,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+        glass_style_metrics.row_h,
+        &t("settings.row_glass_style"),
+        &t("settings.desc_glass_style"),
+        SettingsControl::popup(
+            ctrl_x,
+            y + 10.0,
+            ctrl_w,
+            glass_style_metrics.control_h,
+            &glass_style_label_refs,
+            0,
+        ),
+    );
+    bind_control(target, ui.glass_style);
+    canvas.group_end();
     canvas.card(&t("settings.header_appearance"));
 
     canvas.next_section();

@@ -636,6 +636,12 @@ pub(crate) fn refresh_clipboard_separate_clear_all_switch_from_config() {
     dispatch::refresh_clipboard_separate_clear_all_switch_from_config();
 }
 
+/// Re-read the General appearance controls after a non-rebuilding appearance change (a panel-material
+/// change): the material and glass-style popups plus the dependent row's visibility.
+pub(crate) fn refresh_appearance_controls_from_config() {
+    dispatch::refresh_appearance_controls_from_config();
+}
+
 pub(crate) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option<&str>) {
     dispatch::set_clipboard_shortcut_recording_ui(recording, error);
 }
@@ -1544,8 +1550,19 @@ static MOUSE_PAGE_MATERIALIZED: AtomicBool = AtomicBool::new(false);
 /// a fresh rebuild).
 static MOUSE_PAGE_DIRTY: AtomicBool = AtomicBool::new(true);
 
+/// How many times the settings content has been rebuilt since the process started. Exposed so
+/// `--smoke-settings-layout` can tell an in-place update from a rebuild; `note_settings_content_rebuilt`
+/// itself is only a notification.
+static SETTINGS_CONTENT_REBUILDS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the settings content has been rebuilt since the process started.
+pub(crate) fn settings_content_rebuild_count() -> usize {
+    SETTINGS_CONTENT_REBUILDS.load(Ordering::SeqCst)
+}
+
 /// The window's content was rebuilt: every control is new, so the mouse page has to be filled again.
 pub(super) fn note_settings_content_rebuilt() {
+    SETTINGS_CONTENT_REBUILDS.fetch_add(1, Ordering::SeqCst);
     MOUSE_PAGE_MATERIALIZED.store(false, Ordering::SeqCst);
     MOUSE_PAGE_DIRTY.store(true, Ordering::SeqCst);
     // The numeric fields are new too: an edit recorded against the old controls must not commit through a

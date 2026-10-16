@@ -1351,6 +1351,16 @@ pub(super) unsafe fn update_conditional_rows(ui: &SettingsUi) {
     update_pointer_accel_visibility(ui);
     update_display_mode_dependent_visibility(ui);
     update_clipboard_delete_dependent_visibility(ui);
+    update_panel_material_dependent_visibility(ui);
+}
+
+/// Show the glass-style sub-option only while Liquid Glass is the selected material. It is the only
+/// structural effect a panel-material change has on the settings page; the settings window's own
+/// colors follow the theme, so this is reflowed in place instead of rebuilding the content.
+unsafe fn update_panel_material_dependent_visibility(ui: &SettingsUi) {
+    let liquid_glass = crate::config::effective_panel_material().as_str() == "liquid-glass";
+    ui.page_canvases[SETTINGS_GENERAL_PAGE_INDEX]
+        .set_group_visible(RowGroup::GlassStyle, liquid_glass);
 }
 
 /// Callback when the enable_mouse switch is toggled: apply immediately, then freeze/unfreeze
@@ -1442,6 +1452,29 @@ pub(crate) fn refresh_service_controls_from_config() {
             update_mouse_controls_enabled(u);
             update_clipboard_controls_enabled(u);
             super::bindings::update_binding_controls_enabled(u);
+        });
+    }
+}
+
+/// Re-read the General appearance controls after a change that does not rebuild the window
+/// (currently a panel-material change): the material and glass-style popups' selected values plus
+/// the dependent row's visibility. Deliberately not `load_settings_values`: a material click must
+/// not overwrite a value the user is editing elsewhere on the page. An open settings window is
+/// refreshed in place; a hidden or absent one is left alone.
+pub(crate) fn refresh_appearance_controls_from_config() {
+    let cfg = CONFIG.read().unwrap().clone();
+    unsafe {
+        with_settings_ui(|ui| {
+            let Some(u) = ui.as_ref() else {
+                return;
+            };
+            let material_idx =
+                crate::config::panel_material_index_of(&cfg.appearance.panel_material).unwrap_or(0)
+                    as isize;
+            let _: () = msg_send![u.panel_material, selectItemAtIndex: material_idx];
+            let glass_idx = crate::glass::glass_style_index(&cfg.appearance.glass_style) as isize;
+            let _: () = msg_send![u.glass_style, selectItemAtIndex: glass_idx];
+            update_conditional_rows(u);
         });
     }
 }
@@ -2163,19 +2196,22 @@ fn commit_imported_config(
 }
 
 /// Replay the runtime side effects of an import on the main thread.
-fn apply_imported_runtime(old: &Config, next: &Config) {
+pub(crate) fn apply_imported_runtime(old: &Config, next: &Config) {
     if next == old {
         // Nothing observable changed, so no runtime side effect has to be replayed and the window
         // does not need rebuilding -- the disk write was the whole point.
         return;
     }
+    // One shared decision: `apply_config_change` rebuilds the settings content exactly when this is
+    // true. A material-only change no longer rebuilds, so the old "appearance changed => already
+    // rebuilt" inference would leave the other imported controls stale.
+    let rebuilt = crate::runtime_config::settings_window_rebuild_required(old, next);
     apply_config_change(old, next, ConfigChangeSource::Reload);
-    // apply_config_change already rebuilt the window when the theme, the palette or the locale
-    // changed; only the other fields need the in-place refill, and rebuilding twice animates twice.
-    let window_rebuilt =
-        next.appearance != old.appearance || next.colors != old.colors || next.i18n != old.i18n;
-    if !window_rebuilt {
-        refresh_system_appearance();
+    // When it did not rebuild, refill every control from the imported config in place.
+    // `load_settings_values` also covers fields no narrow sync does (the log level dropdown, the
+    // mouse page) and does not rebuild.
+    if !rebuilt {
+        super::load_settings_values();
     }
 }
 

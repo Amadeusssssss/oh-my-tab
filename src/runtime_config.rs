@@ -63,6 +63,26 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.key_bindings
 }
 
+/// Appearance fields that, when they change, require rebuilding the settings content: the window's
+/// own layers are painted from concrete palette colors at construction time. `panel_material` is
+/// deliberately excluded -- the settings palette follows the theme, and the material's only
+/// structural effect on the page (the glass-style row) is reflowed in place.
+fn appearance_excluding_material_changed(old: &Config, new: &Config) -> bool {
+    old.appearance.theme != new.appearance.theme
+        || old.appearance.glass_style != new.appearance.glass_style
+        || old.appearance.corner_radius != new.appearance.corner_radius
+        || old.colors != new.colors
+}
+
+/// Whether a change requires rebuilding the settings content in place.
+///
+/// Shared by the runtime apply path and the import replay so the two cannot disagree about whether
+/// `apply_config_change` rebuilt the window. Fonts and layout stay out on purpose: a slider drag
+/// must not rebuild.
+pub(crate) fn settings_window_rebuild_required(old: &Config, new: &Config) -> bool {
+    appearance_excluding_material_changed(old, new) || old.i18n.locale != new.i18n.locale
+}
+
 fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> ChangeFlags {
     let startup = matches!(source, ConfigChangeSource::Startup);
     ChangeFlags {
@@ -71,7 +91,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.layout.thumbnail_size != new.layout.thumbnail_size
             || old.colors != new.colors
             || old.fonts != new.fonts,
-        settings_appearance: old.appearance != new.appearance || old.colors != new.colors,
+        settings_appearance: appearance_excluding_material_changed(old, new),
         panel_material: old.appearance.panel_material != new.appearance.panel_material,
         locale: old.i18n.locale != new.i18n.locale,
         modifier: startup || old.keyboard.modifier != new.keyboard.modifier,
@@ -115,6 +135,7 @@ fn needs_reserved_shortcut_coordination(flags: &ChangeFlags) -> bool {
 
 /// Apply all runtime side effects for a new configuration in one pass.
 pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChangeSource) {
+    let started = std::time::Instant::now();
     let flags = change_flags(old, new, source);
 
     // Reserved chords are settled once, before anything below publishes a table, caches the
@@ -179,14 +200,15 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
 
     if flags.panel_material {
-        // Each material installs a different root view, so existing panels swap their
-        // backdrop; the settings page rebuild comes from the settings_appearance path above
-        // (appearance changed), which re-derives the sub-option rows' visibility.
+        // Each material installs a different root view, so existing panels swap their backdrop.
         unsafe {
             crate::overlay::apply_backdrop_material();
             crate::clipboard::apply_backdrop_material();
             crate::keystroke_display::apply_backdrop_material();
         }
+        // The settings content is not rebuilt for a material-only change: re-read the material and
+        // glass-style controls and reflow the dependent row in place.
+        crate::settings::refresh_appearance_controls_from_config();
     }
 
     if flags.modifier {
@@ -325,6 +347,13 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
 
     // Keep the status-bar service toggles current for changes made in Settings or by reload.
     crate::menu::refresh_service_menu();
+    // The boundary over the full synchronous apply path, so a change that lost its rebuild (a
+    // panel-material switch) can be compared against one that still rebuilds.
+    crate::log_debug!(
+        "[config] applied source={:?} in {}ms",
+        source,
+        started.elapsed().as_millis()
+    );
 }
 
 #[cfg(test)]
@@ -377,6 +406,68 @@ mod tests {
         new.key_bindings.enabled = true;
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.mouse && flags.clipboard_enabled && flags.key_bindings);
+    }
+
+    /// A panel-material change must not rebuild the settings content -- the material's only
+    /// structural effect (the glass-style row) reflows in place. The fields painted into the
+    /// window's own layers, and the locale, still rebuild; fonts and layout still never do.
+    #[test]
+    fn panel_material_changes_do_not_rebuild_but_baked_appearance_does() {
+        let base = Config::default();
+        let mutate = |f: fn(&mut Config)| {
+            let mut new = base.clone();
+            f(&mut new);
+            new
+        };
+
+        let material = mutate(|cfg| cfg.appearance.panel_material = "frost".into());
+        let flags = change_flags(&base, &material, ConfigChangeSource::Settings);
+        assert!(flags.panel_material, "the material change was not detected");
+        assert!(
+            !flags.settings_appearance,
+            "a panel-material change must not set the settings-appearance rebuild flag"
+        );
+        assert!(!settings_window_rebuild_required(&base, &material));
+
+        // Material mixed with a field no narrow sync covers (logging) still must not rebuild: the
+        // import/restore replay refills the controls in place for exactly this case. Use a level
+        // that genuinely differs from the default, or the "mix" would change nothing.
+        let mut mixed = material.clone();
+        mixed.logging.level = if base.logging.level == "debug" {
+            "info".into()
+        } else {
+            "debug".into()
+        };
+        assert_ne!(mixed.logging.level, base.logging.level);
+        assert!(!settings_window_rebuild_required(&base, &mixed));
+
+        for (label, new) in [
+            ("theme", mutate(|cfg| cfg.appearance.theme = "dark".into())),
+            (
+                "glass style",
+                mutate(|cfg| cfg.appearance.glass_style = "clear".into()),
+            ),
+            (
+                "corner radius",
+                mutate(|cfg| cfg.appearance.corner_radius = 12.0),
+            ),
+            ("locale", mutate(|cfg| cfg.i18n.locale = "zh-Hans".into())),
+        ] {
+            assert!(
+                settings_window_rebuild_required(&base, &new),
+                "{label} must rebuild the settings content"
+            );
+        }
+
+        // Fonts and layout stay out: a slider drag must not rebuild.
+        assert!(!settings_window_rebuild_required(
+            &base,
+            &mutate(|cfg| cfg.fonts.status_bar_size += 1.0)
+        ));
+        assert!(!settings_window_rebuild_required(
+            &base,
+            &mutate(|cfg| cfg.layout.card_text_size += 1.0)
+        ));
     }
 
     /// Any part of the binding feature republishes the engine: the master switch, a row switch, or

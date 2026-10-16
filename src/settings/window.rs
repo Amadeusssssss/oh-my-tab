@@ -1753,6 +1753,207 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
+        // A panel-material change reflows the glass-style row and re-reads the appearance controls in
+        // place; it must not rebuild the settings content (that rebuild used to freeze the main thread
+        // on the click path). Drive the real config-apply path, assert the rebuild counter and the row's
+        // effect on the General document, then restore the material so no test choice persists.
+        {
+            let old = crate::config::CONFIG.read().unwrap().clone();
+            let target = if old.appearance.panel_material == "liquid-glass" {
+                "frost"
+            } else {
+                "liquid-glass"
+            };
+            let general_document_height = || {
+                with_settings_ui(|ui| {
+                    ui.as_ref()
+                        .map(|ui| {
+                            let document: *mut AnyObject =
+                                msg_send![ui.page_view(SettingsPageId::General), documentView];
+                            let frame: NSRect = msg_send![document, frame];
+                            frame.size.height
+                        })
+                        .unwrap_or(0.0)
+                })
+            };
+            let before_height = general_document_height();
+            let before_rebuilds = crate::settings::settings_content_rebuild_count();
+            let mut next = old.clone();
+            next.appearance.panel_material = target.into();
+            *crate::config::CONFIG.write().unwrap() = next.clone();
+            crate::runtime_config::apply_config_change(
+                &old,
+                &next,
+                crate::runtime_config::ConfigChangeSource::Settings,
+            );
+            let after_rebuilds = crate::settings::settings_content_rebuild_count();
+            let after_height = general_document_height();
+            let applied_material_idx = with_settings_ui(|ui| {
+                ui.as_ref()
+                    .map(|u| {
+                        let idx: isize = msg_send![u.panel_material, indexOfSelectedItem];
+                        idx
+                    })
+                    .unwrap_or(-1)
+            });
+            // Restore first, so no failure path can leave the smoke's material behind.
+            *crate::config::CONFIG.write().unwrap() = old.clone();
+            crate::runtime_config::apply_config_change(
+                &next,
+                &old,
+                crate::runtime_config::ConfigChangeSource::Settings,
+            );
+            let restored_height = general_document_height();
+            let want_material =
+                crate::config::panel_material_index_of(target).unwrap_or(0) as isize;
+            if after_rebuilds != before_rebuilds || applied_material_idx != want_material {
+                log_info!(
+                    "[smoke-settings-layout] a panel-material change did not apply in place: rebuilds {before_rebuilds}->{after_rebuilds}, material {applied_material_idx} (want {want_material})"
+                );
+                hide_settings();
+                return false;
+            }
+            // The row is the only structural difference between the two materials, so the document
+            // height must change when the row toggles (and come back when the material is restored).
+            if (after_height - before_height).abs() <= 0.5 {
+                log_info!(
+                    "[smoke-settings-layout] the glass-style row did not follow the material (before {before_height}, after {after_height}, target {target})"
+                );
+                hide_settings();
+                return false;
+            }
+            if (restored_height - before_height).abs() > 0.5 {
+                log_info!(
+                    "[smoke-settings-layout] restoring the material did not restore the General document height ({before_height} -> {restored_height})"
+                );
+                hide_settings();
+                return false;
+            }
+        }
+        let selected_appearance_indices = || {
+            with_settings_ui(|ui| {
+                ui.as_ref()
+                    .map(|u| {
+                        let material: isize = msg_send![u.panel_material, indexOfSelectedItem];
+                        let log: isize = msg_send![u.log_level, indexOfSelectedItem];
+                        (material, log)
+                    })
+                    .unwrap_or((-1, -1))
+            })
+        };
+        // Mixed import: a material + log-level change must keep both dropdowns in sync without
+        // rebuilding. The log level has no narrow sync, so it is only right if the replay refilled
+        // the controls in place. The real replay entry is driven; nothing is persisted.
+        {
+            let old = crate::config::CONFIG.read().unwrap().clone();
+            let target_material = if old.appearance.panel_material == "liquid-glass" {
+                "frost"
+            } else {
+                "liquid-glass"
+            };
+            let target_level = if old.logging.level == "debug" {
+                "info"
+            } else {
+                "debug"
+            };
+            let mut next = old.clone();
+            next.appearance.panel_material = target_material.into();
+            next.logging.level = target_level.into();
+            let before_rebuilds = crate::settings::settings_content_rebuild_count();
+            *crate::config::CONFIG.write().unwrap() = next.clone();
+            crate::settings::dispatch::apply_imported_runtime(&old, &next);
+            let after_rebuilds = crate::settings::settings_content_rebuild_count();
+            let (material_idx, log_idx) = selected_appearance_indices();
+            // Restore first, so no failure path leaves the imported config behind.
+            *crate::config::CONFIG.write().unwrap() = old.clone();
+            crate::settings::dispatch::apply_imported_runtime(&next, &old);
+            let want_material =
+                crate::config::panel_material_index_of(target_material).unwrap_or(0) as isize;
+            let want_log = if target_level == "debug" { 0 } else { 1 };
+            if after_rebuilds != before_rebuilds
+                || material_idx != want_material
+                || log_idx != want_log
+            {
+                log_info!(
+                    "[smoke-settings-layout] mixed import did not sync in place: rebuilds {before_rebuilds}->{after_rebuilds}, material {material_idx} (want {want_material}), log {log_idx} (want {want_log})"
+                );
+                hide_settings();
+                return false;
+            }
+        }
+        // General restore-defaults with the same mix, through the real restore entry. That entry
+        // persists the restored config, so the caller's config is written back and persisted right
+        // after the readback, before any assertion can bail out. Keeping theme, glass style, corner
+        // radius and locale already at their defaults makes this exercise the in-place refill branch
+        // instead of the rebuild one.
+        {
+            let saved = crate::config::CONFIG.read().unwrap().clone();
+            let defaults = crate::config::Config::default();
+            let mut skewed = saved.clone();
+            skewed.appearance.theme = defaults.appearance.theme.clone();
+            skewed.appearance.glass_style = defaults.appearance.glass_style.clone();
+            skewed.appearance.corner_radius = defaults.appearance.corner_radius;
+            skewed.i18n.locale = defaults.i18n.locale.clone();
+            skewed.appearance.panel_material =
+                if defaults.appearance.panel_material == "liquid-glass" {
+                    "frost".into()
+                } else {
+                    "liquid-glass".into()
+                };
+            skewed.logging.level = if defaults.logging.level == "debug" {
+                "info".into()
+            } else {
+                "debug".into()
+            };
+            *crate::config::CONFIG.write().unwrap() = skewed.clone();
+            // Show the skewed values in the controls before the restore. Without this, a caller
+            // whose config already holds the defaults would start from the expected state and the
+            // checks below could pass with no refill at all.
+            load_settings_values();
+            let (skewed_material, skewed_log) = selected_appearance_indices();
+            let want_material =
+                crate::config::panel_material_index_of(&defaults.appearance.panel_material)
+                    .unwrap_or(0) as isize;
+            let want_log = if defaults.logging.level == "debug" {
+                0
+            } else {
+                1
+            };
+            if skewed_material == want_material || skewed_log == want_log {
+                log_info!(
+                    "[smoke-settings-layout] the restore case did not establish non-default controls (material {skewed_material}, log {skewed_log})"
+                );
+                *crate::config::CONFIG.write().unwrap() = saved.clone();
+                let _ = crate::config::flush_config_sync();
+                hide_settings();
+                return false;
+            }
+            let before_rebuilds = crate::settings::settings_content_rebuild_count();
+            crate::settings::restore::restore_page_defaults(SettingsPageId::General);
+            let after_rebuilds = crate::settings::settings_content_rebuild_count();
+            let (material_idx, log_idx) = selected_appearance_indices();
+            // Put the caller's config back on disk, synchronously, before any assertion can return:
+            // the restore entry only queued a write of the defaults, and exiting without waiting
+            // would leave them there.
+            *crate::config::CONFIG.write().unwrap() = saved.clone();
+            if let Err(error) = crate::config::flush_config_sync() {
+                log_info!(
+                    "[smoke-settings-layout] could not restore the caller's config to disk: {error}"
+                );
+                hide_settings();
+                return false;
+            }
+            if after_rebuilds != before_rebuilds
+                || material_idx != want_material
+                || log_idx != want_log
+            {
+                log_info!(
+                    "[smoke-settings-layout] General restore did not sync in place: rebuilds {before_rebuilds}->{after_rebuilds}, material {material_idx} (want {want_material}), log {log_idx} (want {want_log})"
+                );
+                hide_settings();
+                return false;
+            }
+        }
         // Switching pages re-applies every sidebar title, but only the accent colour moves: the
         // titles, fonts and row height are unchanged, so the resolved geometry still holds and the
         // bitmap measurement must not run again. That measurement renders the button and scans it on
