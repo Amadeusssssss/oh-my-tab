@@ -1,0 +1,45 @@
+# Settings for the independent reviewer (scripts/agent-review.sh). See AGENTS.md, "Independent reviewer".
+#
+# reviewer — which backend reviews: "codex", "pi" or "none". It is required and has no default, so a
+#            review never silently runs on a backend the file did not name. "none" is an explicit no-op:
+#            the script prints one line and exits 0 without starting a round, though the rest of the file
+#            is still parsed and validated, so a typo elsewhere is still refused.
+#
+# The two backends are sibling tables with different fields, because their settings are not the same:
+#
+# [codex]
+#   model            — the Codex model that reviews. Environment override: OMT_REVIEW_MODEL.
+#   fast             — request Fast mode, which codex spells service_tier "priority" (`codex debug models`
+#                      describes the tier as "2x speed, increased usage"). fast = false sends service_tier
+#                      "default" explicitly, so a Fast mode configured in ~/.codex/config.toml cannot leak
+#                      into a review. Environment override: OMT_REVIEW_FAST.
+#   reasoning_effort — how hard codex reasons, which codex spells model_reasoning_effort. Omit the key and
+#                      no flag is sent, so the model default or a globally configured level stays in force.
+#                      Environment override: OMT_REVIEW_REASONING_EFFORT.
+#
+# [pi]
+#   provider         — pi provider name, for example "command code" (`pi --list-models`). Required with
+#                      reviewer = "pi"; environment override: OMT_REVIEW_PI_PROVIDER.
+#   model            — pi model id or pattern, for example "deepseek/deepseek-v4.1-flash". Required;
+#                      environment override: OMT_REVIEW_PI_MODEL.
+#   thinking         — pi thinking level: off, minimal, low, medium, high, xhigh or max. Required;
+#                      environment override: OMT_REVIEW_PI_THINKING.
+#                      pi runs non-interactively in JSON mode with edit and write disabled (only
+#                      read/bash/grep/find/ls are enabled), so no file-writing tool is offered; bash still
+#                      runs with this account's permissions, so the prompt's no-modification rule is the
+#                      remaining guard. pi resumes one session per task.
+#
+# Only the keys documented here are read. An unknown key is refused instead of ignored: a typo would
+# otherwise change how the review runs without saying so, and a review's own settings should never be
+# silently different from the file that states them.
+reviewer = "codex"
+
+[codex]
+model = "gpt-6.1-sol"
+fast = false
+reasoning_effort = "high"
+
+[pi]
+provider = "command code"
+model = "deepseek/deepseek-v4.1-flash"
+thinking = "high"

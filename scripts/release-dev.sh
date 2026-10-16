@@ -73,7 +73,7 @@ fi
 
 # Every valid code-signing identity, one "<sha1>\t<name>" per line.
 # `security` is called by name rather than by absolute path so the offline selftest can put a stub
-# ahead of it on PATH (the same stub pattern codex-review-selftest.sh uses); everything else here is
+# ahead of it on PATH (the same stub pattern agent-review-selftest.sh uses); everything else here is
 # called by absolute path.
 list_identities() {
   security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '

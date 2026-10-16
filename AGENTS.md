@@ -55,7 +55,7 @@ For every non-trivial implementation task:
 
 1. Understand the change and inspect the relevant existing code before modifying anything.
 2. If the user asks for a design consultation first (先和 Codex 商量方案, "design first", 先议后做), put the
-   approach to the reviewer before writing any code: `./scripts/codex-review.sh --design` with a brief that
+   approach to the reviewer before writing any code: `./scripts/agent-review.sh --design` with a brief that
    states the goal and constraints, what you inspected, the approach, the alternatives you rejected and why,
    what you are unsure about, and how you intend to verify it. That round judges the approach, not code — the
    reviewer must not write it, and its answer ends with `PLAN-STATUS: AGREED` or `PLAN-STATUS: CONCERNS`.
@@ -114,21 +114,22 @@ round. Budget the loop and triage by impact instead.
 
 ## Independent reviewer
 
-The independent reviewer is the Codex CLI, driven by `scripts/codex-review.sh`. The implementation agent must
-not act as its own final reviewer.
+The independent reviewer is a separate model session, driven by `scripts/agent-review.sh`: this repository
+reviews with the Codex CLI by default, and the `reviewer` key can select the local pi agent instead (see the
+reviewer-config paragraph below). The implementation agent must not act as its own final reviewer.
 
 ```sh
-scripts/codex-review.sh                     # first review, or a re-review in the same session
-scripts/codex-review.sh --design            # put an approach to the reviewer before writing code
-scripts/codex-review.sh --note "<text>"     # the agent's own words: verdicts, disagreements, gate results
-scripts/codex-review.sh --note-file <path>  # the same, read from a file
-scripts/codex-review.sh --retry             # resume a round that produced no verdict
-scripts/codex-review.sh --fresh             # start a new session when the old one is gone
-scripts/codex-review.sh --task <slug>       # this task's session, archive and lock (see below)
-scripts/codex-review.sh --tasks             # list the sessions this repository holds
-scripts/codex-review.sh --timeout <sec>     # bound a run that hangs (default 1800, 0 disables)
-scripts/codex-review.sh --finish            # clear this task's reviewer session for the next task
-scripts/codex-review-selftest.sh            # check the helper itself, against a stub CLI, offline
+scripts/agent-review.sh                     # first review, or a re-review in the same session
+scripts/agent-review.sh --design            # put an approach to the reviewer before writing code
+scripts/agent-review.sh --note "<text>"     # the agent's own words: verdicts, disagreements, gate results
+scripts/agent-review.sh --note-file <path>  # the same, read from a file
+scripts/agent-review.sh --retry             # resume a round that produced no verdict
+scripts/agent-review.sh --fresh             # start a new session when the old one is gone
+scripts/agent-review.sh --task <slug>       # this task's session, archive and lock (see below)
+scripts/agent-review.sh --tasks             # list the sessions this repository holds
+scripts/agent-review.sh --timeout <sec>     # bound a run that hangs (default 1800, 0 disables)
+scripts/agent-review.sh --finish            # clear this task's reviewer session for the next task
+scripts/agent-review-selftest.sh            # check the helper itself, against a stub CLI, offline
 ```
 
 - One session per task, and a re-review resumes **that** session so the reviewer remembers its previous
@@ -142,7 +143,7 @@ scripts/codex-review-selftest.sh            # check the helper itself, against a
     「这个功能完成了」「审查到此为止」). Do not run it to tidy up, to save tokens, or because the work looks
     like it has landed.
   - On `cmsg` (see *Git and commits*), if the task's session is still open, say so and offer to close it —
-    do not close it silently. `scripts/codex-review.sh --tasks` shows the state: `open` means the task is
+    do not close it silently. `scripts/agent-review.sh --tasks` shows the state: `open` means the task is
     still on its session, `closed` means it was ended on purpose.
 - A session that has run past the budget grows more expensive every round, and a round that hits `--timeout`
   loses its work. The helper warns on the round that starts over budget; closing the session is still the
@@ -181,16 +182,22 @@ scripts/codex-review-selftest.sh            # check the helper itself, against a
   in `--note` so the next round reads it.
 
 The reviewer prompt carries a repository checklist (the patch-side view of the next four rules) and the prompt
-lives in the script. The model, the speed and the reasoning effort come from `codex-review.toml` at the
-repository root (`[review] model` / `fast` / `reasoning_effort`); the file is optional, and without it the
-reviewer runs on `gpt-6.1-sol` with Fast mode off and no reasoning flag. `OMT_REVIEW_MODEL`, `OMT_REVIEW_FAST`
-and `OMT_REVIEW_REASONING_EFFORT` override one setting each. `fast = true` asks Codex for Fast mode
-(`service_tier = "priority"`), which is billed at a higher rate; `false` sends `service_tier = "default"`
-explicitly so a Fast mode configured in `~/.codex/config.toml` cannot leak into a review. `reasoning_effort`
-is one of the model's own levels (`codex debug models` lists them); omitting the key sends no flag, so the
-model default or a globally configured level stays in force. A configuration that cannot be read refuses the
-round rather than being ignored, and each round's outcome records the settings it ran under, including
-whether Codex declined the requested reasoning effort.
+lives in the script. The reviewer is chosen by the top-level `reviewer` key in `agent-review.toml` at the
+repository root: `"codex"`, `"pi"` or `"none"`. It is required and has no default, so a missing file or a
+file without the key refuses the round; `"none"` is an explicit no-op that exits 0. codex settings live in
+`[codex]` (`model` / `fast` / `reasoning_effort`) and pi settings in `[pi]` (`provider` / `model` /
+`thinking`), all three required when `reviewer = "pi"`. `OMT_REVIEW_REVIEWER`, `OMT_REVIEW_MODEL`,
+`OMT_REVIEW_FAST`, `OMT_REVIEW_REASONING_EFFORT`, `OMT_REVIEW_PI_PROVIDER`, `OMT_REVIEW_PI_MODEL` and
+`OMT_REVIEW_PI_THINKING` override one setting each. `fast = true` asks Codex for Fast mode (`service_tier =
+"priority"`), which is billed at a higher rate; `false` sends `service_tier = "default"` explicitly so a Fast
+mode configured in `~/.codex/config.toml` cannot leak into a review. `reasoning_effort` is one of codex's own
+levels (`codex debug models` lists them); omitting it sends no flag, so the model default or a globally
+configured level stays in force. pi runs non-interactively in JSON mode with `edit` and `write` disabled and
+only `read/bash/grep/find/ls` enabled, so the tool list offers no file-writing tool; `bash` still runs with the
+account's permissions, so the prompt's no-modification rule is the remaining guard. pi resumes one session per
+task through `--session-id`. A configuration
+that cannot be read refuses the round rather than being ignored, and each round's outcome records the
+reviewer and the settings it ran under, including whether Codex declined the requested reasoning effort.
 
 ### What the reviewer is asked to weigh here
 

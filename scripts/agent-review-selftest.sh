@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Self-test for scripts/codex-review.sh.
+# Self-test for scripts/agent-review.sh.
 #
-# The helper is run against a stub `codex` in a throwaway git repository, so no reviewer session and
-# no network are involved. It covers the failure modes the helper exists to classify and the
+# The helper is run against a stub `codex` and a stub `pi` in a throwaway git repository, so no reviewer
+# session and no network are involved. It covers the failure modes the helper exists to classify and the
 # behaviour it promises around them:
 #
 #   - a run that succeeds, and one whose CLI exits non-zero
@@ -16,12 +16,12 @@
 #   - the archive that keeps every attempt, including the failed ones
 #   - a relative --note-file, and stdin closed so the CLI cannot read input
 #
-#   scripts/codex-review-selftest.sh
+#   scripts/agent-review-selftest.sh
 #
 set -uo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-helper="$script_dir/codex-review.sh"
+helper="$script_dir/agent-review.sh"
 
 [[ -f "$helper" ]] || { echo "cannot find $helper" >&2; exit 66; }
 
@@ -30,7 +30,8 @@ helper="$script_dir/codex-review.sh"
 # while the assertions still read the top-level paths, and the gate would fail for a reason that belongs to
 # the caller's shell. The same holds for a model or speed override. The cases that test any of those
 # variables set it on the call itself.
-unset OMT_REVIEW_TASK OMT_REVIEW_MODEL OMT_REVIEW_FAST OMT_REVIEW_REASONING_EFFORT
+unset OMT_REVIEW_TASK OMT_REVIEW_MODEL OMT_REVIEW_FAST OMT_REVIEW_REASONING_EFFORT \
+    OMT_REVIEW_REVIEWER OMT_REVIEW_PI_PROVIDER OMT_REVIEW_PI_MODEL OMT_REVIEW_PI_THINKING
 
 tmp="$(mktemp -d)"
 # The pre-check below asks whether the tree is clean, so the runs that test it must keep the harness's
@@ -169,14 +170,80 @@ esac
 exit 0
 STUB
 chmod +x bin/codex
+cat > bin/pi <<'STUB'
+#!/bin/bash
+# A stand-in for the pi CLI: emits pi's JSON-mode records for the modes the helper classifies,
+# records the flags it was passed, and writes the prompt where the assertions read it.
+mode="${STUB_MODE:-ok}"
+prev=""; provider=""; model=""; thinking=""; tools=""; session_arg=""
+for a in "$@"; do
+    case "$prev" in
+        --provider)    provider="$a" ;;
+        --model)       model="$a" ;;
+        --thinking)    thinking="$a" ;;
+        --tools)       tools="$a" ;;
+        --session-id)  session_arg="$a" ;;
+    esac
+    prev="$a"
+done
+prompt="${@: -1}"
+printf '%s' "$provider" > "$STUB_DIR/pi-provider.txt"
+printf '%s' "$model" > "$STUB_DIR/pi-model.txt"
+printf '%s' "$thinking" > "$STUB_DIR/pi-thinking.txt"
+printf '%s' "$tools" > "$STUB_DIR/pi-tools.txt"
+printf '%s' "$session_arg" > "$STUB_DIR/pi-session-arg.txt"
+printf '%s' "$prompt" > "$STUB_DIR/last-prompt.txt"
+echo called >> "$STUB_DIR/calls.txt"
+# The session id is derived from the task key the prompt named, so a round that resumed another
+# task's session shows up in the assertion instead of looking like the right one.
+task_key="$(printf '%s' "$prompt" | sed -n "s/.*belongs to task '\([a-z0-9._-]*\)'.*/\1/p" | head -1)"
+if [[ -n "$session_arg" ]]; then
+    sid="$session_arg"
+elif [[ -n "$task_key" ]]; then
+    sid="pi-$task_key"
+else
+    sid="pi-session"
+fi
+echo "{\"type\":\"session\",\"version\":3,\"id\":\"$sid\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"$PWD\"}"
+echo '{"type":"agent_start"}'
+echo '{"type":"turn_start"}'
+msg() {
+    python3 -c 'import json,sys; print(json.dumps({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":sys.argv[1]}],"stopReason":"stop"}}, ensure_ascii=False))' "$1"
+}
+msg_stop() {
+    python3 -c 'import json,sys; print(json.dumps({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":sys.argv[1]}],"stopReason":sys.argv[2]}}, ensure_ascii=False))' "$1" "$2"
+}
+passing() { printf '审查结论：本轮通过，未发现显著问题。\n\nREVIEW-STATUS: PASS'; }
+case "$mode" in
+    ok)           msg "$(passing)"; echo '{"type":"agent_settled","aborted":false}' ;;
+    plan)         msg "$(printf '方案可行，可以照着做。\n\nPLAN-STATUS: AGREED')"; echo '{"type":"agent_settled","aborted":false}' ;;
+    not-verdict)  msg "需要我继续吗？"; echo '{"type":"agent_settled","aborted":false}' ;;
+    unsettled)    msg "正在审查，先看" ;;
+    # A provider truncation or error still reaches agent_settled with exit 0; the stop reason is what
+    # separates those from a finished answer.
+    truncated)    msg_stop "$(passing)" "length"; echo '{"type":"agent_settled","aborted":false}' ;;
+    empty-final)  msg "$(passing)"; msg_stop "" "error"; echo '{"type":"agent_settled","aborted":false}' ;;
+    error-then-ok) msg_stop "interrupted" "error"; msg "$(passing)"; echo '{"type":"agent_settled","aborted":false}' ;;
+    # pi creates a session under the requested id when it no longer holds one, and warns on stderr.
+    session-gone) echo "Warning: No project session found with id '$session_arg'; creating a new session with that id." >&2; msg "$(passing)"; echo '{"type":"agent_settled","aborted":false}' ;;
+    fail)         echo "boom: transport reset" >&2; exit 1 ;;
+    hang)         sleep 30 ;;
+esac
+exit 0
+STUB
+chmod +x bin/pi
 export STUB_DIR="$tmp"
+
+# The reviewer key has no default, so the suite starts from a file that names codex; every case that
+# tests the resolver rewrites or removes it.
+printf 'reviewer = "codex"\n' > agent-review.toml
 
 failures=0
 
 run() {
     local mode="$1"; shift
     set +e
-    STUB_MODE="$mode" PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh "$@" >"$tmp/out.txt" 2>"$tmp/err.txt"
+    STUB_MODE="$mode" PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh "$@" >"$tmp/out.txt" 2>"$tmp/err.txt"
     echo $? > "$tmp/exit.txt"
     set -e
 }
@@ -312,7 +379,7 @@ echo "git cannot say whether the tree changed"
 # called. GIT_DIR pointing at nothing is a git failure that no repository state can mask.
 calls_before_git_failure="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
 set +e
-GIT_DIR="$tmp/no-such-git-dir" STUB_MODE=ok PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh >"$tmp/out.txt" 2>"$tmp/err.txt"
+GIT_DIR="$tmp/no-such-git-dir" STUB_MODE=ok PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh >"$tmp/out.txt" 2>"$tmp/err.txt"
 echo $? > "$tmp/exit.txt"
 set -e
 check "a git failure refuses the round" 66 "git failed" "$tmp/err.txt"
@@ -333,6 +400,7 @@ mkdir -p "$badrepo/scripts" "$badrepo/bin"
 cp "$helper" "$badrepo/scripts/"
 cp -R "$tmp/bin/." "$badrepo/bin/"
 cp -R .agent-review "$badrepo/" 2>/dev/null || true
+cp agent-review.toml "$badrepo/" 2>/dev/null || true
 (
     cd "$badrepo"
     git init -q .
@@ -344,11 +412,11 @@ cp -R .agent-review "$badrepo/" 2>/dev/null || true
     printf 'y\n' > f.txt
     # An interrupted round first, so the retry is a legitimate one and reaches the repository check. Its own
     # reviewer call is legitimate, so the baseline for "was the reviewer called" is taken after it.
-    STUB_MODE=unfinished PATH="$badrepo/bin:$PATH" ./scripts/codex-review.sh >/dev/null 2>&1 || true
+    STUB_MODE=unfinished PATH="$badrepo/bin:$PATH" ./scripts/agent-review.sh >/dev/null 2>&1 || true
     wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' > "$scratch/calls-before.txt" || echo 0 > "$scratch/calls-before.txt"
     printf 'not an index' > .git/index
     set +e
-    STUB_MODE=ok PATH="$badrepo/bin:$PATH" ./scripts/codex-review.sh --retry >"$scratch/out.txt" 2>"$scratch/err.txt"
+    STUB_MODE=ok PATH="$badrepo/bin:$PATH" ./scripts/agent-review.sh --retry >"$scratch/out.txt" 2>"$scratch/err.txt"
     echo $? > "$scratch/exit.txt"
     set -e
 )
@@ -574,7 +642,7 @@ expect_absent "and the keyed refusal needs no hint" "--task <slug>" "$tmp/err.tx
 rmdir .agent-review/tasks/alpha/lock
 
 echo "two tasks review at the same time"
-STUB_MODE=hang PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh --task alpha --timeout 60 >/dev/null 2>&1 &
+STUB_MODE=hang PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh --task alpha --timeout 60 >/dev/null 2>&1 &
 alpha_pid=$!
 for _ in $(seq 1 50); do [[ -d .agent-review/tasks/alpha/lock ]] && break; sleep 0.1; done
 if [[ -d .agent-review/tasks/alpha/lock ]]; then
@@ -796,7 +864,7 @@ echo "an interrupted first round still records that its session began"
 # even with the signal path broken, which is exactly how this assertion first failed to bite.
 int_task="interrupted-start"
 rm -rf ".agent-review/tasks/$int_task"
-STUB_MODE=hang PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh --task "$int_task" >/dev/null 2>&1 &
+STUB_MODE=hang PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh --task "$int_task" >/dev/null 2>&1 &
 int_pid=$!
 for _ in $(seq 1 100); do [[ -s ".agent-review/tasks/$int_task/last-review.jsonl" ]] && break; sleep 0.1; done
 for _ in $(seq 1 100); do [[ -s ".agent-review/tasks/$int_task/codex-session-id" ]] && break; sleep 0.1; done
@@ -826,7 +894,7 @@ echo "the session-log write is not gated by the in-memory flag"
 # statements, so no test can deterministically land a signal inside it -- a timing-based test would be
 # flaky, and a flaky gate is worse than none. Reading the ordering off the source fails on the
 # defective implementation every time, which is what a regression gate has to do.
-log_body="$(sed -n '/^log_round_session()/,/^}/p' ./scripts/codex-review.sh)"
+log_body="$(sed -n '/^log_round_session()/,/^}/p' ./scripts/agent-review.sh)"
 append_line="$(printf '%s\n' "$log_body" | grep -n 'log_session_event' | head -1 | cut -d: -f1)"
 guard_line="$(printf '%s\n' "$log_body" | grep -n 'ROUND_SESSION_LOGGED=1' | tail -1 | cut -d: -f1)"
 if [[ -n "$append_line" && -n "$guard_line" && "$guard_line" -gt "$append_line" ]]; then
@@ -862,7 +930,7 @@ done
 
 echo "a signal sent to the script alone, while the CLI ignores TERM"
 rm -f "$tmp/child.pid" "$tmp/script-exit.txt"
-STUB_MODE=ignore-term PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh >/dev/null 2>&1 &
+STUB_MODE=ignore-term PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh >/dev/null 2>&1 &
 script_pid=$!
 for _ in $(seq 1 50); do [[ -s "$tmp/child.pid" ]] && break; sleep 0.1; done
 child_pid="$(cat "$tmp/child.pid" 2>/dev/null || echo none)"
@@ -881,7 +949,7 @@ if [[ "$after" -gt "$before" ]]; then echo "  ok   the interrupted round was arc
 
 echo "a group whose leader yields but whose child ignores TERM"
 rm -f "$tmp/child.pid" "$tmp/grandchild.pid" "$tmp/child-ready"
-STUB_MODE=child-survives PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh >/dev/null 2>&1 &
+STUB_MODE=child-survives PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh >/dev/null 2>&1 &
 script_pid=$!
 grandchild=""
 await_child "$tmp/child-ready" "$tmp/grandchild.pid" "the signal case handshake" || failures=$((failures + 1))
@@ -903,7 +971,7 @@ fi
 
 echo "the same, on the timeout path"
 rm -f "$tmp/child.pid" "$tmp/grandchild.pid" "$tmp/child-ready"
-STUB_MODE=child-survives PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh --timeout 2 >/dev/null 2>"$tmp/err.txt" &
+STUB_MODE=child-survives PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh --timeout 2 >/dev/null 2>"$tmp/err.txt" &
 script_pid=$!
 grandchild=""
 await_child "$tmp/child-ready" "$tmp/grandchild.pid" "the timeout case handshake" || failures=$((failures + 1))
@@ -928,7 +996,7 @@ rm -f "$tmp/child.pid" "$tmp/grandchild.pid" "$tmp/child-ready"
 # shell's asynchronous children do) and the second signal below would be a no-op — which is exactly how
 # an earlier version of this case passed without testing anything.
 set -m
-STUB_MODE=child-survives PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh >/dev/null 2>&1 &
+STUB_MODE=child-survives PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh >/dev/null 2>&1 &
 script_pid=$!
 set +m
 grandchild=""
@@ -1020,33 +1088,34 @@ for bad in High "has space" 2 '!'; do
     check "OMT_REVIEW_REASONING_EFFORT='$bad' is refused" 64 "OMT_REVIEW_REASONING_EFFORT" "$tmp/err.txt"
 done
 
-echo "codex-review.toml configures the model and the speed"
-# The file is read from the repository root, which is this throwaway repo. Each case rewrites it; the
-# last one removes it so the remaining cases run on the built-in defaults.
-write_config() { printf '%s\n' "$@" > codex-review.toml; }
+echo "agent-review.toml configures the model and the speed"
+# The file is read from the repository root, which is this throwaway repo. Each case rewrites it; it is
+# left in place afterwards, because the reviewer key has no default and a round without one is refused.
+write_config() { printf '%s\n' "$@" > agent-review.toml; }
 # A fast flag whose value cannot be confused with the file's: every case below that asserts a "default"
 # tier would also pass if the flag were dropped.
-write_config '[review]' 'model = "file-model"' 'fast = true'
+write_config 'reviewer = "codex"' '[codex]' 'model = "file-model"' 'fast = true'
 run ok
 check "a configured round runs" 0 - "$tmp/out.txt"
 expect_value "the file's model is used" "file-model" "$tmp/last-model.txt"
 expect_value "the file's fast = true asks for priority" "priority" "$tmp/last-tier.txt"
-expect "the round names the file as the source" "model=file-model (codex-review.toml), fast=on (codex-review.toml)" "$tmp/out.txt"
-write_config '[review]' 'fast = true'
+expect "the round names the file as the source" "model=file-model (agent-review.toml), fast=on (agent-review.toml)" "$tmp/out.txt"
+expect "and names the reviewer it chose" "reviewer: codex (agent-review.toml)" "$tmp/out.txt"
+write_config 'reviewer = "codex"' '[codex]' 'fast = true'
 run ok
 expect_value "a missing model falls back on its own" "gpt-6.1-sol" "$tmp/last-model.txt"
 expect_value "while the file's fast still applies" "priority" "$tmp/last-tier.txt"
-expect "each setting's source is reported separately" "model=gpt-6.1-sol (the built-in default), fast=on (codex-review.toml)" "$tmp/out.txt"
-write_config '[review]' 'reasoning_effort = "xhigh"'
+expect "each setting's source is reported separately" "model=gpt-6.1-sol (the built-in default), fast=on (agent-review.toml)" "$tmp/out.txt"
+write_config 'reviewer = "codex"' '[codex]' 'reasoning_effort = "xhigh"'
 run ok
 expect_value "the file's reasoning_effort is used" "xhigh" "$tmp/last-reasoning.txt"
-expect "and the round names the file as its source" "reasoning_effort=xhigh (codex-review.toml)" "$tmp/out.txt"
-write_config '[review]' 'model = "file-model"' 'reasoning_effort = "max"'
+expect "and the round names the file as its source" "reasoning_effort=xhigh (agent-review.toml)" "$tmp/out.txt"
+write_config 'reviewer = "codex"' '[codex]' 'model = "file-model"' 'reasoning_effort = "max"'
 run ok
 expect_value "a file effort and a file model combine" "max" "$tmp/last-reasoning.txt"
 expect_value "the model is still the file's" "file-model" "$tmp/last-model.txt"
 expect_value "and an omitted fast falls back on its own" "default" "$tmp/last-tier.txt"
-write_config '[review]' 'model = "file-model"' 'fast = false'
+write_config 'reviewer = "codex"' '[codex]' 'model = "file-model"' 'fast = false'
 run ok
 expect_value "fast = false is off" "default" "$tmp/last-tier.txt"
 # The file must not be able to leave the tier unset: an omitted service_tier inherits a Fast mode
@@ -1056,20 +1125,98 @@ expect_value "a one-off override wins over the file" "priority" "$tmp/last-tier.
 OMT_REVIEW_MODEL=env-model run ok
 expect_value "and the model override wins over the file" "env-model" "$tmp/last-model.txt"
 
+echo "reviewer = pi is a sibling table with its own fields"
+# A pi round passes its three settings and the read-only tool allowlist; the pi stub records each.
+write_config 'reviewer = "pi"' '[codex]' 'model = "file-model"' 'fast = true' \
+    '[pi]' 'provider = "command code"' 'model = "pi-model"' 'thinking = "xhigh"'
+run ok
+check "a configured pi round runs" 0 - "$tmp/out.txt"
+expect_value "the pi provider reaches the CLI" "command code" "$tmp/pi-provider.txt"
+expect_value "the pi model reaches the CLI" "pi-model" "$tmp/pi-model.txt"
+expect_value "the pi thinking level reaches the CLI" "xhigh" "$tmp/pi-thinking.txt"
+expect_value "and only the read-only tools are enabled" "read,bash,grep,find,ls" "$tmp/pi-tools.txt"
+expect "the round names the pi settings and their source" "reviewer: pi provider=command code (agent-review.toml), model=pi-model (agent-review.toml), thinking=xhigh (agent-review.toml)" "$tmp/out.txt"
+expect "a reviewer switch drops the other backend's session" "cannot be resumed by pi" "$tmp/err.txt"
+expect_value "the first pi round names no session id" "" "$tmp/pi-session-arg.txt"
+run ok
+expect_value "the next pi round resumes the session it made" "pi-session" "$tmp/pi-session-arg.txt"
+expect "and the review is still produced on a resume" "PASS" "$tmp/out.txt"
+last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
+expect "the pi outcome names the reviewer" "reviewer=pi" "$last_outcome"
+expect "and the pi provider" "pi_provider=command code" "$last_outcome"
+expect "and the pi model" "pi_model=pi-model" "$last_outcome"
+expect "and the pi thinking level" "pi_thinking=xhigh" "$last_outcome"
+# The pi classifier completes only on agent_settled with aborted false; these are its counter-examples.
+run unsettled
+check "a pi round with no agent_settled is refused" 1 "no agent_settled" "$tmp/err.txt"
+run fail
+check "a pi process that exits non-zero is refused" 1 "pi exited" "$tmp/err.txt"
+run not-verdict
+check "a pi message that is not a verdict is refused" 1 "REVIEW-STATUS" "$tmp/err.txt"
+run plan --design
+check "a pi design round is accepted" 0 - "$tmp/out.txt"
+expect "and kept as a plan" "PLAN-STATUS: AGREED" .agent-review/last-plan.txt
+run session-gone
+check "a pi resume whose session is gone still answers" 0 - "$tmp/out.txt"
+if [[ "$(tail -1 .agent-review/session-log.tsv | cut -f2)" == "lost" ]]; then
+    echo "  ok   the lost pi session is recorded"
+else
+    echo "  FAIL the lost pi session was not recorded"
+    failures=$((failures + 1))
+fi
+expect "and the warning says so" "no longer exists" "$tmp/err.txt"
+run truncated
+check "a pi answer truncated by the model is refused" 1 "stopped with 'length'" "$tmp/err.txt"
+run empty-final
+check "an empty final pi message is refused" 1 "stopped with 'error'" "$tmp/err.txt"
+expect_absent "and the earlier passing message is not surfaced as evidence" "REVIEW-STATUS: PASS" "$tmp/err.txt"
+run error-then-ok
+check "a pi run that recovered on a later message passes" 0 - "$tmp/out.txt"
+expect "and the recovered final answer is the one used" "本轮通过" "$tmp/out.txt"
+
+echo "the reviewer is required and has no default"
+rm -f agent-review.toml
+run ok
+check "a missing reviewer refuses the round" 64 "No reviewer configured" "$tmp/err.txt"
+OMT_REVIEW_REVIEWER=pi run ok
+check "pi without its three settings refuses" 64 "provider, model, thinking" "$tmp/err.txt"
+OMT_REVIEW_REVIEWER=none run ok
+check "reviewer = none is an explicit no-op" 0 "no reviewer is configured" "$tmp/out.txt"
+write_config 'reviewer = "codex"'
+
 echo "a configuration that cannot be read refuses the round"
 calls_before_config="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
-for bad_config in 'model = [' 'fast = "yes"' 'model = 12' 'model = ""' 'reasoning_effort = "High"' 'reasoning_effort = 3' 'reasoning_effort = ""' '[review]
-unknown = 1' '[other]
-model = "x"' '[review]
+for bad_config in 'reviewer = "codex"
+[codex]
+model = [' 'reviewer = "codex"
+[codex]
+fast = "yes"' 'reviewer = "codex"
+[codex]
+model = 12' 'reviewer = "codex"
+[codex]
+model = ""' 'reviewer = "codex"
+[codex]
+reasoning_effort = "High"' 'reviewer = "codex"
+[codex]
+reasoning_effort = 3' 'reviewer = "codex"
+[codex]
+reasoning_effort = ""' 'reviewer = "codex"
+[codex]
+unknown = 1' 'reviewer = "codex"
+[other]
+model = "x"' 'reviewer = "codex"
+[codex]
 model = "has
-newline"' 'review = 1' '[review]
-fast = 1'; do
-    printf '%s\n' "$bad_config" > codex-review.toml
+newline"' 'review = 1' 'reviewer = "codex"
+[codex]
+fast = 1' 'reviewer = "pi"' 'reviewer = "other"' '[pi]
+provider = "x"'; do
+    printf '%s\n' "$bad_config" > agent-review.toml
     run ok
-    check "it is refused: $(printf '%s' "$bad_config" | tr '\n' ' ' | head -c 40)" 64 "codex-review.toml" "$tmp/err.txt"
+    check "it is refused: $(printf '%s' "$bad_config" | tr '\n' ' ' | head -c 40)" 64 "agent-review.toml" "$tmp/err.txt"
 done
 # The missing TOML reader has to be refused in the same way: a bare `python3` is not necessarily 3.11+.
-printf '%s\n' '[review]' 'model = "file-model"' > codex-review.toml
+printf '%s\n' 'reviewer = "codex"' '[codex]' 'model = "file-model"' > agent-review.toml
 rm -rf "$tmp/nolib"; mkdir -p "$tmp/nolib"
 cat > "$tmp/nolib/python3" <<'NOPY'
 #!/bin/bash
@@ -1082,15 +1229,16 @@ exec /usr/bin/env python3 "$@"
 NOPY
 chmod +x "$tmp/nolib/python3"
 set +e
-STUB_MODE=ok PATH="$tmp/nolib:$tmp/bin:$PATH" ./scripts/codex-review.sh >"$tmp/out.txt" 2>"$tmp/err.txt"
+STUB_MODE=ok PATH="$tmp/nolib:$tmp/bin:$PATH" ./scripts/agent-review.sh >"$tmp/out.txt" 2>"$tmp/err.txt"
 echo $? > "$tmp/exit.txt"
 set -e
 check "a python3 without tomllib is refused, with the reason" 64 "no tomllib" "$tmp/err.txt"
 # The counter-example that makes "the reviewer was not called" mean something: an accepted config does
 # call it. Without this, a harness that never calls the stub at all would pass the check below.
-write_config '[review]' 'model = "file-model"'
+write_config 'reviewer = "codex"' '[codex]' 'model = "file-model"'
 run ok
 check "a readable configuration still runs" 0 - "$tmp/out.txt"
+expect "switching back to codex drops the pi session" "cannot be resumed by codex" "$tmp/err.txt"
 calls_after_control="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
 if [[ "$calls_after_control" -gt "$calls_before_config" ]]; then
     echo "  ok   an accepted configuration does call the reviewer"
@@ -1100,12 +1248,12 @@ else
 fi
 # Every refused case above must have left the CLI alone.
 calls_before_bad="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
-printf '%s\n' '[review]' 'fast = "yes"' > codex-review.toml
+printf '%s\n' 'reviewer = "codex"' '[codex]' 'fast = "yes"' > agent-review.toml
 run ok
 check "a bad value is refused" 64 "must be true or false" "$tmp/err.txt"
 run ok --task alpha
 check "a bad value refuses a named task too" 64 "must be true or false" "$tmp/err.txt"
-printf '%s\n' '[review]' 'reasoning_effort = "High"' > codex-review.toml
+printf '%s\n' 'reviewer = "codex"' '[codex]' 'reasoning_effort = "High"' > agent-review.toml
 run ok
 check "an uppercase effort is refused rather than lowercased" 64 "reasoning_effort" "$tmp/err.txt"
 calls_after_bad="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
@@ -1119,18 +1267,24 @@ fi
 : > .agent-review/last-status.txt; printf 'concluded=yes\n' > .agent-review/last-status.txt
 : > .agent-review/last-round-kind; printf 'review\n' > .agent-review/last-round-kind
 run ok
-check "the round is refused" 64 "codex-review.toml" "$tmp/err.txt"
+check "the round is refused" 64 "agent-review.toml" "$tmp/err.txt"
 expect "the previous status record survives" "concluded=yes" .agent-review/last-status.txt
 expect_value "and the recorded kind is untouched" "review" .agent-review/last-round-kind
 # A broken configuration must not be able to make a session unclearable.
-write_config '[review]' 'model = ['
+write_config 'reviewer = "codex"' '[codex]' 'model = ['
 run ok --tasks
 check "--tasks works with a broken configuration" 0 "task" "$tmp/out.txt"
 run ok --finish
 check "--finish works with a broken configuration" 0 "session cleared" "$tmp/out.txt"
+if [[ -e .agent-review/session-backend || -e .agent-review/codex-session-id ]]; then
+    echo "  FAIL --finish left the session pointer behind"
+    failures=$((failures + 1))
+else
+    echo "  ok   --finish clears the session pointer and its backend"
+fi
 run ok --help
 check "--help works with a broken configuration" 0 "usage:" "$tmp/err.txt"
-rm -f codex-review.toml
+rm -f agent-review.toml
 
 echo "a configuration path that exists but cannot be read is refused, not treated as absent"
 # "No configuration file" and "a configuration that cannot be read" are different states, and only the
@@ -1138,39 +1292,41 @@ echo "a configuration path that exists but cannot be read is refused, not treate
 # function exists to prevent: a config reached through a symlink would stop applying, without a word,
 # the moment its target went away, and the reviewer would run on a model nobody chose.
 config_calls_before="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
-rm -f codex-review.toml
-mkdir codex-review.toml
+rm -f agent-review.toml
+mkdir agent-review.toml
 run ok
 check "a directory where the configuration should be is refused" 64 "not a readable regular file" "$tmp/err.txt"
-rmdir codex-review.toml
-ln -s "$tmp/no-such-target.toml" codex-review.toml
+rmdir agent-review.toml
+ln -s "$tmp/no-such-target.toml" agent-review.toml
 run ok
 check "a dangling symlink is refused" 64 "not a readable regular file" "$tmp/err.txt"
-rm -f codex-review.toml
-# The absent case is asserted straight after, so "refused" cannot be passing because every state is
-# refused: with the path gone the built-in defaults are used and the reviewer does run.
+rm -f agent-review.toml
+# The absent case is asserted straight after the unreadable ones, so "refused" cannot be passing
+# because every state is refused: an absent file refuses for the missing reviewer, a different reason.
 run ok
-check "a genuinely absent configuration still uses the defaults" 0 - "$tmp/out.txt"
-expect_value "on the default model" "gpt-6.1-sol" "$tmp/last-model.txt"
+check "an absent configuration refuses for the missing reviewer" 64 "No reviewer configured" "$tmp/err.txt"
 # Unreadable to this user, which is not the same as absent either.
-printf '%s\n' '[review]' 'model = "file-model"' > codex-review.toml
-chmod 000 codex-review.toml
-if [[ ! -r codex-review.toml ]]; then
+printf '%s\n' 'reviewer = "codex"' '[codex]' 'model = "file-model"' > agent-review.toml
+chmod 000 agent-review.toml
+if [[ ! -r agent-review.toml ]]; then
     run ok
     check "an unreadable file is refused" 64 "not a readable regular file" "$tmp/err.txt"
 else
     echo "  ok   (skipped the chmod-000 case: this user can still read the file)"
 fi
-chmod 644 codex-review.toml 2>/dev/null || true
-rm -f codex-review.toml
+chmod 644 agent-review.toml 2>/dev/null || true
+rm -f agent-review.toml
 config_calls_after="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
-# The single call in the absent-configuration control above is the only one that may have happened here.
-if [[ "$((config_calls_after - config_calls_before))" -le 1 ]]; then
-    echo "  ok   only the absent-configuration control reached the reviewer"
+# Every state between the two snapshots is refused before the reviewer is reached: the directory, the
+# dangling symlink, the absent file and the unreadable file.
+if [[ "$((config_calls_after - config_calls_before))" -eq 0 ]]; then
+    echo "  ok   no broken or absent path reached the reviewer"
 else
     echo "  FAIL $((config_calls_after - config_calls_before)) calls happened; a broken path reached the reviewer"
     failures=$((failures + 1))
 fi
+# The reviewer has no default, so the cases after this one need a file that names one.
+write_config 'reviewer = "codex"'
 
 echo "the requested speed is archived with every round"
 run ok
@@ -1261,7 +1417,7 @@ fi
 
 echo "a session created while the CLI was being stopped"
 rm -f "$tmp/child.pid" "$tmp/late-ready" "$tmp/late-go" .agent-review/codex-session-id
-STUB_MODE=late-session PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh >/dev/null 2>&1 &
+STUB_MODE=late-session PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh >/dev/null 2>&1 &
 script_pid=$!
 for _ in $(seq 1 100); do [[ -f "$tmp/late-ready" ]] && break; sleep 0.1; done
 kill -TERM "$script_pid" 2>/dev/null
@@ -1280,7 +1436,7 @@ fi
 
 echo "a timeout against a CLI that ignores TERM"
 rm -f "$tmp/child.pid"
-STUB_MODE=ignore-term PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh --timeout 2 >/dev/null 2>"$tmp/err.txt" &
+STUB_MODE=ignore-term PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh --timeout 2 >/dev/null 2>"$tmp/err.txt" &
 script_pid=$!
 for _ in $(seq 1 50); do [[ -s "$tmp/child.pid" ]] && break; sleep 0.1; done
 child_pid="$(cat "$tmp/child.pid" 2>/dev/null || echo none)"
@@ -1298,7 +1454,7 @@ if kill -0 "$child_pid" 2>/dev/null; then echo "  FAIL the CLI survived KILL"; f
 echo "a captured stdout must reach EOF when the script returns"
 started=$SECONDS
 set +e
-STUB_MODE=ok PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh --timeout 60 2>/dev/null | cat >/dev/null
+STUB_MODE=ok PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh --timeout 60 2>/dev/null | cat >/dev/null
 set -e
 elapsed=$((SECONDS - started))
 echo "  the pipeline closed after ${elapsed}s (want < 20, not the 60s timeout)"
@@ -1328,7 +1484,7 @@ fi
 echo "a relative --note-file"
 echo "备注内容：只审脚本。" > scripts/note.txt
 set +e
-(cd scripts && STUB_MODE=ok PATH="$tmp/bin:$PATH" ./codex-review.sh --note-file ./note.txt >/dev/null 2>&1)
+(cd scripts && STUB_MODE=ok PATH="$tmp/bin:$PATH" ./agent-review.sh --note-file ./note.txt >/dev/null 2>&1)
 echo $? > "$tmp/exit.txt"
 set -e
 check "it is read from the caller's directory" 0 - "$tmp/out.txt"
@@ -1338,7 +1494,7 @@ echo "a tree with nothing to review"
 # From here on the reviewed tree must stay clean, so the output goes to $scratch.
 run_clean() {
     set +e
-    STUB_MODE="${STUB_MODE:-ok}" PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh "$@" >"$scratch/out.txt" 2>"$scratch/err.txt"
+    STUB_MODE="${STUB_MODE:-ok}" PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh "$@" >"$scratch/out.txt" 2>"$scratch/err.txt"
     echo $? > "$scratch/exit.txt"
     set -e
 }
@@ -1503,7 +1659,7 @@ mkdir -p "$norepo"
     git add staged.txt
     rm -f staged.txt
     set +e
-    STUB_MODE=ok PATH="$tmp/bin:$PATH" "$tmp/scripts/codex-review.sh" >"$scratch/out.txt" 2>"$scratch/err.txt"
+    OMT_REVIEW_REVIEWER=codex STUB_MODE=ok PATH="$tmp/bin:$PATH" "$tmp/scripts/agent-review.sh" >"$scratch/out.txt" 2>"$scratch/err.txt"
     echo $? > "$scratch/exit.txt"
     set -e
 )

@@ -7,7 +7,7 @@ dist/
 # Sparkle framework and release tools are vendored under vendor/Sparkle*.
 /tools/r2-publisher/target/
 
-# Independent-review state and evidence (scripts/codex-review.sh).
+# Independent-review state and evidence (scripts/agent-review.sh).
 .agent-review/
 
 # Python bytecode from the e2e helper library (scripts/e2e/lib).

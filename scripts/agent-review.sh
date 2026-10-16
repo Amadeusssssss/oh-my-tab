@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# Independent Codex review of the current working tree.
+# Independent review of the current working tree (codex, pi or none).
 #
-#   scripts/codex-review.sh                     first review, or a re-review in the same session
-#   scripts/codex-review.sh --retry             resume after a round that produced no verdict
-#   scripts/codex-review.sh --fresh             start a new session when the old one is gone
-#   scripts/codex-review.sh --note "<text>"     the implementation agent's own words to the reviewer
-#   scripts/codex-review.sh --note-file <path>  the same, read from a file
-#   scripts/codex-review.sh --task <slug>       this task's reviewer session (see below)
-#   scripts/codex-review.sh --tasks             list the sessions this repository holds
-#   scripts/codex-review.sh --timeout <sec>     bound a run that hangs (default 1800, 0 disables)
-#   scripts/codex-review.sh --finish            clear this task's reviewer session for the next task
+#   scripts/agent-review.sh                     first review, or a re-review in the same session
+#   scripts/agent-review.sh --retry             resume after a round that produced no verdict
+#   scripts/agent-review.sh --fresh             start a new session when the old one is gone
+#   scripts/agent-review.sh --note "<text>"     the implementation agent's own words to the reviewer
+#   scripts/agent-review.sh --note-file <path>  the same, read from a file
+#   scripts/agent-review.sh --task <slug>       this task's reviewer session (see below)
+#   scripts/agent-review.sh --tasks             list the sessions this repository holds
+#   scripts/agent-review.sh --timeout <sec>     bound a run that hangs (default 1800, 0 disables)
+#   scripts/agent-review.sh --finish            clear this task's reviewer session for the next task
 #
 # One reviewer session belongs to one task. Two tasks reviewed in this repository at the same time
 # must not resume each other's session, read each other's findings, clear each other's session or wait
@@ -26,29 +26,34 @@
 # one working tree still put both tasks' changes in front of the reviewer — a tree per task is what
 # makes two reviews independent.
 #
-# The reviewer runs on the model, the speed and the reasoning effort named by codex-review.toml at the
-# repository root ([review] model / fast / reasoning_effort); with that file absent the defaults are
-# gpt-6.1-sol, no Fast mode and no reasoning flag. OMT_REVIEW_MODEL, OMT_REVIEW_FAST and
-# OMT_REVIEW_REASONING_EFFORT override one setting each, for a harness that wants to try another model,
-# speed or effort without editing a tracked file. `fast = true` asks Codex for Fast mode, which it
-# spells service_tier "priority"; `fast = false` sends service_tier "default" explicitly, so a Fast
-# mode configured in ~/.codex/config.toml or .codex/config.toml cannot leak into a review. An omitted
-# reasoning_effort sends no model_reasoning_effort flag, so codex's model default or a globally
-# configured level stays in force. Both settings are chosen per turn and do not stick, so a resumed
-# round is told again.
+# The reviewer and its settings are named by agent-review.toml at the repository root. The top-level
+# `reviewer` key is required and has no default: "codex", "pi" or "none". codex settings live in
+# [codex] (model / fast / reasoning_effort) and pi settings in [pi] (provider / model / thinking),
+# required when reviewer = "pi". `fast = true` asks Codex for Fast mode, which it spells service_tier
+# "priority"; `fast = false` sends service_tier "default" explicitly, so a Fast mode configured in
+# ~/.codex/config.toml or .codex/config.toml cannot leak into a review. An omitted codex
+# reasoning_effort sends no model_reasoning_effort flag, so the model default or a globally configured
+# level stays in force. pi runs non-interactively in JSON mode with only read/bash/grep/find/ls tools
+# and resumes one session per task. `none` is an explicit no-op that exits 0. Every setting has an
+# environment override (OMT_REVIEW_REVIEWER, OMT_REVIEW_MODEL, OMT_REVIEW_FAST,
+# OMT_REVIEW_REASONING_EFFORT, OMT_REVIEW_PI_PROVIDER, OMT_REVIEW_PI_MODEL, OMT_REVIEW_PI_THINKING)
+# for a harness that wants to try another backend or setting without editing a tracked file. The
+# per-turn settings are chosen again on a resumed round.
 #
 # The reviewer is asked to write its findings in Chinese, with the severity tokens left in English.
 #
 # A tree with no change relative to HEAD is refused (exit 65, --retry exempt): a round that reviewed
 # nothing must not be counted as a review that passed.
 #
-# A round only counts as a review when Codex actually finished one. Anything else — a transport
+# A round only counts as a review when the selected reviewer actually finished one. Anything else — a transport
 # failure, a turn that never completed, no final message, a message that is not a verdict, a timeout,
 # an interruption — exits non-zero with the reason, keeps the session, and archives that round's
 # evidence, so that a retry resumes the same reviewer instead of starting a second one that remembers
 # nothing.
 #
-#   .agent-review/codex-session-id   the reviewer session, kept across failures and interruptions
+#   .agent-review/codex-session-id   the active reviewer session (codex or pi), kept across failures
+#                                    and interruptions
+#   .agent-review/session-backend    which backend issued that session id, so a switch drops it
 #   .agent-review/last-review.txt    the newest readable review (also printed)
 #   .agent-review/last-review.jsonl  the newest raw event stream
 #   .agent-review/last-message.txt   the CLI's own final-message file for the newest run
@@ -58,8 +63,8 @@
 #   .agent-review/session-log.tsv    every session's beginning, resumption, loss and deliberate end
 #   .agent-review/rounds/            every attempt's events, message, stderr and outcome
 #
-# Each round's outcome names the model, the requested service tier and where each setting came from, so
-# the configuration an old round ran under survives the next round overwriting last-status.txt.
+# Each round's outcome names the reviewer and the settings that round ran under, with each setting's
+# origin, so the configuration of an old round survives the next round overwriting last-status.txt.
 #
 # Those are the paths of the keyless task. A named task holds the same set under
 # .agent-review/tasks/<key>/, so its session, lock, counter and archive are its own and a listing of
@@ -86,11 +91,14 @@ if ! ROOT="$(git rev-parse --show-toplevel 2>&1)"; then
 fi
 cd "$ROOT"
 
-# The reviewer's model and speed are resolved further down, from codex-review.toml and the environment
+# The reviewer and its settings are resolved further down, from agent-review.toml and the environment
 # overrides. They are deliberately not read here: --help, --tasks and --finish must keep working when
-# that file is broken, and those three return before the resolver runs. The values below are the
-# built-in defaults, and they are also what a signal arriving before the resolver sees, so that the
-# archive of an interrupted round never reads an unset variable.
+# that file is broken, and those three return before the resolver runs. The values below are what a
+# signal arriving before the resolver sees, so that the archive of an interrupted round never reads an
+# unset variable. The reviewer has no default: it comes from the file or OMT_REVIEW_REVIEWER, and an
+# empty value refuses the round rather than quietly picking one.
+REVIEWER=""
+REVIEWER_SOURCE=""
 DEFAULT_MODEL="gpt-6.1-sol"
 MODEL="$DEFAULT_MODEL"
 MODEL_SOURCE="the built-in default"
@@ -105,7 +113,15 @@ SERVICE_TIER_REJECTED="no"
 REASONING_EFFORT=""
 REASONING_EFFORT_SOURCE="the built-in default"
 REASONING_EFFORT_REJECTED="no"
-CONFIG_FILE="$ROOT/codex-review.toml"
+# The pi backend's settings. Empty means "no flag", so pi falls back to its own configured default for
+# that one setting; the file names all three so a review cannot silently run on a machine-wide default.
+PI_PROVIDER=""
+PI_PROVIDER_SOURCE="the built-in default"
+PI_MODEL=""
+PI_MODEL_SOURCE="the built-in default"
+PI_THINKING=""
+PI_THINKING_SOURCE="the built-in default"
+CONFIG_FILE="$ROOT/agent-review.toml"
 
 BASE_DIR="$ROOT/.agent-review"
 TASKS_DIR="$BASE_DIR/tasks"
@@ -201,7 +217,7 @@ has_unfinished_session() {
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [--note <text>]
+usage: scripts/agent-review.sh [--task <slug>] [--design] [--retry] [--fresh] [--note <text>]
                                [--note-file <path>] [--timeout <seconds>] [--finish] [--tasks]
 
   (no options)        review, or re-review the same session after fixes
@@ -222,13 +238,16 @@ usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [-
   --timeout <sec>     bound a run that has not finished in this long (default 1800, 0 = none)
   --finish            clear this task's reviewer session: the user's call, not the agent's
 
-The model, the speed and the reasoning effort are read from codex-review.toml at the repository root
-([review] model / fast / reasoning_effort). That file is optional: without it the reviewer runs on
-gpt-6.1-sol with Fast mode off and no reasoning flag. With it, a bad value, an unknown key or an
-unreadable file refuses the round instead of being ignored, because a review that silently ran on another
-model, speed or effort is not the review its settings describe. --tasks and --finish never read it, so a
-broken file cannot make a session unclearable. OMT_REVIEW_MODEL, OMT_REVIEW_FAST and
-OMT_REVIEW_REASONING_EFFORT override one setting each and take precedence over the file.
+The reviewer is chosen by the top-level `reviewer` key in agent-review.toml at the repository root:
+"codex", "pi" or "none". There is no default; a file that does not name one, or a missing file,
+refuses the round rather than guessing. "none" is an explicit no-op that exits 0 (the rest of the file is still validated). codex settings live
+in [codex] (model / fast / reasoning_effort); pi settings live in [pi] (provider / model / thinking),
+and all three are required when reviewer = "pi". A bad value, an unknown key or an unreadable file
+refuses the round instead of being ignored, because a review that silently ran on another reviewer or
+other settings is not the review its configuration describes. --tasks and --finish never read it, so a
+broken file cannot make a session unclearable. OMT_REVIEW_REVIEWER, OMT_REVIEW_MODEL, OMT_REVIEW_FAST,
+OMT_REVIEW_REASONING_EFFORT, OMT_REVIEW_PI_PROVIDER, OMT_REVIEW_PI_MODEL and OMT_REVIEW_PI_THINKING
+override one setting each and take precedence over the file.
 
 The session is kept until the user says the task is done, so that the reviewer remembers its own
 findings across the rounds of one task. --finish is the agent's only way to end it early and it is
@@ -419,6 +438,9 @@ else
 fi
 
 SESSION_FILE="$STATE_DIR/codex-session-id"
+# The backend that made the remembered session. A session id only means something to the CLI that
+# issued it, so a reviewer switch has to drop the pointer rather than hand it to the other backend.
+SESSION_BACKEND_FILE="$STATE_DIR/session-backend"
 OUTPUT_FILE="$STATE_DIR/last-review.txt"
 JSON_FILE="$STATE_DIR/last-review.jsonl"
 MESSAGE_FILE="$STATE_DIR/last-message.txt"
@@ -478,19 +500,14 @@ if [[ "$finish" == 1 ]]; then
         log_session_event "$STATE_DIR" finished "$(cat "$SESSION_FILE")" \
             "$(cat "$STATE_DIR/round-counter" 2>/dev/null || echo -)" "$(cat "$KIND_FILE" 2>/dev/null || echo -)"
     fi
-    rm -f "$SESSION_FILE" "$OUTPUT_FILE" "$STATE_DIR/last-plan.txt" "$KIND_FILE" "$JSON_FILE" \
-        "$MESSAGE_FILE" "$STATUS_FILE" "$TIMEOUT_MARKER" "$JSON_FILE.stream-message"
+    rm -f "$SESSION_FILE" "$SESSION_BACKEND_FILE" "$OUTPUT_FILE" "$STATE_DIR/last-plan.txt" "$KIND_FILE" \
+        "$JSON_FILE" "$MESSAGE_FILE" "$STATUS_FILE" "$TIMEOUT_MARKER" "$JSON_FILE.stream-message"
     if [[ -n "$TASK_SOURCE" ]]; then
-        echo "Codex reviewer session cleared (task: $TASK_KEY)."
+        echo "Reviewer session cleared (task: $TASK_KEY)."
     else
-        echo "Codex reviewer session cleared."
+        echo "Reviewer session cleared."
     fi
     exit 0
-fi
-
-if ! command -v codex >/dev/null 2>&1; then
-    echo "codex CLI not found on PATH; install it or fix PATH before reviewing." >&2
-    exit 127
 fi
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -505,13 +522,14 @@ trap release_lock EXIT
 
 announce_task
 
-# The reviewer's model and speed, resolved here: after --tasks and --finish have returned (so a broken
+# The reviewer and its settings, resolved here: after --tasks and --finish have returned (so a broken
 # file cannot make a session unclearable), and before --fresh drops a session or this round's status
 # and evidence files are truncated (so a refused configuration leaves the previous round intact).
 #
-# An unknown key, a wrong type, an unreadable file or a missing TOML reader refuses the round rather
-# than falling back: "the reviewer ran on gpt-6.1-sol" is a claim about the review that a silent
-# fallback would make false. Every message names the file and the offending key.
+# The reviewer is explicit and has no default. An unknown key, a wrong type, a missing reviewer, an
+# unreadable file or a missing TOML reader refuses the round rather than falling back: "the reviewer
+# ran on gpt-6.1-sol" is a claim about the review that a silent fallback would make false. Every
+# message names the file and the offending key.
 #
 # A path that is *present* but is not a readable regular file -- a directory, a dangling or looping
 # symlink -- is refused for the same reason. Treating it as "no configuration" is the silent fallback
@@ -522,6 +540,10 @@ MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
 # would mean the review ran at a level the file did not state. The value is checked for shape only;
 # whether a model supports it is codex's answer, and a rejection is reported and archived, not ignored.
 REASONING_RE='^[a-z][a-z0-9_-]{0,31}$'
+# A provider name is pi's own label and may contain a space ("command code"); a pi model may be a
+# provider/id or a glob pattern, so its name is checked for shape and no whitespace, not for existence.
+PROVIDER_RE='^[A-Za-z0-9][A-Za-z0-9 ._:-]{0,127}$'
+PI_MODEL_RE='^[A-Za-z0-9*][A-Za-z0-9._:/*-]{0,127}$'
 
 resolve_settings() {
     if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
@@ -558,66 +580,127 @@ except (OSError, tomllib.TOMLDecodeError) as exc:
     print("cannot read %s: %s" % (path, exc))
     raise SystemExit(1)
 
-# Only the three documented keys are accepted, at the top level and inside [review]: a typo here would
-# otherwise change which model, speed or reasoning effort the review runs at, silently.
-allowed_top = {"review"}
-allowed_review = {"model", "fast", "reasoning_effort"}
+# Only the documented keys are accepted: the top-level reviewer plus one table per backend. A typo
+# here would change which reviewer runs, or with what settings, without saying so.
+allowed_top = {"reviewer", "codex", "pi"}
+allowed_codex = {"model", "fast", "reasoning_effort"}
+allowed_pi = {"provider", "model", "thinking"}
 unknown = sorted(set(data) - allowed_top)
 if unknown:
-    print("unknown key %s in %s (only [review] is read)" % (", ".join(repr(k) for k in unknown), path))
+    print(
+        "unknown key %s in %s (only reviewer, [codex] and [pi] are read)"
+        % (", ".join(repr(k) for k in unknown), path)
+    )
     raise SystemExit(1)
 
-review = data.get("review", {})
-if not isinstance(review, dict):
-    print("[review] in %s must be a table" % path)
+reviewer = ""
+if "reviewer" in data:
+    reviewer = data["reviewer"]
+    if not isinstance(reviewer, str) or reviewer not in ("codex", "pi", "none"):
+        print("reviewer in %s must be one of codex, pi or none; got %r" % (path, reviewer))
+        raise SystemExit(1)
+
+codex = data.get("codex", {})
+if not isinstance(codex, dict):
+    print("[codex] in %s must be a table" % path)
     raise SystemExit(1)
-unknown = sorted(set(review) - allowed_review)
+unknown = sorted(set(codex) - allowed_codex)
 if unknown:
     print(
-        "unknown key %s in [review] of %s (only model, fast and reasoning_effort are read)"
+        "unknown key %s in [codex] of %s (only model, fast and reasoning_effort are read)"
         % (", ".join(repr(k) for k in unknown), path)
     )
     raise SystemExit(1)
 
 model, model_from_file = default_model, False
-if "model" in review:
-    model = review["model"]
+if "model" in codex:
+    model = codex["model"]
     model_from_file = True
     if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", model):
         print(
-            "model in %s must be a model name of letters, digits, '.', '_', ':' and '-', at most 128 "
-            "characters; got %r" % (path, model)
+            "model in [codex] of %s must be a model name of letters, digits, '.', '_', ':' and '-', "
+            "at most 128 characters; got %r" % (path, model)
         )
         raise SystemExit(1)
 
 fast, fast_from_file = False, False
-if "fast" in review:
-    fast = review["fast"]
+if "fast" in codex:
+    fast = codex["fast"]
     fast_from_file = True
     if not isinstance(fast, bool):
-        print("fast in %s must be true or false; got %r" % (path, fast))
+        print("fast in [codex] of %s must be true or false; got %r" % (path, fast))
         raise SystemExit(1)
 
-# The reasoning effort is optional and has no neutral value, so it is parsed the same way but printed
-# only when the file sets it: an omitted key sends no flag and the built-in default stands. Printing no
-# line also keeps the key/value/origin parse unambiguous, because read would otherwise collapse an
-# empty middle field. Comment text lives inside this heredoc, so it must not carry a lone quote either:
-# bash 3.2 scans the body while it looks for the end of the enclosing command substitution.
 reasoning, reasoning_from_file = "", False
-if "reasoning_effort" in review:
-    reasoning = review["reasoning_effort"]
+if "reasoning_effort" in codex:
+    reasoning = codex["reasoning_effort"]
     reasoning_from_file = True
     if not isinstance(reasoning, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", reasoning):
         print(
-            "reasoning_effort in %s must be a lowercase effort name of letters, digits, '_' and '-' "
-            "(for example low, medium, high, xhigh or max); got %r" % (path, reasoning)
+            "reasoning_effort in [codex] of %s must be a lowercase effort name of letters, digits, "
+            "'_' and '-' (for example low, medium, high, xhigh or max); got %r" % (path, reasoning)
         )
         raise SystemExit(1)
 
+pi = data.get("pi", {})
+if not isinstance(pi, dict):
+    print("[pi] in %s must be a table" % path)
+    raise SystemExit(1)
+unknown = sorted(set(pi) - allowed_pi)
+if unknown:
+    print(
+        "unknown key %s in [pi] of %s (only provider, model and thinking are read)"
+        % (", ".join(repr(k) for k in unknown), path)
+    )
+    raise SystemExit(1)
+
+provider, provider_from_file = "", False
+if "provider" in pi:
+    provider = pi["provider"]
+    provider_from_file = True
+    if not isinstance(provider, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._:-]{0,127}", provider):
+        print(
+            "provider in [pi] of %s must be a provider name of letters, digits, space, '.', '_', ':' "
+            "and '-', at most 128 characters; got %r" % (path, provider)
+        )
+        raise SystemExit(1)
+
+pi_model, pi_model_from_file = "", False
+if "model" in pi:
+    pi_model = pi["model"]
+    pi_model_from_file = True
+    if not isinstance(pi_model, str) or not re.fullmatch(r"[A-Za-z0-9*][A-Za-z0-9._:/*-]{0,127}", pi_model):
+        print(
+            "model in [pi] of %s must be a model id or pattern of letters, digits, '.', '_', ':', "
+            "'/', '*' and '-', at most 128 characters; got %r" % (path, pi_model)
+        )
+        raise SystemExit(1)
+
+# pi spells this setting thinking; the level set belongs to pi, and it is checked here because a
+# value pi does not know must refuse rather than reach the CLI as a silent no-op.
+thinking, thinking_from_file = "", False
+if "thinking" in pi:
+    thinking = pi["thinking"]
+    thinking_from_file = True
+    if thinking not in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
+        print(
+            "thinking in [pi] of %s must be one of off, minimal, low, medium, high, xhigh, max; got %r"
+            % (path, thinking)
+        )
+        raise SystemExit(1)
+
+if reviewer:
+    print("reviewer\t%s\tfile" % reviewer)
 print("model\t%s\t%s" % (model, "file" if model_from_file else "default"))
 print("fast\t%s\t%s" % ("1" if fast else "0", "file" if fast_from_file else "default"))
 if reasoning_from_file:
     print("reasoning_effort\t%s\tfile" % reasoning)
+if provider_from_file:
+    print("pi_provider\t%s\tfile" % provider)
+if pi_model_from_file:
+    print("pi_model\t%s\tfile" % pi_model)
+if thinking_from_file:
+    print("pi_thinking\t%s\tfile" % thinking)
 PY
 )" || status=$?
         if [[ "$status" -ne 0 ]]; then
@@ -628,17 +711,33 @@ PY
         local key value origin
         while IFS=$'\t' read -r key value origin; do
             case "$key" in
+                reviewer)
+                    REVIEWER="$value"
+                    REVIEWER_SOURCE="agent-review.toml"
+                    ;;
                 model)
                     MODEL="$value"
-                    [[ "$origin" == file ]] && MODEL_SOURCE="codex-review.toml" || MODEL_SOURCE="the built-in default"
+                    [[ "$origin" == file ]] && MODEL_SOURCE="agent-review.toml" || MODEL_SOURCE="the built-in default"
                     ;;
                 fast)
                     [[ "$value" == 1 ]] && FAST=1 || FAST=0
-                    [[ "$origin" == file ]] && FAST_SOURCE="codex-review.toml" || FAST_SOURCE="the built-in default"
+                    [[ "$origin" == file ]] && FAST_SOURCE="agent-review.toml" || FAST_SOURCE="the built-in default"
                     ;;
                 reasoning_effort)
                     REASONING_EFFORT="$value"
-                    REASONING_EFFORT_SOURCE="codex-review.toml"
+                    REASONING_EFFORT_SOURCE="agent-review.toml"
+                    ;;
+                pi_provider)
+                    PI_PROVIDER="$value"
+                    PI_PROVIDER_SOURCE="agent-review.toml"
+                    ;;
+                pi_model)
+                    PI_MODEL="$value"
+                    PI_MODEL_SOURCE="agent-review.toml"
+                    ;;
+                pi_thinking)
+                    PI_THINKING="$value"
+                    PI_THINKING_SOURCE="agent-review.toml"
                     ;;
             esac
         done <<< "$parsed"
@@ -647,6 +746,16 @@ PY
     # The environment overrides one setting each and wins over the file, which is what makes the selftest
     # and a one-off comparison possible without editing a tracked file. They are validated like any other
     # value: an override that silently does nothing would be a lie about the review that ran.
+    if [[ -n "${OMT_REVIEW_REVIEWER:-}" ]]; then
+        case "$OMT_REVIEW_REVIEWER" in
+            codex|pi|none) REVIEWER="$OMT_REVIEW_REVIEWER" ;;
+            *)
+                echo "OMT_REVIEW_REVIEWER takes codex, pi or none; got '$OMT_REVIEW_REVIEWER'." >&2
+                exit 64
+                ;;
+        esac
+        REVIEWER_SOURCE="OMT_REVIEW_REVIEWER"
+    fi
     if [[ -n "${OMT_REVIEW_MODEL:-}" ]]; then
         if [[ ! "$OMT_REVIEW_MODEL" =~ $MODEL_RE ]]; then
             echo "OMT_REVIEW_MODEL is not a model name: '$OMT_REVIEW_MODEL'" >&2
@@ -674,6 +783,53 @@ PY
         REASONING_EFFORT="$OMT_REVIEW_REASONING_EFFORT"
         REASONING_EFFORT_SOURCE="OMT_REVIEW_REASONING_EFFORT"
     fi
+    if [[ -n "${OMT_REVIEW_PI_PROVIDER:-}" ]]; then
+        if [[ ! "$OMT_REVIEW_PI_PROVIDER" =~ $PROVIDER_RE ]]; then
+            echo "OMT_REVIEW_PI_PROVIDER is not a provider name: '$OMT_REVIEW_PI_PROVIDER'" >&2
+            exit 64
+        fi
+        PI_PROVIDER="$OMT_REVIEW_PI_PROVIDER"
+        PI_PROVIDER_SOURCE="OMT_REVIEW_PI_PROVIDER"
+    fi
+    if [[ -n "${OMT_REVIEW_PI_MODEL:-}" ]]; then
+        if [[ ! "$OMT_REVIEW_PI_MODEL" =~ $PI_MODEL_RE ]]; then
+            echo "OMT_REVIEW_PI_MODEL is not a model id: '$OMT_REVIEW_PI_MODEL'" >&2
+            exit 64
+        fi
+        PI_MODEL="$OMT_REVIEW_PI_MODEL"
+        PI_MODEL_SOURCE="OMT_REVIEW_PI_MODEL"
+    fi
+    if [[ -n "${OMT_REVIEW_PI_THINKING:-}" ]]; then
+        case "$OMT_REVIEW_PI_THINKING" in
+            off|minimal|low|medium|high|xhigh|max) ;;
+            *)
+                echo "OMT_REVIEW_PI_THINKING takes off, minimal, low, medium, high, xhigh or max; got '$OMT_REVIEW_PI_THINKING'." >&2
+                exit 64
+                ;;
+        esac
+        PI_THINKING="$OMT_REVIEW_PI_THINKING"
+        PI_THINKING_SOURCE="OMT_REVIEW_PI_THINKING"
+    fi
+
+    # The reviewer is explicit: there is no default. A file or an environment that names none refuses
+    # the round rather than quietly running one, which is what a fallback would do without saying so.
+    if [[ -z "$REVIEWER" ]]; then
+        echo "No reviewer configured: set reviewer = \"codex\", \"pi\" or \"none\" at the top of $CONFIG_FILE," >&2
+        echo "or set OMT_REVIEW_REVIEWER. The reviewer is explicit and has no default." >&2
+        exit 64
+    fi
+    # pi takes one flag per setting, and a missing one would silently fall back to the machine-wide pi
+    # configuration, so all three are required when pi is the reviewer.
+    if [[ "$REVIEWER" == "pi" ]]; then
+        missing=""
+        [[ -n "$PI_PROVIDER" ]] || missing="provider"
+        [[ -n "$PI_MODEL" ]] || missing="${missing:+$missing, }model"
+        [[ -n "$PI_THINKING" ]] || missing="${missing:+$missing, }thinking"
+        if [[ -n "$missing" ]]; then
+            echo "reviewer = \"pi\" in $CONFIG_FILE needs [pi] $missing (or the OMT_REVIEW_PI_* overrides); it was not set." >&2
+            exit 64
+        fi
+    fi
 
     # Fast mode is codex's service_tier "priority". Off is sent as an explicit "default" rather than
     # omitted, because an omitted setting inherits a Fast mode configured in ~/.codex/config.toml or in
@@ -687,8 +843,29 @@ PY
 }
 
 resolve_settings
-echo "reviewer: model=$MODEL ($MODEL_SOURCE), fast=$([[ "$FAST" == 1 ]] && echo on || echo off) ($FAST_SOURCE)"
-echo "reviewer: reasoning_effort=${REASONING_EFFORT:--} ($REASONING_EFFORT_SOURCE)"
+echo "reviewer: $REVIEWER ($REVIEWER_SOURCE)"
+if [[ "$REVIEWER" == "pi" ]]; then
+    echo "reviewer: pi provider=$PI_PROVIDER ($PI_PROVIDER_SOURCE), model=$PI_MODEL ($PI_MODEL_SOURCE), thinking=$PI_THINKING ($PI_THINKING_SOURCE)"
+elif [[ "$REVIEWER" == "codex" ]]; then
+    echo "reviewer: model=$MODEL ($MODEL_SOURCE), fast=$([[ "$FAST" == 1 ]] && echo on || echo off) ($FAST_SOURCE)"
+    echo "reviewer: reasoning_effort=${REASONING_EFFORT:--} ($REASONING_EFFORT_SOURCE)"
+fi
+
+# reviewer = "none" is an explicit no-op and not a review: it starts nothing, records nothing and
+# succeeds, so a caller that deliberately configured no reviewer is not failed for it. It runs before
+# the CLI check and before the work-tree check, because neither applies when no reviewer is configured.
+if [[ "$REVIEWER" == "none" ]]; then
+    echo "reviewer = none: no reviewer is configured, so this round ran nothing."
+    exit 0
+fi
+
+# The CLI is checked only now, once the reviewer that needs it is known. The earlier return points
+# (--help, --tasks, --finish) and the none no-op never reach here, so a missing CLI cannot make a
+# session unclearable and cannot turn a no-op into a failure.
+if ! command -v "$REVIEWER" >/dev/null 2>&1; then
+    echo "$REVIEWER CLI not found on PATH; install it or fix PATH before reviewing." >&2
+    exit 127
+fi
 
 # A retry resumes *that* round, so it keeps that round's kind: the one thing a retry must never do is
 # turn a design consultation that was never answered into a code review verdict. Read under the lock,
@@ -854,18 +1031,24 @@ stop_watchdog() {
 # resume it rather than start another one that remembers nothing.
 current_session_id() {
     [[ -f "$JSON_FILE" ]] || return 0
-    python3 - "$JSON_FILE" <<'PY'
+    python3 - "$JSON_FILE" "$REVIEWER" <<'PY'
 import json
 import sys
 
-with open(sys.argv[1], "r", encoding="utf-8") as f:
+path, reviewer = sys.argv[1], sys.argv[2]
+
+with open(path, "r", encoding="utf-8") as f:
     for line in f:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
 
-        if event.get("type") == "thread.started" and event.get("thread_id"):
+        if reviewer == "pi":
+            if event.get("type") == "session" and event.get("id"):
+                print(event["id"])
+                break
+        elif event.get("type") == "thread.started" and event.get("thread_id"):
             print(event["thread_id"])
             break
 PY
@@ -877,6 +1060,7 @@ keep_session() {
         found="$(current_session_id)"
         if [[ -n "$found" ]]; then
             printf '%s\n' "$found" > "$SESSION_FILE"
+            printf '%s\n' "$REVIEWER" > "$SESSION_BACKEND_FILE"
         fi
     fi
 }
@@ -939,15 +1123,25 @@ archive_round() {
         # overwritten by the next round, so without this the model and the speed of a past round would
         # be unknowable. Read from the variables resolved for this round, never re-read from the file,
         # which may have changed in between.
-        echo "model=$MODEL"
-        echo "model_source=$MODEL_SOURCE"
-        echo "fast=$([[ "$FAST" == 1 ]] && echo on || echo off)"
-        echo "fast_source=$FAST_SOURCE"
-        echo "service_tier=$SERVICE_TIER"
-        echo "reasoning_effort=${REASONING_EFFORT:--}"
-        echo "reasoning_effort_source=$REASONING_EFFORT_SOURCE"
-        echo "reasoning_effort_rejected=${REASONING_EFFORT_REJECTED:-no}"
-        echo "service_tier_rejected=${SERVICE_TIER_REJECTED:-no}"
+        echo "reviewer=$REVIEWER"
+        if [[ "$REVIEWER" == "pi" ]]; then
+            echo "pi_provider=$PI_PROVIDER"
+            echo "pi_provider_source=$PI_PROVIDER_SOURCE"
+            echo "pi_model=$PI_MODEL"
+            echo "pi_model_source=$PI_MODEL_SOURCE"
+            echo "pi_thinking=$PI_THINKING"
+            echo "pi_thinking_source=$PI_THINKING_SOURCE"
+        else
+            echo "model=$MODEL"
+            echo "model_source=$MODEL_SOURCE"
+            echo "fast=$([[ "$FAST" == 1 ]] && echo on || echo off)"
+            echo "fast_source=$FAST_SOURCE"
+            echo "service_tier=$SERVICE_TIER"
+            echo "reasoning_effort=${REASONING_EFFORT:--}"
+            echo "reasoning_effort_source=$REASONING_EFFORT_SOURCE"
+            echo "reasoning_effort_rejected=${REASONING_EFFORT_REJECTED:-no}"
+            echo "service_tier_rejected=${SERVICE_TIER_REJECTED:-no}"
+        fi
     } > "$ROUNDS_DIR/$stamp-outcome.txt"
     echo "$stamp"
 }
@@ -989,7 +1183,22 @@ if [[ "$fresh" == 1 && -f "$SESSION_FILE" ]]; then
     # `codex exec resume <id>` can still reach it.
     log_session_event "$STATE_DIR" discarded "$(cat "$SESSION_FILE")" \
         "$(cat "$STATE_DIR/round-counter" 2>/dev/null || echo -)" "$(cat "$KIND_FILE" 2>/dev/null || echo -)"
-    rm -f "$SESSION_FILE"
+    rm -f "$SESSION_FILE" "$SESSION_BACKEND_FILE"
+fi
+
+# A session id belongs to the backend that issued it: codex would report no rollout for a pi id, and pi
+# would create a fresh session under a codex id, both silently. After an explicit reviewer switch the
+# pointer is dropped on purpose, so the round starts a new session and the log says the old memory was
+# thrown away rather than losing it without a word.
+if [[ -f "$SESSION_FILE" ]]; then
+    recorded_backend="codex"
+    [[ -f "$SESSION_BACKEND_FILE" ]] && recorded_backend="$(cat "$SESSION_BACKEND_FILE")"
+    if [[ "$recorded_backend" != "$REVIEWER" ]]; then
+        echo "The remembered $recorded_backend session cannot be resumed by $REVIEWER; starting a new one." >&2
+        log_session_event "$STATE_DIR" discarded "$(cat "$SESSION_FILE")" \
+            "$(cat "$STATE_DIR/round-counter" 2>/dev/null || echo -)" "$(cat "$KIND_FILE" 2>/dev/null || echo -)"
+        rm -f "$SESSION_FILE" "$SESSION_BACKEND_FILE"
+    fi
 fi
 
 # A new round starts clean: a stale review must never be read as this round's, and the status record belongs to
@@ -1255,14 +1464,17 @@ else
     RETRY_PROMPT="$RETRY_PROMPT$REPO_CONTEXT$REVIEW_STATUS_INSTRUCTION"
 fi
 
-# Runs Codex with its output captured, stdin pointed at /dev/null, and a watchdog that can actually end
-# it. When stdin is not a terminal the CLI always tries to read "additional input" from it and says so on
-# stderr; /dev/null makes that read return end-of-file at once, where an inherited pipe with no writer —
-# how an agent usually invokes this script — could otherwise leave it waiting. stderr goes to a file
-# rather than through a process substitution, which a sandbox that forbids /dev/fd would refuse.
-run_codex() {
+# Runs the selected reviewer CLI with its output captured, stdin pointed at /dev/null, and a watchdog
+# that can actually end it. When stdin is not a terminal the CLI always tries to read "additional input"
+# from it and says so on stderr; /dev/null makes that read return end-of-file at once, where an inherited
+# pipe with no writer — how an agent usually invokes this script — could otherwise leave it waiting.
+# stderr goes to a file rather than through a process substitution, which a sandbox that forbids /dev/fd
+# would refuse. The program is an argument so codex and pi share one watchdog, one kill path and one sweep.
+run_cli() {
+    local program="$1"
+    shift
     local status=0
-    codex "$@" </dev/null > "$JSON_FILE" 2> "$STDERR_FILE" &
+    "$program" "$@" </dev/null > "$JSON_FILE" 2> "$STDERR_FILE" &
     CHILD_PID=$!
     if [[ "$timeout" -gt 0 ]]; then
         # The watchdog escalates by itself: a CLI that ignores TERM would otherwise leave the parent
@@ -1335,17 +1547,24 @@ if [[ "$ROUND_KIND" == "review" && "$INTENDED_EVENT" == "resumed" ]]; then
 fi
 
 if [[ ! -f "$SESSION_FILE" ]]; then
-    echo "Starting new Codex reviewer session..."
+    echo "Starting new $REVIEWER reviewer session..."
     status=0
     # `set --` rather than an array: macOS ships bash 3.2, where expanding an empty array under
-    # `set -u` is an error. The effort flag is inserted before the prompt only when one is configured,
-    # so an omitted reasoning_effort sends no model_reasoning_effort argument at all.
-    set -- exec --model "$MODEL" -c service_tier="$SERVICE_TIER"
-    if [[ -n "$REASONING_EFFORT" ]]; then
-        set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
+    # `set -u` is an error. The argument list is built once per branch so both backends share the same
+    # watchdog and the same capture files; the prompt is behind `--` so a leading dash is not an option.
+    if [[ "$REVIEWER" == "pi" ]]; then
+        set -- --mode json --print --no-approve --no-extensions --no-mcp --no-skills \
+            --tools read,bash,grep,find,ls --provider "$PI_PROVIDER" --model "$PI_MODEL" \
+            --thinking "$PI_THINKING" -- "$FIRST_PROMPT"
+        run_cli pi "$@" || status=$?
+    else
+        set -- exec --model "$MODEL" -c service_tier="$SERVICE_TIER"
+        if [[ -n "$REASONING_EFFORT" ]]; then
+            set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
+        fi
+        set -- "$@" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT"
+        run_cli codex "$@" || status=$?
     fi
-    set -- "$@" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT"
-    run_codex "$@" || status=$?
     # Logged after the CLI ran, because only then does the new session have an id: the record has to
     # name the session it began, or a later reader cannot follow it to its rollout. A round whose CLI
     # never created one is recorded with no id, which is the honest description of that attempt.
@@ -1353,13 +1572,13 @@ if [[ ! -f "$SESSION_FILE" ]]; then
 else
     SESSION_ID="$(cat "$SESSION_FILE")"
     if [[ "$design" == 1 ]]; then
-        echo "Resuming Codex reviewer session (design round):"
+        echo "Resuming $REVIEWER reviewer session (design round):"
         PROMPT="$DESIGN_PROMPT"
     elif [[ "$retry" == 1 ]]; then
-        echo "Retrying Codex reviewer session:"
+        echo "Retrying $REVIEWER reviewer session:"
         PROMPT="$RETRY_PROMPT"
     else
-        echo "Resuming Codex reviewer session:"
+        echo "Resuming $REVIEWER reviewer session:"
         PROMPT="$REREVIEW_PROMPT"
     fi
     echo "$SESSION_ID"
@@ -1368,92 +1587,167 @@ else
     # not end up recorded twice, once here and once by the handler.
     log_round_session
     status=0
-    # The service tier and the reasoning effort are sent again here because neither sticks: codex
-    # resolves both per turn, and a resumed turn with no -c flag comes back at the default speed and
-    # effort even when the first round asked otherwise.
-    set -- exec resume "$SESSION_ID" --model "$MODEL" -c service_tier="$SERVICE_TIER"
-    if [[ -n "$REASONING_EFFORT" ]]; then
-        set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
+    # A per-turn setting does not stick: codex resolves the tier and the effort per turn, and pi is
+    # resumed explicitly, so every round states the settings again rather than assuming they carried over.
+    if [[ "$REVIEWER" == "pi" ]]; then
+        set -- --mode json --print --no-approve --no-extensions --no-mcp --no-skills \
+            --tools read,bash,grep,find,ls --provider "$PI_PROVIDER" --model "$PI_MODEL" \
+            --thinking "$PI_THINKING" --session-id "$SESSION_ID" -- "$PROMPT"
+        run_cli pi "$@" || status=$?
+    else
+        set -- exec resume "$SESSION_ID" --model "$MODEL" -c service_tier="$SERVICE_TIER"
+        if [[ -n "$REASONING_EFFORT" ]]; then
+            set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
+        fi
+        set -- "$@" --json -o "$MESSAGE_FILE" "$PROMPT"
+        run_cli codex "$@" || status=$?
     fi
-    set -- "$@" --json -o "$MESSAGE_FILE" "$PROMPT"
-    run_codex "$@" || status=$?
-    # A resume against a thread the CLI no longer holds fails before any turn: the session is gone, and
-    # the log has to say `lost` rather than `resumed`, or the memory gap stays invisible. The wording is
-    # the CLI's own; it is matched because it is the only signal that separates "this session is gone"
-    # from every other way a resume can fail, and a false negative costs only a mislabelled event.
-    if [[ "$status" -ne 0 ]] && grep -qi 'no rollout found for thread id' "$STDERR_FILE" 2>/dev/null; then
+    # A resume can silently lose the memory it promised: codex fails the run when it no longer holds the
+    # thread, while pi's --session-id creates a new session under the same id and only says so on stderr.
+    # Both have to be recorded as `lost` rather than `resumed`, or the memory gap stays invisible.
+    if [[ "$REVIEWER" == "codex" && "$status" -ne 0 ]] \
+        && grep -qi 'no rollout found for thread id' "$STDERR_FILE" 2>/dev/null; then
         # Same round number as the `resumed` this attempt already logged: it is the second half of one
         # attempt, and session_rounds_so_far skips it for the same reason -- the round was tried once.
         log_session_event "$STATE_DIR" lost "$SESSION_ID" "$ROUND_NUMBER" "$ROUND_KIND"
         echo "The reviewer session $SESSION_ID is gone: the CLI has no rollout for it." >&2
         echo "The log records it as lost. --fresh starts a new one (its memory is lost); a retry cannot." >&2
+    elif [[ "$REVIEWER" == "pi" ]] \
+        && grep -qi 'No project session found with id' "$STDERR_FILE" 2>/dev/null; then
+        log_session_event "$STATE_DIR" lost "$SESSION_ID" "$ROUND_NUMBER" "$ROUND_KIND"
+        echo "The pi session $SESSION_ID no longer exists; pi started a new one under that id." >&2
+        echo "Its memory of earlier findings is gone. The log records it as lost; --fresh drops it." >&2
     fi
 fi
 
-# One pass over the event stream: what happened, and what the final message was. The CLI's own -o file
-# is the only source of a final message — it is the CLI's documented contract for one — and a message
-# that exists only in the event stream is reported as evidence rather than promoted to a verdict,
-# because that is what a turn cut short would look like.
-python3 - "$JSON_FILE" "$MESSAGE_FILE" "$STATUS_FILE" "$MARKER_NAME" "$ROUND_KIND" <<'PY'
+# One pass over the event stream: what happened, and what the final message was. codex's -o file is the
+# authoritative message for that backend; pi has no -o file, so its last assistant message_end is, per
+# its JSON-mode documentation, the authoritative final message and is written to the same file. A
+# message that exists only in codex's event stream stays evidence rather than being promoted to a verdict.
+python3 - "$REVIEWER" "$JSON_FILE" "$MESSAGE_FILE" "$STATUS_FILE" "$MARKER_NAME" "$ROUND_KIND" <<'PY'
 import json
 import re
 import sys
 
-events_path, message_path, status_path = sys.argv[1], sys.argv[2], sys.argv[3]
-marker_name, round_kind = sys.argv[4], sys.argv[5]
+reviewer, events_path, message_path, status_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+marker_name, round_kind = sys.argv[5], sys.argv[6]
 
 thread_id = ""
 completed = False
 errors = []
 stream_message = ""
-# codex does not fail a run whose service tier it will not use; it reports an `error` item and answers
-# at the default speed. That message is the only signal that the requested speed was dropped, so it is
-# matched on its stable part. It is recorded, not treated as a failed round: the review itself is valid.
 tier_rejected = False
-# The same shape of signal for a reasoning effort codex will not use: an error item, with the round
-# still answered. Matched on the setting's own words plus the shared tail, so neither warning can fire
-# on the other's message.
 reasoning_rejected = False
-
-try:
-    with open(events_path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            kind = event.get("type") or ""
-            if kind == "thread.started":
-                thread_id = event.get("thread_id") or thread_id
-            elif kind == "turn.completed":
-                completed = True
-            elif "error" in kind or "failed" in kind:
-                errors.append(json.dumps(event, ensure_ascii=False)[:300])
-
-            if kind == "item.completed":
-                item = event.get("item") or {}
-                if item.get("type") == "agent_message" and item.get("text"):
-                    stream_message = item["text"]
-                if item.get("type") == "error":
-                    # Both halves are required: the generic tail alone ("not advertised as supported
-                    # for model") could belong to another setting, and attributing that to the service
-                    # tier would archive a rejection that never happened. codex's own wording for this
-                    # case is "Configured service tier `X` is not advertised as supported for model `Y`".
-                    detail = str(item.get("message") or "")
-                    if "service tier" in detail and "not advertised as supported for model" in detail:
-                        tier_rejected = True
-                    if "reasoning effort" in detail and "not advertised as supported for model" in detail:
-                        reasoning_rejected = True
-except FileNotFoundError:
-    pass
-
 message = ""
-try:
-    with open(message_path, "r", encoding="utf-8") as f:
-        message = f.read().strip()
-except FileNotFoundError:
-    pass
+incomplete = ""
+
+
+def one_line(value):
+    # A status file is key=value lines, so a provider error must not carry its own newlines into it.
+    return " ".join(str(value).split())[:300]
+
+
+if reviewer == "pi":
+    # pi JSON mode names the run in a `session` header, ends a run with `agent_settled` (the one event
+    # that says no retry, compaction recovery or queued message remains), and carries the authoritative
+    # answer in the last assistant `message_end`. There is no -o file, so the message is written here and
+    # the rest of the round treats both backends the same.
+    settled = False
+    aborted = False
+    # The last assistant message decides, even when its text is empty: a truncated or errored final
+    # answer must not be hidden by an earlier message that happened to carry the verdict.
+    last_stop = ""
+    saw_assistant = False
+    try:
+        with open(events_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                kind = event.get("type") or ""
+                if kind == "session":
+                    thread_id = event.get("id") or thread_id
+                elif kind == "agent_settled":
+                    settled = True
+                    aborted = bool(event.get("aborted"))
+                elif kind == "auto_retry_end" and event.get("success") is False:
+                    errors.append(one_line(event.get("finalError") or "the automatic retry failed"))
+                elif kind == "message_update":
+                    detail = event.get("assistantMessageEvent") or {}
+                    if detail.get("type") == "error":
+                        errors.append(one_line(detail.get("error")))
+                elif kind == "message_end":
+                    msg = event.get("message") or {}
+                    if msg.get("role") == "assistant":
+                        parts = [
+                            block.get("text", "")
+                            for block in (msg.get("content") or [])
+                            if isinstance(block, dict) and block.get("type") == "text"
+                        ]
+                        stream_message = "".join(parts)
+                        last_stop = str(msg.get("stopReason") or "")
+                        saw_assistant = True
+    except FileNotFoundError:
+        pass
+    # pi documents stopReason as pending | stop | length | toolUse | error | aborted | deferred. Only a
+    # clean `stop` on the last assistant message is a finished answer: the other values are a failure, a
+    # truncation, or a turn that still had work to do, and pi can reach agent_settled with any of them.
+    if not settled:
+        incomplete = "the pi turn did not finish (no agent_settled in the event stream)"
+    elif aborted:
+        incomplete = "the pi turn was aborted"
+    elif not saw_assistant:
+        incomplete = "the pi turn produced no assistant message"
+    elif last_stop != "stop":
+        incomplete = "the pi turn did not finish (the last assistant message stopped with '%s')" % (last_stop or "no stop reason")
+    completed = settled and not aborted and saw_assistant and last_stop == "stop"
+    message = stream_message.strip()
+    if message:
+        with open(message_path, "w", encoding="utf-8") as f:
+            f.write(message)
+else:
+    # codex reports a completed turn as an event, keeps a declined tier or effort as an error item, and
+    # writes the final message to its own -o file, which is the authoritative source for one.
+    try:
+        with open(events_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                kind = event.get("type") or ""
+                if kind == "thread.started":
+                    thread_id = event.get("thread_id") or thread_id
+                elif kind == "turn.completed":
+                    completed = True
+                elif "error" in kind or "failed" in kind:
+                    errors.append(json.dumps(event, ensure_ascii=False)[:300])
+
+                if kind == "item.completed":
+                    item = event.get("item") or {}
+                    if item.get("type") == "agent_message" and item.get("text"):
+                        stream_message = item["text"]
+                    if item.get("type") == "error":
+                        # Both halves are required: the generic tail alone ("not advertised as supported
+                        # for model") could belong to another setting, and attributing that to the service
+                        # tier would archive a rejection that never happened. codex's own wording for this
+                        # case is "Configured service tier `X` is not advertised as supported for model `Y`".
+                        detail = str(item.get("message") or "")
+                        if "service tier" in detail and "not advertised as supported for model" in detail:
+                            tier_rejected = True
+                        if "reasoning effort" in detail and "not advertised as supported for model" in detail:
+                            reasoning_rejected = True
+    except FileNotFoundError:
+        pass
+
+    try:
+        with open(message_path, "r", encoding="utf-8") as f:
+            message = f.read().strip()
+    except FileNotFoundError:
+        pass
 
 # The structure the prompts demand, checked as structure: the message must end with the status line,
 # and that line must be nothing else. Both weaker checks were wrong — keyword matching accepted "我还没有
@@ -1500,6 +1794,7 @@ looks_like_verdict = status_line is not None
 with open(status_path, "w", encoding="utf-8") as f:
     f.write("thread_id=%s\n" % thread_id)
     f.write("completed=%s\n" % ("yes" if completed else "no"))
+    f.write("incomplete=%s\n" % incomplete)
     f.write("error=%s\n" % (errors[0] if errors else ""))
     f.write("service_tier_rejected=%s\n" % ("yes" if tier_rejected else "no"))
     f.write("reasoning_effort_rejected=%s\n" % ("yes" if reasoning_rejected else "no"))
@@ -1528,6 +1823,8 @@ SERVICE_TIER_REJECTED="$(status_field service_tier_rejected)"
 # The same conservative treatment for the effort: a run whose effort codex declined still produced a
 # valid review, so the round keeps its verdict and its exit code and only the mismatch is surfaced.
 REASONING_EFFORT_REJECTED="$(status_field reasoning_effort_rejected)"
+# Why a pi round did not complete, in words the failure message can use directly (empty for codex).
+INCOMPLETE="$(status_field incomplete)"
 # The classification above reports the *shape* of the message. A verdict-shaped message still does not make a
 # round: the turn has to have completed, the CLI has to have exited cleanly and the run must not have been
 # killed. A retry resumes a round that reached none of that, so it tests this field, not the shape.
@@ -1540,13 +1837,17 @@ if [[ -f "$TIMEOUT_MARKER" ]]; then
     REASON="the run did not finish within ${timeout}s and was terminated"
     CODE=124
 elif [[ "$status" -ne 0 ]]; then
-    REASON="codex exec exited $status"
+    REASON="$REVIEWER exited $status"
     CODE="$status"
 elif [[ ! -s "$JSON_FILE" ]]; then
-    REASON="codex printed no events"
+    REASON="$REVIEWER printed no events"
     CODE=1
 elif [[ "$completed" != "yes" ]]; then
-    REASON="the turn did not finish (no turn.completed in the event stream)"
+    if [[ -n "$INCOMPLETE" ]]; then
+        REASON="$INCOMPLETE"
+    else
+        REASON="the turn did not finish (no turn.completed in the event stream)"
+    fi
     CODE=1
 elif [[ "$message_chars" -eq 0 ]]; then
     REASON="the turn produced no final message"
@@ -1566,7 +1867,7 @@ if [[ "$SERVICE_TIER_REJECTED" == "yes" ]]; then
     echo >&2
     if [[ "$FAST" == 1 ]]; then
         echo "Note: codex did not accept the requested service tier '$SERVICE_TIER' for model '$MODEL' and" >&2
-        echo "ran this round at its default speed. Fast mode (fast = true in codex-review.toml, from" >&2
+        echo "ran this round at its default speed. Fast mode (fast = true in agent-review.toml, from" >&2
         echo "$FAST_SOURCE) is therefore NOT confirmed for this round; the catalogue of tiers a model" >&2
         echo "supports is \`codex debug models\`." >&2
     else
@@ -1592,12 +1893,12 @@ fi
 
 echo >&2
 echo "This round produced no review: $REASON." >&2
-echo "Exit $CODE (codex itself exited $status). Evidence: $ROUNDS_DIR/$stamp-*" >&2
+echo "Exit $CODE ($REVIEWER itself exited $status). Evidence: $ROUNDS_DIR/$stamp-*" >&2
 if [[ -n "$cli_error" ]]; then
-    echo "Codex reported: $cli_error" >&2
+    echo "$REVIEWER reported: $cli_error" >&2
 fi
 if [[ -s "$STDERR_FILE" ]]; then
-    echo "--- codex stderr (last 5 lines) ---" >&2
+    echo "--- $REVIEWER stderr (last 5 lines) ---" >&2
     tail -5 "$STDERR_FILE" >&2
 fi
 if [[ -s "$MESSAGE_FILE" ]]; then
