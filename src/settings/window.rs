@@ -1733,6 +1733,26 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
+        // The rendered label must be a resolved string, never the key itself: `t()` returns the key
+        // when no locale resolves it, so a wrong `title_key()` showed the key verbatim in the
+        // sidebar. The check above compares the button against the same `t(page.title_key())` and is
+        // self-consistent -- a raw key passes it -- so comparing against the key itself is the
+        // counter-example that does not.
+        let titles_are_resolved =
+            with_settings_ui(|ui| {
+                let ui = ui.as_ref()?;
+                let buttons = sidebar_buttons(ui);
+                let identities = settings_page_ids();
+                Some(buttons.iter().zip(identities.iter()).all(|(button, page)| {
+                    widgets::sidebar_button_title(*button) != page.title_key()
+                }))
+            })
+            .unwrap_or(false);
+        if !titles_are_resolved {
+            log_info!("[smoke-settings-layout] a sidebar button rendered its raw translation key");
+            hide_settings();
+            return false;
+        }
         // Switching pages re-applies every sidebar title, but only the accent colour moves: the
         // titles, fonts and row height are unchanged, so the resolved geometry still holds and the
         // bitmap measurement must not run again. That measurement renders the button and scans it on

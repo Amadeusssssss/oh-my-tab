@@ -87,15 +87,13 @@ impl SettingsPageId {
     /// refresh read one list, not two.
     pub(super) fn title_key(self) -> &'static str {
         match self {
-            SettingsPageId::General => "settings.sidebar_button(SettingsPageId::General)",
-            SettingsPageId::Switcher => "settings.sidebar_button(SettingsPageId::Switcher)",
-            SettingsPageId::Mouse => "settings.sidebar_button(SettingsPageId::Mouse)",
-            SettingsPageId::Clipboard => "settings.sidebar_button(SettingsPageId::Clipboard)",
-            SettingsPageId::KeyBindings => "settings.sidebar_button(SettingsPageId::KeyBindings)",
-            SettingsPageId::KeystrokeDisplay => {
-                "settings.sidebar_button(SettingsPageId::KeystrokeDisplay)"
-            }
-            SettingsPageId::About => "settings.sidebar_button(SettingsPageId::About)",
+            SettingsPageId::General => "settings.sidebar_general",
+            SettingsPageId::Switcher => "settings.sidebar_switcher",
+            SettingsPageId::Mouse => "settings.sidebar_mouse",
+            SettingsPageId::Clipboard => "settings.sidebar_clipboard",
+            SettingsPageId::KeyBindings => "settings.sidebar_key_bindings",
+            SettingsPageId::KeystrokeDisplay => "settings.sidebar_keystroke_display",
+            SettingsPageId::About => "settings.sidebar_about",
         }
     }
 }
@@ -2277,6 +2275,42 @@ mod tests {
             app.display()
         );
         app
+    }
+
+    /// The sidebar label is `t(title_key())`, and `t()` returns the key itself when no locale
+    /// entry resolves it -- so a botched key is shown verbatim in the sidebar (regression: commit
+    /// 89650ca shipped "settings.sidebar_button(SettingsPageId::General)" and the sidebar rendered
+    /// it). Assert both the mapping and that every key resolves, so a raw key cannot come back
+    /// unnoticed. The old GUI assertion compared the button title to `t(title_key())`, which is
+    /// self-consistent and stayed green on the broken key.
+    #[test]
+    fn sidebar_title_keys_resolve_in_the_locales() {
+        use super::SettingsPageId;
+        let expected = [
+            (SettingsPageId::General, "settings.sidebar_general"),
+            (SettingsPageId::Switcher, "settings.sidebar_switcher"),
+            (SettingsPageId::Mouse, "settings.sidebar_mouse"),
+            (SettingsPageId::Clipboard, "settings.sidebar_clipboard"),
+            (SettingsPageId::KeyBindings, "settings.sidebar_key_bindings"),
+            (
+                SettingsPageId::KeystrokeDisplay,
+                "settings.sidebar_keystroke_display",
+            ),
+            (SettingsPageId::About, "settings.sidebar_about"),
+        ];
+        assert_eq!(
+            expected.len(),
+            super::SETTINGS_PAGE_COUNT,
+            "every settings page must be covered here"
+        );
+        for (page, key) in expected {
+            assert_eq!(page.title_key(), key, "the sidebar key for {page:?} moved");
+            assert_ne!(
+                crate::i18n::t(key),
+                key,
+                "{key} resolves to itself, so the sidebar would show a raw key"
+            );
+        }
     }
 
     #[test]
