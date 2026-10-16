@@ -60,24 +60,19 @@ const THUMB_SELECTION_RING_TAG: isize = 0xE7F4;
 /// the renderer, and pixels are not a gate).
 pub(crate) const THUMB_FULLSCREEN_BADGE_TAG: isize = 0xE7F5;
 pub(crate) const THUMB_VISIBILITY_BADGE_TAG: isize = 0xE7F6;
-/// Liquid Glass washes out the mockup's 16% accent-soft; use 38% for a clearer selection.
-const SELECTION_RING_ALPHA: u8 = 0x61;
-/// Zero-offset glow around the ring, layered separately from the card's dark drop shadow.
-const SELECTION_GLOW_OPACITY: f32 = 0.35;
-const SELECTION_GLOW_RADIUS: f64 = 4.0;
-/// How far a selected card's decoration reaches outside the card's own frame: the ring's inset plus
-/// the glow drawn around the ring. Everything below the last row's card is clipped by the card
-/// viewport, so the card area's bottom inset (`theme::THUMB_BOTTOM_INSET`) must cover this.
-pub(crate) const SELECTION_DECORATION_INSET: f64 = OVERLAY_RING_INSET + SELECTION_GLOW_RADIUS;
-
-/// Compile-time invariant for the line above: the room the card area keeps below its last row covers
-/// what a selected card draws outside itself (or the footer's edge clips the selection).
+/// Tag for the scrim behind the icon-only card's close button. The button sits over the icon
+/// rather than over a filled plate, so the glyph needs its own chip to stay readable.
+pub(crate) const CLOSE_SCRIM_TAG: isize = 0xE7F7;
+/// Compile-time invariant: the thumbnail layout selects the whole card, so its ring reaches
+/// `theme::OVERLAY_RING_INSET` outside one, and the room the card area keeps below its last row
+/// must cover that or the footer's edge clips the ring. The icon-only plate nests inside its card
+/// and draws nothing outside it.
 const _: () = assert!(
-    crate::theme::THUMB_BOTTOM_INSET >= SELECTION_DECORATION_INSET,
-    "the card area's bottom inset must cover the selection ring and its glow"
+    crate::theme::THUMB_BOTTOM_INSET >= crate::theme::OVERLAY_RING_INSET,
+    "the card area's bottom inset must cover the thumbnail ring's outward reach"
 );
-/// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
-/// Distance that only the icon moves upward in legacy icon-only mode.
+/// Distance that the icon and, in icon-only mode, the selection plate nested around it move
+/// upward when selected, so the icon stays centred inside the plate.
 const SELECTED_CONTENT_NUDGE: f64 = 2.0;
 /// The mockup's `.item.selected { transform: translateY(-1px) }`: AppKit's y axis is
 /// positive upward, so the thumbnail card root uses +1pt and lifts its caption, preview,
@@ -632,11 +627,10 @@ pub(crate) unsafe fn smoke_footer_settings_button_fits() -> Result<(), String> {
 /// clip).
 ///
 /// The card viewport (the clip view) ends at the status footer, i.e. at the document's y = 0, and the
-/// selected card draws outside its own bounds: the ring sits `OVERLAY_RING_INSET` out and its
-/// zero-offset glow reaches `SELECTION_GLOW_RADIUS` further. A card closer to the document's bottom
-/// than that gets the ring clipped once the viewport is scrolled to the end -- the "the footer band
-/// covers the selection" defect. Card frames are document coordinates, so this holds at any offset and
-/// does not depend on the scroll position the smoke run happens to leave behind.
+/// thumbnail layout's ring reaches `theme::OVERLAY_RING_INSET` outside its card. A card closer to the
+/// document's bottom than that gets the ring clipped once the viewport is scrolled to the end -- the
+/// "the footer band covers the selection" defect. Card frames are document coordinates, so this holds
+/// at any offset and does not depend on the scroll position the smoke run happens to leave behind.
 pub(crate) unsafe fn smoke_bottom_card_clears_the_selection_ring() -> Result<Option<f64>, String> {
     let Some(document) = card_document() else {
         return Err("the card document view does not exist".to_string());
@@ -660,11 +654,11 @@ pub(crate) unsafe fn smoke_bottom_card_clears_the_selection_ring() -> Result<Opt
             ))
         };
     }
-    if bottom + 1e-6 < SELECTION_DECORATION_INSET {
+    let outside = crate::theme::OVERLAY_RING_INSET;
+    if bottom + 1e-6 < outside {
         return Err(format!(
-            "the bottom-most card sits {bottom:.1}pt above the viewport's bottom edge, \
-             less than the {SELECTION_DECORATION_INSET:.1}pt the selection ring and its glow draw \
-             outside it"
+            "the bottom-most card sits {bottom:.1}pt above the viewport's bottom edge, less than \
+             the {outside:.1}pt the thumbnail layout's ring draws outside it"
         ));
     }
     Ok(Some(bottom))
@@ -979,11 +973,6 @@ pub(crate) fn reset_thumbnail_nav_anchor() {
     *THUMB_NAV_ANCHOR_X.lock().unwrap() = None;
 }
 
-/// Preserve RRGGBB and replace only the alpha in RRGGBBAA.
-fn color_with_alpha(color: u32, alpha: u8) -> u32 {
-    (color & 0xFFFF_FF00) | u32::from(alpha)
-}
-
 fn thumbnail_card_lift_y(is_selected: bool) -> f64 {
     if is_selected {
         SELECTED_CARD_LIFT
@@ -1094,7 +1083,6 @@ mod tests {
     use super::card_caption;
     use super::card_reconcile_action;
     use super::cg_window_center_to_appkit_point;
-    use super::color_with_alpha;
     use super::delayed_order_out_should_hide;
     use super::display_title;
     use super::edge_row_nav_index;
@@ -1185,12 +1173,6 @@ mod tests {
             card_reconcile_action(Some(&painted), &current),
             CardReconcileAction::Replace
         );
-    }
-
-    #[test]
-    fn color_with_alpha_preserves_rgb() {
-        assert_eq!(color_with_alpha(0x4B7BECC7, 0x47), 0x4B7BEC47);
-        assert_eq!(color_with_alpha(0x5577CCFF, 0x57), 0x5577CC57);
     }
 
     #[test]

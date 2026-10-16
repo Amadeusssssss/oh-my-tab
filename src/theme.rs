@@ -21,11 +21,18 @@ pub(crate) const PANEL_MAX_WIDTH_RATIO: f64 = 0.92;
 /// Note: at 1.0 the panel may fill the visible area, covering an auto-hidden Dock (placement is
 /// clamped by clamp_into_visible in cards.rs, so it never crosses the menu bar).
 pub(crate) const PANEL_MAX_HEIGHT_RATIO: f64 = 1.0;
-/// Base icon-only card dimensions; width stays fixed while height reserves room for larger content.
+/// Icon-only card width; the height comes from the card's content (see `card_h`).
 pub(crate) const ICON_CARD_W: f64 = 140.0;
-pub(crate) const ICON_CARD_H: f64 = 180.0;
 pub(crate) const ICON_CARD_GAP: f64 = 0.0;
 pub(crate) const ICON_SIZE: f64 = 110.0;
+/// Gap between the card's top edge and the icon canvas in the icon-only layout.
+pub(crate) const ICON_TOP_INSET: f64 = 4.0;
+/// Gap between the icon canvas and the first caption line in the icon-only layout.
+pub(crate) const ICON_TEXT_GAP: f64 = 4.5;
+/// Gap between the two caption lines in the icon-only layout.
+pub(crate) const ICON_LINE_GAP: f64 = 2.0;
+/// Gap the card keeps below its last caption line.
+pub(crate) const ICON_BOTTOM_INSET: f64 = 4.0;
 pub(crate) const CARD_TEXT_BASE_SIZE: f64 = 12.0;
 pub(crate) const CARD_TEXT_SIZE_MIN: f64 = 13.0;
 pub(crate) const CARD_TEXT_SIZE_MAX: f64 = 20.0;
@@ -202,7 +209,32 @@ pub(crate) const MODAL_SCRIM: u32 = 0x00000040;
 pub(crate) const DISABLED_FILL_OPACITY: f64 = 0.5;
 pub(crate) const SETTINGS_WINDOW_RADIUS: f64 = 26.0;
 pub(crate) const OVERLAY_RING_INSET: f64 = 3.0;
+/// Captured window pixels keep square corners inside the rounded card.
 pub(crate) const THUMBNAIL_PREVIEW_RADIUS: f64 = 0.0;
+/// The icon-only selection ring: how far the plate sits outside the icon's *visible artwork*
+/// on every side. The plate is therefore narrower than the icon canvas, and shows as a ring in
+/// the canvas' own transparent margin rather than as a slab behind the icon. It must stay under
+/// the canvas margin itself -- 10.75pt for the artwork's 0.805 share of a 110pt canvas -- or the
+/// plate would leave the icon's own box and start filling the card's side margins.
+pub(crate) const SELECTION_RING_WIDTH: f64 = 7.0;
+/// The ring's stroke, drawn inward from the plate's edge (CALayer draws a border inside the
+/// frame). What is left of SELECTION_RING_WIDTH is the wash the rim sits on.
+pub(crate) const SELECTION_RING_STROKE: f64 = 2.0;
+/// Margin the icon-only card's hover target keeps inside its visible content.
+pub(crate) const SELECTION_HOVER_MARGIN: f64 = 4.0;
+/// Fraction of an app-icon canvas its visible artwork occupies: an icns canvas carries a
+/// transparent margin around the artwork. BetterCmdTab's `iconArtworkRatio` (412/512), fitted
+/// against the system icon masks; reused rather than re-derived.
+pub(crate) const ICON_ARTWORK_RATIO: f64 = 412.0 / 512.0;
+/// The radius the plate needs to nest evenly around an app icon's artwork, as a fraction of the
+/// artwork's side. This is deliberately *not* the squircle's own corner parameter (BetterCmdTab's
+/// `iconCornerRatio`, 107/412 = 0.2597): a "continuous" corner bulges closer to its box's corner
+/// than a circular arc of the same parameter, so a plate drawn at 0.2597 cuts in further than the
+/// artwork does and its ring comes out visibly thinner at the four corners. Measured by
+/// equalising the corner gap with the edge gap across the installed application icons, a 5.5pt
+/// ring reads 4.2pt at the corners under 0.2597 and 5.5pt under this value -- which is macOS's
+/// own documented circular-icon corner ratio.
+pub(crate) const ICON_ARTWORK_CORNER_RATIO: f64 = 0.223;
 
 fn linear_channel(value: f64) -> f64 {
     let value = value / 255.0;
@@ -347,6 +379,12 @@ pub(crate) struct UiPalette {
     pub(crate) switch_off_disabled_track: u32,
     pub(crate) switch_knob: u32,
     pub(crate) selection_bg: u32,
+    /// The switcher's icon plate: the surface a selected icon rides on. Heavier than the row
+    /// wash above, because it has to read as a filled plate at the size of an icon rather than as
+    /// a row highlight, and because the panel behind it is translucent glass -- `selection_bg`'s
+    /// light-mode 8% composites to almost nothing there, which left the icon's own white
+    /// background indistinguishable from the panel.
+    pub(crate) selection_plate_bg: u32,
     pub(crate) hover_bg: u32,
     pub(crate) accent: u32,
     pub(crate) accent_hover: u32,
@@ -406,6 +444,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             switch_off_disabled_track: 0x63636673,
             switch_knob: 0xF5F5F7F5,
             selection_bg: 0x0A84FF38,
+            selection_plate_bg: 0x0A84FF4D,
             hover_bg: 0xFFFFFF1A,
             accent: 0x0A84FFFF,
             accent_hover: 0x3D9BFFFF,
@@ -450,6 +489,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             switch_off_disabled_track: 0xC7C7CC73,
             switch_knob: 0xFFFFFFF5,
             selection_bg: 0x0A84FF14,
+            selection_plate_bg: 0x0A84FF38,
             hover_bg: 0x7676801F,
             accent: 0x0A84FFFF,
             accent_hover: 0x0077EDFF,
@@ -520,11 +560,19 @@ pub(crate) fn current_colors() -> Colors {
 pub(crate) fn card_w() -> f64 {
     ICON_CARD_W
 }
+/// The icon-only card's height: exactly what its content needs, with no slack. The previous
+/// form added a fixed reserve on top of a base height that already exceeded its content, which
+/// left ~27pt of blank inside the card's own bounds -- the plate ended up crammed 2pt above the
+/// caption while a band of nothing sat at the card's bottom.
 pub(crate) fn card_h() -> f64 {
-    let scale = text_scale();
-    // Keep the default card height stable. When text grows, add room for the two larger
-    // rows below the unchanged large icon.
-    ICON_CARD_H + ((18.0 * scale + 2.0 + 16.0 * scale) - 36.0).max(0.0)
+    let (primary_line_h, secondary_line_h) = icon_caption_line_heights();
+    ICON_TOP_INSET
+        + icon_px()
+        + ICON_TEXT_GAP
+        + primary_line_h
+        + ICON_LINE_GAP
+        + secondary_line_h
+        + ICON_BOTTOM_INSET
 }
 pub(crate) fn card_gap() -> f64 {
     ICON_CARD_GAP
@@ -534,6 +582,166 @@ pub(crate) fn icon_px() -> f64 {
 }
 pub(crate) fn letter_px() -> f64 {
     icon_px() * 0.5
+}
+
+/// The icon canvas' visible artwork, in points. An app icon's canvas carries a transparent
+/// margin around the artwork, so this is what the selection ring has to hug.
+pub(crate) fn icon_artwork_px() -> f64 {
+    icon_px() * ICON_ARTWORK_RATIO
+}
+
+/// The icon-only selection plate in card-local points (x, y, w, h), with y measured from
+/// the card's bottom (AppKit's non-flipped origin). It is centred on the icon canvas and sized
+/// around the artwork plus SELECTION_RING_WIDTH on every side -- narrower than the canvas
+/// itself, so the plate shows as a ring in the icon's own transparent margin instead of a slab
+/// behind it.
+pub(crate) fn icon_selection_plate(card_w: f64, card_h: f64) -> (f64, f64, f64, f64) {
+    let side = icon_artwork_px() + SELECTION_RING_WIDTH * 2.0;
+    let layout = icon_card_layout(card_w, card_h);
+    let inset = (icon_px() - side) / 2.0;
+    (
+        layout.icon_x + inset,
+        layout.icon_bottom + inset,
+        side,
+        side,
+    )
+}
+
+/// The plate's corner radius: the artwork's own corner plus the ring width, which is what keeps
+/// the ring the same width at the corners as along the edges. A fraction of the plate's own
+/// (smaller) side would pinch the corners.
+pub(crate) fn icon_selection_plate_radius() -> f64 {
+    icon_artwork_px() * ICON_ARTWORK_CORNER_RATIO + SELECTION_RING_WIDTH
+}
+
+/// The icon-only card's own vertical layout, shared by the card builder and the hover target,
+/// so the pointer-to-select area cannot drift from what the card actually draws. Card-local
+/// points, y measured from the card's bottom (AppKit's non-flipped origin).
+pub(crate) struct IconCardLayout {
+    pub(crate) icon_x: f64,
+    pub(crate) icon_bottom: f64,
+    pub(crate) primary_line_h: f64,
+    pub(crate) secondary_line_h: f64,
+    /// Bottom of the window-title line.
+    pub(crate) primary_bottom: f64,
+    /// Bottom of the app-name line: the lowest ink the card draws.
+    pub(crate) secondary_bottom: f64,
+}
+
+/// The two caption lines' heights, from the configured font sizes.
+fn icon_caption_line_heights() -> (f64, f64) {
+    (
+        line_height(card_title_font_size(), LINE_HEIGHT_TITLE_RATIO),
+        line_height(card_app_name_font_size(), LINE_HEIGHT_CAPTION_RATIO),
+    )
+}
+
+pub(crate) fn icon_card_layout(card_w: f64, card_h: f64) -> IconCardLayout {
+    let icon_bottom = card_h - ICON_TOP_INSET - icon_px();
+    let (primary_line_h, secondary_line_h) = icon_caption_line_heights();
+    let primary_bottom = icon_bottom - ICON_TEXT_GAP - primary_line_h;
+    IconCardLayout {
+        icon_x: (card_w - icon_px()) / 2.0,
+        icon_bottom,
+        primary_line_h,
+        secondary_line_h,
+        primary_bottom,
+        secondary_bottom: primary_bottom - ICON_LINE_GAP - secondary_line_h,
+    }
+}
+
+/// The icon-only card's hover target: where the pointer may select this card.
+///
+/// That is the card's visible content plus SELECTION_HOVER_MARGIN, not the card frame. Since
+/// `card_h` no longer leaves blank inside the card the two nearly coincide, but the card's own
+/// top strip (above the plate) stays outside, and a future change that re-introduces slack
+/// cannot silently make the pointer select from a band that draws nothing.
+///
+/// The width stays the card's own: the captions are centred and truncate at the card width, and
+/// with ICON_CARD_GAP == 0 a narrower target would open a gutter between neighbouring icons
+/// that the pointer has to cross.
+pub(crate) fn icon_hover_target(card_w: f64, card_h: f64) -> (f64, f64, f64, f64) {
+    let layout = icon_card_layout(card_w, card_h);
+    // The plate is the highest thing the card paints.
+    let (_, plate_y, _, plate_h) = icon_selection_plate(card_w, card_h);
+    let top = plate_y + plate_h;
+    let bottom = layout.secondary_bottom - SELECTION_HOVER_MARGIN;
+    (0.0, bottom, card_w, (top - bottom).max(1.0))
+}
+
+#[cfg(test)]
+mod icon_hover_target_tests {
+    use super::*;
+
+    /// It tops out at the plate -- the highest thing the card paints -- and keeps
+    /// SELECTION_HOVER_MARGIN under the last caption line.
+    #[test]
+    fn hover_target_tops_out_at_the_plate() {
+        let card_w = card_w();
+        let card_h = card_h();
+        let layout = icon_card_layout(card_w, card_h);
+        let (x, y, w, h) = icon_hover_target(card_w, card_h);
+        assert_eq!(x, 0.0, "the full width keeps neighbouring icons contiguous");
+        assert_eq!(w, card_w);
+        let (_, plate_y, _, plate_h) = icon_selection_plate(card_w, card_h);
+        assert!(
+            (y + h - (plate_y + plate_h)).abs() < 1e-9,
+            "the plate must stay inside"
+        );
+        assert!((y - (layout.secondary_bottom - SELECTION_HOVER_MARGIN)).abs() < 1e-9);
+    }
+
+    /// It stays inside the card and leaves the card's blank top strip out, while covering both
+    /// caption lines. `card_h` derives from the content, so what keeps the target honest is the
+    /// strip above the plate, not a band below the text.
+    #[test]
+    fn hover_target_stays_inside_the_card_without_its_top_strip() {
+        let card_w = card_w();
+        let card_h = card_h();
+        let layout = icon_card_layout(card_w, card_h);
+        let (_, y, _, h) = icon_hover_target(card_w, card_h);
+        assert!(y >= 0.0 && y + h <= card_h + 1e-9, "inside the card");
+        assert!(y + h < card_h, "the strip above the plate stays outside");
+        assert!(y < layout.secondary_bottom, "the app-name line is inside");
+        assert!(y + h > layout.primary_bottom, "the title line is inside");
+    }
+}
+
+#[cfg(test)]
+mod selection_plate_tests {
+    use super::*;
+
+    /// The plate hugs the icon's artwork, is centred on the canvas, and is *narrower* than that
+    /// canvas -- the whole point of the plate: it shows as a ring in the icon's transparent
+    /// margin rather than a slab behind the icon.
+    #[test]
+    fn plate_hugs_the_artwork_inside_the_canvas() {
+        let card_w = card_w();
+        let card_h = card_h();
+        let (x, y, w, h) = icon_selection_plate(card_w, card_h);
+        assert!((w - (icon_artwork_px() + SELECTION_RING_WIDTH * 2.0)).abs() < 1e-9);
+        assert!((h - w).abs() < 1e-9, "the plate is square");
+        assert!(w < icon_px(), "the plate sits inside the icon canvas");
+        // Concentric with the canvas, and exactly SELECTION_RING_WIDTH outside the artwork.
+        assert!((x + w / 2.0 - card_w / 2.0).abs() < 1e-9);
+        let layout = icon_card_layout(card_w, card_h);
+        assert!((y + h / 2.0 - (layout.icon_bottom + icon_px() / 2.0)).abs() < 1e-9);
+        let artwork_inset = (icon_px() - icon_artwork_px()) / 2.0;
+        assert!((x - (layout.icon_x + artwork_inset - SELECTION_RING_WIDTH)).abs() < 1e-9);
+        assert!((y - (layout.icon_bottom + artwork_inset - SELECTION_RING_WIDTH)).abs() < 1e-9);
+    }
+
+    /// The radius is the artwork's own corner plus the ring width, so the ring keeps the same
+    /// width at the corners as along the edges, and stays a squircle rather than a circle.
+    #[test]
+    fn plate_radius_keeps_the_ring_even() {
+        let radius = icon_selection_plate_radius();
+        let artwork_radius = icon_artwork_px() * ICON_ARTWORK_CORNER_RATIO;
+        assert!((radius - (artwork_radius + SELECTION_RING_WIDTH)).abs() < 1e-9);
+        assert!(radius > artwork_radius);
+        let side = icon_artwork_px() + SELECTION_RING_WIDTH * 2.0;
+        assert!(radius > 0.0 && radius < side / 2.0);
+    }
 }
 
 /// Scale shared by the card's window-title and app-name text.
@@ -2269,6 +2477,27 @@ mod tests {
         }
     }
 
+    /// The icon plate is a heavier wash than a list row: it has to carry a whole icon on
+    /// translucent glass, where the row wash's 8% light-mode alpha reads as nothing.
+    #[test]
+    fn selection_plate_wash_is_a_heavier_accent_than_a_row_wash() {
+        for (palette, expected) in [
+            (ui_palette_for_mode(false), 0.22),
+            (ui_palette_for_mode(true), 0.30),
+        ] {
+            let alpha = f64::from(palette.selection_plate_bg & 0xFF) / 255.0;
+            assert!((alpha - expected).abs() < 0.002, "{alpha}");
+            // The ring's own hue, so the plate and its rim cannot drift apart.
+            assert_eq!(
+                palette.selection_plate_bg & 0xFFFF_FF00,
+                palette.accent & 0xFFFF_FF00
+            );
+            assert!(alpha > f64::from(palette.selection_bg & 0xFF) / 255.0);
+            // ...and still a wash rather than an opaque fill.
+            assert!(alpha <= 0.35);
+        }
+    }
+
     #[test]
     fn documented_sidebar_destructive_and_symbol_roles_match_the_palette() {
         let light = ui_palette_for_mode(false);
@@ -2303,6 +2532,23 @@ mod tests {
         }
     }
 
+    /// The close button's hover chip fills with `destructive` while keeping the white glyph, so
+    /// that pairing has to clear the 3:1 non-text floor in both modes -- the glyph is the whole
+    /// affordance. (Turning the glyph red over the chip's mid grey instead measured ~1.4:1.)
+    #[test]
+    fn hovered_close_chip_glyph_meets_contrast_on_its_destructive_fill() {
+        for palette in [ui_palette_for_mode(false), ui_palette_for_mode(true)] {
+            let ratio = contrast_ratio(
+                color_rgb(palette.accent_text),
+                color_rgb(palette.destructive),
+            );
+            assert!(
+                ratio >= 3.0,
+                "hovered close glyph contrast is too low: {ratio:.2}:1"
+            );
+        }
+    }
+
     /// Hover and selection fills must be visible against the surface in both modes. They are
     /// translucent washes, so a literal that only suits one mode disappears in the other: the
     /// detail panel's save-as button filled its hover state with black at 5%, which measures
@@ -2321,6 +2567,7 @@ mod tests {
             for (role, token) in [
                 ("hover_bg", palette.hover_bg),
                 ("selection_bg", palette.selection_bg),
+                ("selection_plate_bg", palette.selection_plate_bg),
             ] {
                 let fill = composite_rgb(token, palette.window_bg);
                 let contrast = contrast_ratio(fill, surface);
@@ -3066,17 +3313,18 @@ mod flow_tests {
     }
 
     /// The bug this pins: the last row used to sit flush against the status footer, and the card
-    /// viewport -- which ends where the footer begins -- clipped the bottom of the selection ring the
-    /// selected card draws outside itself. Every production layout must leave the ring's outward
+    /// viewport -- which ends where the footer begins -- clipped the bottom of the ring the selected
+    /// thumbnail card draws outside itself. Every production layout must leave that ring's outward
     /// extent below its bottom-most card, and it must survive scrolling to the document's end (where
     /// the document's bottom edge is the viewport's).
     #[test]
-    fn the_bottom_row_clears_the_footer_for_the_selection_ring() {
+    fn the_bottom_row_clears_the_footer() {
         // The card frame's own y in document coordinates is what the clip view compares against:
-        // placements carry panel coordinates (the footer included), so subtracting `footer_band_h()` gives
-        // the offset above the viewport's bottom edge. The requirement comes from the ring's geometry,
-        // not from the inset constant, or shrinking the constant would satisfy the assertion.
-        let drawn_outside_the_card = crate::overlay::SELECTION_DECORATION_INSET;
+        // placements carry panel coordinates (the footer included), so subtracting `footer_band_h()`
+        // gives the offset above the viewport's bottom edge. The requirement comes from the ring's
+        // geometry (the thumbnail layout's ring is `OVERLAY_RING_INSET` out), not from the inset
+        // constant, or shrinking the constant would satisfy the assertion.
+        let drawn_outside_the_card = OVERLAY_RING_INSET;
         let room_below_the_last_card = |placements: &[ThumbPlacement]| {
             placements
                 .iter()

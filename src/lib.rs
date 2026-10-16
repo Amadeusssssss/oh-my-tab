@@ -3236,13 +3236,12 @@ pub fn run() {
                 msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 0.3f64];
             let _: () = msg_send![rl, runUntilDate: settle];
 
-            // Laid-out frames, not pixels: the bottom-most card must keep the room the selected-state
-            // ring draws into, or the status footer clips it (the card viewport ends there).
+            // Laid-out frames, not pixels: the bottom-most card must not be laid out below the card
+            // viewport, or the status footer covers the row's own content.
             match crate::overlay::smoke_bottom_card_clears_the_selection_ring() {
                 Ok(Some(clearance)) => log_info!(
-                    "[smoke-overlay] bottom row keeps {:.1}pt clear of the card viewport (selection ring draws {:.1}pt outside a card)",
-                    clearance,
-                    crate::overlay::SELECTION_DECORATION_INSET
+                    "[smoke-overlay] bottom row keeps {:.1}pt clear of the card viewport",
+                    clearance
                 ),
                 Ok(None) => log_info!(
                     "[smoke-overlay] no windows laid out; the selection-ring clearance not measured"

@@ -407,31 +407,46 @@ pub(crate) fn create_card_view(
 
         let colors = current_colors();
 
-        // The mockup's first box-shadow is a zero-blur soft-blue ring spread 2pt outward. A
-        // transparent NSImageView carries a 2pt border: expanding its frame by 2pt per side makes
-        // the inward-drawn border cover exactly the card's outer [-2,0] band. It is added before
-        // caption/preview content; masksToBounds=false keeps the outer ring visible.
-        // refresh_highlight owns visibility and theme color. Both layouts build it, so the
-        // icon-only selection is the same ring at the same concentric radius as the thumbnail one.
-        let ring_inset = crate::theme::OVERLAY_RING_INSET;
-        let ring_frame = NSRect::new(
-            NSPoint::new(-ring_inset, -ring_inset),
-            NSSize::new(card_width + ring_inset * 2.0, card_h + ring_inset * 2.0),
-        );
+        // The selection plate, built by both layouts and owned (visibility, colour) by
+        // refresh_highlight. What each one marks is the layout's own unit of selection:
+        // - Thumbnail mode selects the whole card -- caption row and preview together -- so its
+        //   ring wraps the card at the concentric `card_radius + OVERLAY_RING_INSET`. That inset
+        //   is what `theme::THUMB_BOTTOM_INSET` has to cover below the last row.
+        // - Icon-only mode selects the icon, so its plate wraps the icon's visible artwork
+        //   (theme::icon_selection_plate) and the captions stay outside it.
+        // masksToBounds=false on the plate's layer: its fill and border are drawn inside its own
+        // frame, but the card clip must not eat them while the card is translated.
+        let (ring_frame, ring_radius) = if use_new {
+            let inset = crate::theme::OVERLAY_RING_INSET;
+            (
+                NSRect::new(
+                    NSPoint::new(-inset, -inset),
+                    NSSize::new(card_width + inset * 2.0, card_h + inset * 2.0),
+                ),
+                radii.selection_ring,
+            )
+        } else {
+            let (px, py, pw, ph) = crate::theme::icon_selection_plate(card_width, card_h);
+            (
+                NSRect::new(NSPoint::new(px, py), NSSize::new(pw, ph)),
+                crate::theme::icon_selection_plate_radius(),
+            )
+        };
         let ring: *mut AnyObject = msg_send![class!(NSImageView), alloc];
         let ring: *mut AnyObject = msg_send![ring, initWithFrame: ring_frame];
         let _: () = msg_send![ring, setTag: THUMB_SELECTION_RING_TAG];
         let _: () = msg_send![ring, setWantsLayer: true];
         let ring_layer: *mut AnyObject = msg_send![ring, layer];
-        let _: () = msg_send![ring_layer, setCornerRadius: radii.selection_ring];
+        let _: () = msg_send![ring_layer, setCornerRadius: ring_radius];
         let _: () = msg_send![ring_layer, setMasksToBounds: false];
-        let _: () = msg_send![ring_layer, setBorderWidth: 2.0f64];
+        let _: () = msg_send![ring_layer, setBorderWidth: crate::theme::SELECTION_RING_STROKE];
+        // Both plates are "continuous" squircles, so their corner curve follows the artwork's or
+        // the preview's own rather than cutting a circular arc across it.
+        layer_set_continuous_corner_curve(ring_layer);
+        // Same rim token `refresh_highlight` paints; it owns the colour from here on.
         layer_set_border(
             ring_layer,
-            hex_to_cg_color(color_with_alpha(
-                colors.card_border_sel,
-                SELECTION_RING_ALPHA,
-            )),
+            hex_to_cg_color(crate::theme::ui_palette().accent),
         );
         let _: () = msg_send![ring, setHidden: true];
         let _: () = msg_send![view, addSubview: ring];
@@ -554,8 +569,12 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![view, addSubview: container];
             release_obj(container); // view owns the container; drop our alloc +1
         } else {
-            let icon_x = (card_width - icon_px()) / 2.0; // 16.0
-            let icon_bottom = card_h - 8.0 - icon_px(); // 64.0
+            // One shared derivation of the icon-only card's vertical layout: the card builder and
+            // `theme::icon_hover_target` both read it, so the pointer target cannot drift from
+            // what is actually drawn.
+            let layout = crate::theme::icon_card_layout(card_width, card_h);
+            let icon_x = layout.icon_x; // 15.0
+            let icon_bottom = layout.icon_bottom; // 70.5
 
             if let Some(ref icon_path) = w.icon_path {
                 let ns_path = make_nsstring(icon_path);
@@ -641,15 +660,13 @@ pub(crate) fn create_card_view(
                 }
             }
 
-            // Gap below icon before text starts
-            let text_gap: f64 = 6.0;
             // Primary line = window title, secondary = app name: title 12px medium
-            // (win_title), app name 10px regular (app_name).
-            let primary_line_h = card_title_font_size() * 1.2;
-            let secondary_line_h = card_app_name_font_size() * 1.35;
-            let primary_bottom = icon_bottom - text_gap - primary_line_h;
-            // Secondary line: 16px tall at the bottom.
-            let secondary_bottom = primary_bottom - 2.0 - secondary_line_h;
+            // (win_title), app name 10px regular (app_name). Both positions come from the shared
+            // layout so the hover target measures the same lines.
+            let primary_line_h = layout.primary_line_h;
+            let secondary_line_h = layout.secondary_line_h;
+            let primary_bottom = layout.primary_bottom;
+            let secondary_bottom = layout.secondary_bottom;
 
             // --- Primary line: window title (12px medium, dark).
             let primary_font_size = card_title_font_size();
@@ -692,7 +709,15 @@ pub(crate) fn create_card_view(
         // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
         let opts: u64 = 0x01 | 0x80;
         let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h));
+        // `mouseEntered:` selects the card, so the area has to be the target `handle_hover_at`
+        // tests, not the card frame: the icon-only layout keeps ~35pt of blank inside its own
+        // bounds (theme::icon_hover_target).
+        let (hx, hy, hw, hh) = if use_new {
+            (0.0, 0.0, card_width, card_h)
+        } else {
+            crate::theme::icon_hover_target(card_width, card_h)
+        };
+        let bounds = NSRect::new(NSPoint::new(hx, hy), NSSize::new(hw, hh));
         let ta: *mut AnyObject = msg_send![ta, initWithRect: bounds, options: opts, owner: view, userInfo: std::ptr::null::<AnyObject>()];
         let _: () = msg_send![view, addTrackingArea: ta];
         release_obj(ta); // view owns the tracking area; drop our alloc +1
@@ -700,7 +725,10 @@ pub(crate) fn create_card_view(
         // --- Close button: unified style across both layouts (20x20, radius 6,
         // font 12 -- identical to the legacy icon-mode button, hover-red included);
         // only the position follows the layout: caption-row right edge (centered)
-        // in thumbnail mode, top-right corner in legacy. ---
+        // in thumbnail mode, the card's top-right corner in legacy -- the plate is
+        // only a 5.5pt ring now, so the glyph has no room inside its corner and
+        // sits in the icon canvas' transparent margin instead, over the scrim
+        // added below. ---
         let (btn_frame, btn_radius, btn_font_sz) = if use_new {
             let caption_h = thumb_caption_h_for_card(card_h);
             let caption_y = card_h - THUMB_PAD - caption_h;
@@ -725,6 +753,35 @@ pub(crate) fn create_card_view(
                 crate::theme::FONT_CAPTION,
             )
         };
+        if !use_new {
+            // The icon-only button sits over the icon itself, so it carries its own chip:
+            // the same `badge_scrim` + white glyph the preview badges use (design-style §11),
+            // because a bare glyph is unreadable on some icons. Added before the button so the
+            // button stays on top; `refresh_highlight` owns its visibility, and the button
+            // reads the scrim's presence to pick its glyph colour.
+            //
+            // NSImageView, not NSView: `setTag:` exists only on NSControl-derived classes and a
+            // bare NSView's `tag` is readonly, so the send raises "method not found" (the same
+            // pitfall the letter avatar and the preview container document). An image-less
+            // NSImageView draws nothing but its layer, which is all the scrim is.
+            let scrim: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+            let scrim: *mut AnyObject = msg_send![scrim, initWithFrame: btn_frame];
+            let _: () = msg_send![scrim, setTag: CLOSE_SCRIM_TAG];
+            let _: () = msg_send![scrim, setWantsLayer: true];
+            let scrim_layer: *mut AnyObject = msg_send![scrim, layer];
+            let _: () = msg_send![
+                scrim_layer,
+                setCornerRadius: btn_frame.size.width / 2.0
+            ];
+            let _: () = msg_send![scrim_layer, setMasksToBounds: true];
+            layer_set_background(
+                scrim_layer,
+                hex_to_cg_color(crate::theme::ui_palette().badge_scrim),
+            );
+            let _: () = msg_send![scrim, setHidden: true];
+            let _: () = msg_send![view, addSubview: scrim];
+            release_obj(scrim);
+        }
         let btn = make_close_button(btn_frame, btn_font_sz, btn_radius);
         let _: () = msg_send![btn, setTag: CLOSE_BTN_TAG];
         let _: () = msg_send![btn, setTarget: crate::CONTROLLER.lock().unwrap().unwrap().0];
@@ -732,6 +789,13 @@ pub(crate) fn create_card_view(
         let _: () = msg_send![btn, setHidden: true];
 
         let _: () = msg_send![view, addSubview: btn];
+        if !use_new {
+            // Resolve the base palette again now that the button has a superview. The icon-only
+            // button reads the scrim behind it to pick a glyph colour that contrasts with that
+            // scrim, and `make_close_button` ran before the button was in any view tree -- so its
+            // first pass fell back to the ink meant for the panel's material.
+            reset_close_button_hover(btn);
+        }
         release_obj(btn); // view owns the button; drop our alloc +1
 
         view
@@ -1518,13 +1582,20 @@ unsafe fn view_with_tag(view: *mut AnyObject, tag: isize) -> Option<*mut AnyObje
     None
 }
 
-/// A1 runner for the selected-state ring, driven by controlled card input instead of a summon: it
-/// builds the real card view once per layout and asserts both carry exactly one ring, sized
-/// `OVERLAY_RING_INSET` outside the card with the documented concentric corner radius
-/// (`card_radius + ring_inset`) and hidden until a selection shows it.
+/// A1 runner for the selected-state decoration, driven by controlled card input instead of a
+/// summon: it builds the real card view once per layout and asserts each carries exactly one
+/// decoration view, hidden until a selection shows it, with the geometry and border that layout
+/// documents -- the thumbnail layout's ring `OVERLAY_RING_INSET` outside the card at the
+/// concentric `card_radius + ring_inset`, the icon-only layout's plate hugging the icon canvas at
+/// `icon_selection_plate_radius`.
 ///
-/// The counter-example is built in: the icon-only layout used to construct no ring at all, so its
-/// selection drew only the card's own 1.5pt border and read differently from the thumbnail layout.
+/// Four counter-examples are built in. The icon-only layout once constructed no ring at all, so
+/// its selection drew only the card's own 1.5pt border and read differently from the thumbnail
+/// layout; the plate's own numbers are asserted here so a card laid out at a non-base size (this
+/// runner builds 220x170) still hugs its icon rather than the card; building the close button's
+/// scrim is asserted per layout, which is where a bare NSView's readonly `tag` once panicked
+/// before the button ever reached the screen; and the button's glyph ink is read off the button,
+/// because the ink meant for the panel's material disappears into that scrim.
 /// Needs a GUI session and the main thread. The layout switch writes the in-memory config slot that
 /// a runtime reload writes, and restores it before returning.
 pub(crate) fn smoke_selection_ring() -> bool {
@@ -1545,8 +1616,9 @@ pub(crate) fn smoke_selection_ring() -> bool {
         };
         let card_width = 220.0;
         let card_h = 170.0;
+        let (plate_x, plate_y, plate_w, plate_h) =
+            crate::theme::icon_selection_plate(card_width, card_h);
         let radii = crate::theme::overlay_radii(crate::theme::overlay_card_radius(), THUMB_PAD);
-        let ring_inset = crate::theme::OVERLAY_RING_INSET;
         let mut ok = true;
         for thumbnails in [true, false] {
             let previous = {
@@ -1558,6 +1630,24 @@ pub(crate) fn smoke_selection_ring() -> bool {
             let card = create_card_view(&window, 0, card_width, card_h, true);
             let rings = count_views_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
             let ring = view_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
+            let (want_frame, want_radius) = if thumbnails {
+                let inset = crate::theme::OVERLAY_RING_INSET;
+                (
+                    NSRect::new(
+                        NSPoint::new(-inset, -inset),
+                        NSSize::new(card_width + inset * 2.0, card_h + inset * 2.0),
+                    ),
+                    radii.selection_ring,
+                )
+            } else {
+                (
+                    NSRect::new(
+                        NSPoint::new(plate_x, plate_y),
+                        NSSize::new(plate_w, plate_h),
+                    ),
+                    crate::theme::icon_selection_plate_radius(),
+                )
+            };
             let mut frame_ok = false;
             let mut radius_ok = false;
             let mut border_ok = false;
@@ -1568,22 +1658,62 @@ pub(crate) fn smoke_selection_ring() -> bool {
                 let radius: f64 = msg_send![layer, cornerRadius];
                 let border: f64 = msg_send![layer, borderWidth];
                 hidden = msg_send![ring, isHidden];
-                frame_ok = (frame.origin.x + ring_inset).abs() < 0.5
-                    && (frame.origin.y + ring_inset).abs() < 0.5
-                    && (frame.size.width - (card_width + ring_inset * 2.0)).abs() < 0.5
-                    && (frame.size.height - (card_h + ring_inset * 2.0)).abs() < 0.5;
-                radius_ok = (radius - radii.selection_ring).abs() < 0.01;
-                border_ok = (border - 2.0).abs() < 0.01;
+                frame_ok = (frame.origin.x - want_frame.origin.x).abs() < 0.5
+                    && (frame.origin.y - want_frame.origin.y).abs() < 0.5
+                    && (frame.size.width - want_frame.size.width).abs() < 0.5
+                    && (frame.size.height - want_frame.size.height).abs() < 0.5;
+                radius_ok = (radius - want_radius).abs() < 0.01;
+                border_ok = (border - crate::theme::SELECTION_RING_STROKE).abs() < 0.01;
             }
-            let this_ok = rings == 1 && frame_ok && radius_ok && border_ok && hidden;
+            // The icon-only card also builds the scrim behind its close button, and the
+            // thumbnail card must not. Pinned here because constructing that view is exactly
+            // where the "a bare NSView has no settable tag" panic lived: a crash inside card
+            // construction shows up to a person only as an overlay that never appears.
+            let scrims = count_views_with_tag(card, crate::overlay::CLOSE_SCRIM_TAG);
+            let scrim_ok = if thumbnails {
+                scrims == 0
+            } else if let Some(scrim) = view_with_tag(card, crate::overlay::CLOSE_SCRIM_TAG) {
+                let scrim_hidden: bool = msg_send![scrim, isHidden];
+                scrim_hidden && scrims == 1
+            } else {
+                false
+            };
+            // The close button's glyph ink has to suit the surface under it: `accent_text` over
+            // the icon-only chip, the panel material's ink otherwise. Read the colour the button
+            // actually carries, so dropping the re-resolve that runs once the button is in the
+            // view tree fails here instead of surfacing as a glyph that vanishes into the chip.
+            let glyph_ok = match view_with_tag(card, crate::overlay::CLOSE_BTN_TAG) {
+                Some(btn) => {
+                    let palette = crate::theme::ui_palette();
+                    let want = if thumbnails {
+                        palette.muted_text
+                    } else {
+                        palette.accent_text
+                    };
+                    let want = [
+                        f64::from((want >> 24) & 0xFF) / 255.0,
+                        f64::from((want >> 16) & 0xFF) / 255.0,
+                        f64::from((want >> 8) & 0xFF) / 255.0,
+                        f64::from(want & 0xFF) / 255.0,
+                    ];
+                    let tint: *mut AnyObject = msg_send![btn, contentTintColor];
+                    crate::ffi::ns_color_components(tint)
+                        .is_some_and(|got| got.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.01))
+                }
+                None => false,
+            };
+            let this_ok =
+                rings == 1 && frame_ok && radius_ok && border_ok && hidden && scrim_ok && glyph_ok;
             log_info!(
-                "[smoke-selection-ring] thumbnails={} rings={} frame_ok={} radius_ok={} border_ok={} hidden={}",
+                "[smoke-selection-ring] thumbnails={} rings={} frame_ok={} radius_ok={} border_ok={} hidden={} scrim_ok={} glyph_ok={}",
                 thumbnails,
                 rings,
                 frame_ok,
                 radius_ok,
                 border_ok,
-                hidden
+                hidden,
+                scrim_ok,
+                glyph_ok
             );
             ok = ok && this_ok;
             release_obj(card);

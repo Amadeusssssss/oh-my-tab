@@ -503,11 +503,14 @@ pub(crate) fn refresh_highlight() {
         }) else {
             return;
         };
-        let colors = current_colors();
-        // Match the HTML reference with a subtle background and 1.5px inset-style border instead of
-        // the previous heavy blue outline.
-        let sel_bg_color = hex_to_cg_color(colors.card_bg_sel);
-        let sel_border_color = hex_to_cg_color(colors.card_border_sel);
+        // Both layouts mark the selection with a plate, using the design system's own tokens
+        // (design-style §3/§12): `accent` for the rim and `selection_plate_bg` for the wash.
+        // `colors.card_bg_sel` / `card_border_sel` no longer colour the switcher at all -- the
+        // plate hugs the icon or the preview rather than the card, so a card-shaped fill, border
+        // and drop shadow are gone.
+        let palette = ui_palette();
+        let plate_bg_color = hex_to_cg_color(palette.selection_plate_bg);
+        let plate_border_color = hex_to_cg_color(palette.accent);
 
         for sv in card_views(document) {
             let layer: *mut AnyObject = msg_send![sv, layer];
@@ -517,74 +520,62 @@ pub(crate) fn refresh_highlight() {
             // Read the card's title-label text to verify content matches the index (investigating
             // "shows Picview but opens Ghostty").
             let is_selected = tag == selected;
+            // A thumbnail card carries the preview view; the icon-only layout does not. That is a
+            // per-card fact, so a layout swap mid-session cannot leave a card decorated the old
+            // way, and it is the same signal the thumbnail lift below already relies on.
             let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
-            if !preview.is_null() {
+            let icon_only = preview.is_null();
+            // The plate below is the whole selection decoration in both layouts: the card itself
+            // never paints, so the panel's material stays behind the icons, the previews and the
+            // caption rows. Stated unconditionally rather than only on selection, so a reused card
+            // cannot inherit a previous decoration.
+            let _: () = msg_send![layer, setBorderWidth: 0.0f64];
+            layer_set_border(layer, std::ptr::null_mut());
+            layer_set_background(layer, std::ptr::null_mut());
+            let _: () = msg_send![layer, setShadowOpacity: 0.0f32];
+            if !icon_only {
                 // The HTML applies translateY(-1px) to the `.item.selected` root rather
                 // than `.preview`; +1pt in AppKit coordinates lifts the caption row and
-                // preview together as one card.
+                // preview together as one card. The plate is a subview, so it lifts with them.
                 layer_set_translation_y(layer, thumbnail_card_lift_y(is_selected));
             }
-            if is_selected {
-                // The mockup's .item.selected: a crisp 1.5px accent border
-                // rgba(75,123,236,.78). A soft ring is invisible on the white
-                // surface -- the outline needs the solid accent to show.
-                let _: () = msg_send![layer, setBorderWidth: 1.5f64];
-                layer_set_border(layer, sel_border_color);
-                layer_set_background(layer, sel_bg_color);
-                // Drop shadow: 0 10px 24px rgba(42,62,102,.12), straight from the mockup.
-                // CSS blur 24 ≈ CALayer shadowRadius 12; CALayer's shadowOffset y is up-positive,
-                // so a downward shadow takes -10.
-                let shadow_color = hex_to_cg_color(0x2A3E66FF);
-                // A CGColorRef cannot go through objc2's msg_send! ('@' vs
-                // '^{CGColor=}' rejected at runtime -- crashed the summon, verified);
-                // use raw objc_msgSend per the layer_set_background convention.
-                layer_set_shadow_color(layer, shadow_color);
-                let _: () = msg_send![layer, setShadowOpacity: 0.12f32];
-                let _: () = msg_send![layer, setShadowRadius: 12.0f64];
-                let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -10.0)];
-            } else {
-                let _: () = msg_send![layer, setBorderWidth: 0.0f64];
-                layer_set_border(layer, std::ptr::null_mut());
-                layer_set_background(layer, std::ptr::null_mut());
-                let _: () = msg_send![layer, setShadowOpacity: 0.0f32];
-            }
 
-            // The first CSS box-shadow is a zero-blur 2px accent-soft ring outside the
-            // card; it cannot share CALayer.shadow with the dark blurred drop shadow.
-            // A dedicated ring view preserves the RGB, raises alpha to 38% for Liquid
-            // Glass, adds a zero-offset blue glow, and appears only on the selected card.
             let ring: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_SELECTION_RING_TAG];
             if !ring.is_null() {
                 let ring_layer: *mut AnyObject = msg_send![ring, layer];
-                layer_set_border(
-                    ring_layer,
-                    hex_to_cg_color(color_with_alpha(
-                        colors.card_border_sel,
-                        SELECTION_RING_ALPHA,
-                    )),
-                );
-                layer_set_shadow_color(
-                    ring_layer,
-                    hex_to_cg_color(color_with_alpha(colors.card_border_sel, 0xFF)),
-                );
-                let glow_opacity = if is_selected {
-                    SELECTION_GLOW_OPACITY
-                } else {
-                    0.0
-                };
-                let _: () = msg_send![ring_layer, setShadowOpacity: glow_opacity];
-                let _: () = msg_send![ring_layer, setShadowRadius: SELECTION_GLOW_RADIUS];
-                let _: () = msg_send![ring_layer, setShadowOffset: NSSize::new(0.0, 0.0)];
+                // One rim and one wash, no glow and no drop shadow: the plate marks the icon or
+                // the window by nesting around it, and a glow would only re-add the halo this
+                // replaced.
+                layer_set_border(ring_layer, plate_border_color);
+                layer_set_background(ring_layer, plate_bg_color);
+                let _: () = msg_send![ring_layer, setShadowOpacity: 0.0f32];
+                if icon_only {
+                    // The icon-only plate takes the same SELECTED_CONTENT_NUDGE the icon below
+                    // takes, so the two stay concentric instead of the icon drifting toward the
+                    // plate's top edge. The thumbnail plate is a subview of the lifted card and
+                    // follows it without help.
+                    let frame: NSRect = msg_send![sv, frame];
+                    let (px, py, _, _) =
+                        crate::theme::icon_selection_plate(frame.size.width, frame.size.height);
+                    let lift = if is_selected {
+                        SELECTED_CONTENT_NUDGE
+                    } else {
+                        0.0
+                    };
+                    let _: () = msg_send![ring, setFrameOrigin: NSPoint::new(px, py + lift)];
+                }
                 let _: () = msg_send![ring, setHidden: !is_selected];
             }
 
-            // Nudge the icon up by 2pt when selected; recompute from the baseline on every
-            // refresh so repeated selection changes never accumulate the offset.
+            // Nudge the icon up when selected; recompute from the baseline on every refresh so
+            // repeated selection changes never accumulate the offset. The icon-only plate above
+            // takes the same SELECTED_CONTENT_NUDGE, which is what keeps the icon centred inside
+            // it -- moving one without the other pulls the icon off its plate.
             let icon: *mut AnyObject = msg_send![sv, viewWithTag: ICON_VIEW_TAG];
             if !icon.is_null() {
                 let icon_frame: NSRect = msg_send![icon, frame];
                 let icon_px_now = icon_frame.size.height;
-                let icon_bottom = card_h() - 8.0 - icon_px();
+                let icon_bottom = card_h() - crate::theme::ICON_TOP_INSET - icon_px();
                 let base_y = if (icon_px_now - icon_px()).abs() < 0.5 {
                     icon_bottom
                 } else {
@@ -612,6 +603,11 @@ pub(crate) fn refresh_highlight() {
             let btn: *mut AnyObject = msg_send![sv, viewWithTag: CLOSE_BTN_TAG];
             if !btn.is_null() {
                 let _: () = msg_send![btn, setHidden: tag != selected];
+            }
+            // The icon-only button's scrim follows it; the thumbnail layout has none.
+            let scrim: *mut AnyObject = msg_send![sv, viewWithTag: CLOSE_SCRIM_TAG];
+            if !scrim.is_null() {
+                let _: () = msg_send![scrim, setHidden: tag != selected];
             }
         }
     }

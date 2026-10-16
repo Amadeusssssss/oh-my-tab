@@ -888,6 +888,19 @@ pub(crate) unsafe fn layer_border_color(layer: *mut AnyObject) -> *mut c_void {
     f(layer as *mut c_void, sel)
 }
 
+/// Set CALayer.cornerCurve to `continuous` -- the squircle Apple's own surfaces use, which is
+/// what lets a rounded plate nest around an app icon without pinching its corners. A no-op
+/// where the property does not exist (a CALayer before macOS 10.15).
+pub(crate) unsafe fn layer_set_continuous_corner_curve(layer: *mut AnyObject) {
+    let responds: bool = msg_send![layer, respondsToSelector: sel!(setCornerCurve:)];
+    if !responds {
+        return;
+    }
+    let curve = make_nsstring("continuous");
+    let _: () = msg_send![layer, setCornerCurve: curve];
+    CFRelease(curve as *const c_void);
+}
+
 /// Set CALayer.borderColor using raw objc_msgSend (CGColorRef, not NSColor*).
 pub(crate) unsafe fn layer_set_border(layer: *mut AnyObject, cg: *mut c_void) {
     let sel = sel!(setBorderColor:);

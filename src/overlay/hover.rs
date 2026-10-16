@@ -29,12 +29,23 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
             convertPoint: loc,
             fromView: std::ptr::null::<AnyObject>()
         ];
+        // Icon-only cards are hit through `theme::icon_hover_target`, which is smaller than their
+        // frame; every card in a grid shares one size, so it is derived once and reused. The
+        // thumbnail layout keeps its whole frame, whose blank is only the 8pt inner padding.
+        let mut icon_target: Option<(f64, f64, f64, f64)> = None;
         for sv in card_views(document) {
             let frame: NSRect = msg_send![sv, frame];
-            let inside = document_point.x >= frame.origin.x
-                && document_point.x <= frame.origin.x + frame.size.width
-                && document_point.y >= frame.origin.y
-                && document_point.y <= frame.origin.y + frame.size.height;
+            let (fw, fh) = (frame.size.width, frame.size.height);
+            let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
+            let (tx, ty, tw, th) = if preview.is_null() {
+                *icon_target.get_or_insert_with(|| crate::theme::icon_hover_target(fw, fh))
+            } else {
+                (0.0, 0.0, fw, fh)
+            };
+            let inside = document_point.x >= frame.origin.x + tx
+                && document_point.x <= frame.origin.x + tx + tw
+                && document_point.y >= frame.origin.y + ty
+                && document_point.y <= frame.origin.y + ty + th;
             if !inside {
                 continue;
             }

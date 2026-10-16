@@ -82,6 +82,7 @@
 | `switch_off_disabled_track` | `rgba(199,199,204,.45)` | `rgba(99,99,102,.45)` | 禁用的关闭态开关轨道 |
 | `switch_knob` | `rgba(255,255,255,.96)` | `rgba(245,245,247,.96)` | 开关滑块 |
 | `selection_bg` | `rgba(10,132,255,.08)` | `rgba(10,132,255,.22)` | 选中的侧边栏行、选中的列表块 |
+| `selection_plate_bg` | `rgba(10,132,255,.22)` | `rgba(10,132,255,.30)` | 切换器的图标色板。比行选中更重：它要在半透明玻璃上承载一整个图标，`.08` 在那里等于看不见 |
 | `hover_bg` | `rgba(118,118,128,.12)` | `rgba(255,255,255,.10)` | 悬停的行 / 列表项 |
 | `shadow` | `rgba(0,0,0,.06)` | `rgba(0,0,0,.35)` | elevation 阴影（见 §7） |
 
@@ -401,9 +402,22 @@ Markdown 更新说明的一级标题使用 `sidebar-title` 粗体，二级标题
 
 **同心规则。** 有内边距的圆角容器，其内部元素的圆角为 `max(0, 外圆角 - 内边距)`。围绕卡片绘制的选中环
 半径为 `卡片圆角 + 环内缩`，从而与卡片保持平行；绝不手工指定环半径。
-切换器选中环的 `ring_inset` 为 3pt。切换器卡片区底部另留 8pt 内缩（`theme::THUMB_BOTTOM_INSET`：3pt 环
-加 4pt 光晕，落在 4pt 栅格上），因为卡片视口止于底部标题栏，否则最后一排的选中环会被裁掉。这 8pt 从
-标题栏自身高度中扣除，不占用卡片尺寸预算。
+切换器选中环的 `ring_inset` 为 3pt，且选中的是**整张卡片**——上面的标题行和窗口预览一起——所以切换器卡片区
+底部另留 8pt 内缩（`theme::THUMB_BOTTOM_INSET`）来覆盖这 3pt 的外扩，否则卡片视口（止于底部标题栏）会把
+最后一排的选中环裁掉。这 8pt 从标题栏自身高度中扣除，不占用卡片尺寸预算，`overlay` 里有编译期断言保证覆盖。
+
+**纯图标**模式的切换器卡片不用这个环，而是用一块**色板**贴住图标**实际可见的图形**（artwork）：图形四周各
+外扩 `7pt`（`theme::SELECTION_RING_WIDTH`），所以色板**比图标画布还窄**，读起来是画布透明边距里的一圈
+环，而不是图标背后的一块底色。填色用 `selection_plate_bg`——比列表行的 `selection_bg` 更重，因为要在半透明玻璃上托住一整个图标——描边 `2pt`（`theme::SELECTION_RING_STROKE`）用 `accent`，圆角曲线用**超椭圆**
+（`CALayer.cornerCurve`）。圆角取图形自身的圆角加环宽（`theme::icon_selection_plate_radius`），这样环在四角
+和四边一样宽；按色板自身边长取比例会把四个角掐尖。`ICON_ARTWORK_RATIO` 是图形占画布的比例（Apple 自己的
+`412/512`），`ICON_ARTWORK_CORNER_RATIO` 则是与「超椭圆图标圆角」等价的**正圆**半径——它比超椭圆自身的参数小，
+因为超椭圆的角比方弧更贴近外接框的角。文字行留在色板之外，面板材质仍在文字后面透出来。
+
+卡片高度严格等于内容所需（`theme::card_h`）：图标画布 + 两行文字 + 各内边距。过去是「固定基准高度 + 额外预留」，
+结果卡片内部空出约 35pt——色板被挤到距标题只有 2pt，而底部空着一整条。**触发选中的范围仍不是卡片 frame**，
+而是内容框再加 `SELECTION_HOVER_MARGIN`（`theme::icon_hover_target`），宽度用卡片整宽——文字居中并按卡片宽度
+截断，而且整宽才能让相邻图标之间对指针保持连贯。
 
 小尺寸色块的圆角由自身高度推导，而不是套用 `radius-control`：`radius-control` 是按 32pt 控件设计的，
 用在 19pt 色块上会占掉 42% 的高度，形状变成**胶囊**而不是「柔化过的矩形」。`radius-legend-chip`（5pt）
@@ -578,7 +592,7 @@ Page Down／下一页），使固定宽度容纳所有已发布语言的键名�
 | normal | 基础 token |
 | hover | `hover_bg` 填充（瞬时，无过渡） |
 | pressed | 填充型控件用 ~85% 的 accent；描边型用 `hover_bg` + 轻微内陷 |
-| selected | `selection_bg` 填充，或卡片/色块使用 accent 环 |
+| selected | 行/列表块用 `selection_bg` 填充；卡片或图标色板用 `selection_plate_bg` + accent 环 |
 | open | `hover_bg` 填充、描边保持 idle；在同一位置就地展开的控件用 `hover_bg` + 轻微内陷。收起时必须清掉 open 表面：accent 环属于 focus，不属于“已展开” |
 | disabled | `text_disabled`，控件填充 50% 不透明度，无 hover 反馈 |
 | focus（键盘） | 内嵌 accent 环，2pt，在 `card_bg` 与 `window_bg` 上都清晰可见 |

@@ -93,6 +93,7 @@ auxiliary panels). Never inline a hex value in a view builder.
 | `switch_off_disabled_track` | `rgba(199,199,204,.45)` | `rgba(99,99,102,.45)` | Disabled off-state switch track |
 | `switch_knob` | `rgba(255,255,255,.96)` | `rgba(245,245,247,.96)` | Switch knob |
 | `selection_bg` | `rgba(10,132,255,.08)` | `rgba(10,132,255,.22)` | Selected sidebar row, selected list tile |
+| `selection_plate_bg` | `rgba(10,132,255,.22)` | `rgba(10,132,255,.30)` | The switcher's icon plate. Heavier than a row wash because it carries a whole icon on translucent glass, where `.08` reads as nothing |
 | `hover_bg` | `rgba(118,118,128,.12)` | `rgba(255,255,255,.10)` | Hovered row / list item |
 | `shadow` | `rgba(0,0,0,.06)` | `rgba(0,0,0,.35)` | Elevation shadows (see §7) |
 
@@ -484,10 +485,32 @@ density and the larger one to separate sections; never mix `12` and `14` for the
 **Concentric rule.** A rounded container with padding gives its inner element
 `max(0, outer_radius - padding)`. A selection ring drawn around a card is
 `card_radius + ring_inset` so the two stay parallel; never pick the ring radius by hand.
-The switcher selection ring uses a 3pt `ring_inset`, and the switcher's card area keeps an 8pt bottom
-inset (`theme::THUMB_BOTTOM_INSET`: the 3pt ring plus its 4pt glow, on the 4pt grid) so the card
-viewport — which ends at the footer band — cannot clip the ring on the last row. That inset comes out
-of the footer band's own height, not out of the card-size budget.
+The switcher selection ring uses a 3pt `ring_inset` and selects the **whole card** — the caption row
+and the window preview together — so the switcher's card area keeps an 8pt bottom inset
+(`theme::THUMB_BOTTOM_INSET`) to cover that 3pt of outward reach, or the card viewport (which ends at
+the footer band) would clip the ring on the last row. That inset comes out of the footer band's own
+height, not out of the card-size budget, and `overlay` asserts the coverage at compile time.
+
+An **icon-only** switcher tile does not use that ring. It marks selection with a *plate* that hugs the
+icon's visible **artwork**: the artwork plus `7pt` on every side (`theme::SELECTION_RING_WIDTH`), so the
+plate is *narrower* than the icon canvas and reads as a ring in the icon's own transparent margin, not as a
+slab behind it. It is filled with `selection_plate_bg` -- a heavier wash than a list row's
+`selection_bg`, because a whole icon has to read against translucent glass -- rimmed with `2pt` of `accent`
+(`theme::SELECTION_RING_STROKE`) and drawn on a
+**continuous** corner curve (`CALayer.cornerCurve`). Its radius is the artwork's own corner plus the ring
+width (`theme::icon_selection_plate_radius`), which is what keeps the ring as wide at the corners as along
+the edges; the plate's own side would pinch them. `ICON_ARTWORK_RATIO` is the artwork's share of the canvas
+(Apple's own `412/512`), and `ICON_ARTWORK_CORNER_RATIO` is the *circular* radius that matches a
+"continuous" icon corner -- smaller than the squircle's own parameter, because a squircle bulges closer to
+its box's corner than a circular arc does. The caption rows stay outside the plate, so the panel's material
+keeps showing behind the text.
+
+The tile's height is exactly what its content needs (`theme::card_h`): icon canvas, both caption lines and
+the insets. A fixed base height plus a reserve used to leave ~35pt of blank inside the card -- the plate
+ended up 2pt above the caption while a band of nothing sat at the bottom. Its pointer-to-select target is
+still not the card frame but the content plus `SELECTION_HOVER_MARGIN` (`theme::icon_hover_target`) at the
+card's full width -- the captions are centred and truncate at that width, and the full width is what keeps
+neighbouring icons contiguous for the pointer.
 
 A small chip derives its radius from its own height rather than taking `radius-control`:
 `radius-control` is sized for 32pt controls, and on a 19pt chip it consumes 42% of the height and
@@ -758,7 +781,7 @@ Every custom-drawn control needs all six states, and each uses the token above, 
 | normal | base tokens |
 | hover | `hover_bg` fill (instant, no transition) |
 | pressed | accent at ~85% for filled controls; `hover_bg` + slight inset for bordered ones |
-| selected | `selection_bg` fill, or an accent ring for cards and tiles |
+| selected | `selection_bg` fill for a row or list tile; a card or icon plate uses `selection_plate_bg` + an accent ring |
 | open | `hover_bg` fill, idle border; for a control that expands in place instead of opening a separate surface, `hover_bg` + slight inset. The open surface must be cleared when it collapses: the accent ring belongs to focus, not to "expanded" |
 | disabled | `text_disabled`, 50% opacity on the control's fill, no hover feedback |
 | focus (keyboard) | inset accent ring, 2pt, always visible against both `card_bg` and `window_bg` |

@@ -798,23 +798,51 @@ pub(crate) unsafe fn make_close_button(
 }
 
 /// Apply the close button's base or hover tint and background.
+///
+/// A close button on the icon-only layout carries a scrim behind it (`CLOSE_SCRIM_TAG`) because
+/// it sits over the icon itself, and its glyph then has to contrast with that scrim rather than
+/// with the panel's material, which is what `muted_text` is for. The scrim is looked up on the
+/// button's superview -- the card -- so a mouse-exit cannot leave a glyph colour behind that
+/// disagrees with the surface under it.
+///
+/// The two layouts carry hover differently. On the panel's material the glyph itself turns
+/// `destructive`, with a matching wash on the button. On a chip that would put the glyph at
+/// ~1.4:1 against the chip's mid grey -- under the 3:1 floor, exactly while the pointer is on it
+/// -- so there the glyph stays `accent_text` and the *chip* fills with `destructive` instead.
+/// (`accent_text` on `destructive` is the palette's own pairing; a theme test holds it to 3:1.)
 unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovered: bool) {
     let palette = crate::theme::ui_palette();
-    let tint = if hovered {
-        hex_to_ns_color(palette.destructive)
+    let card: *mut AnyObject = msg_send![button, superview];
+    let scrim: *mut AnyObject = if card.is_null() {
+        std::ptr::null_mut()
     } else {
-        hex_to_ns_color(palette.muted_text)
+        msg_send![card, viewWithTag: CLOSE_SCRIM_TAG]
     };
-    let _: () = msg_send![button, setContentTintColor: tint];
-
     let layer: *mut AnyObject = msg_send![button, layer];
-    if hovered {
-        layer_set_background(
-            layer,
-            hex_to_cg_color(palette.destructive & 0xFFFF_FF00 | 0x12),
-        );
+    if scrim.is_null() {
+        let tint = if hovered {
+            palette.destructive
+        } else {
+            palette.muted_text
+        };
+        let _: () = msg_send![button, setContentTintColor: hex_to_ns_color(tint)];
+        if hovered {
+            layer_set_background(
+                layer,
+                hex_to_cg_color(palette.destructive & 0xFFFF_FF00 | 0x12),
+            );
+        } else {
+            layer_set_background(layer, std::ptr::null_mut());
+        }
     } else {
-        layer_set_background(layer, std::ptr::null_mut());
+        let _: () = msg_send![button, setContentTintColor: hex_to_ns_color(palette.accent_text)];
+        let scrim_layer: *mut AnyObject = msg_send![scrim, layer];
+        let fill = if hovered {
+            palette.destructive
+        } else {
+            palette.badge_scrim
+        };
+        layer_set_background(scrim_layer, hex_to_cg_color(fill));
     }
 }
 
