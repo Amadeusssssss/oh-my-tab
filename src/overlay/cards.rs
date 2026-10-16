@@ -410,8 +410,9 @@ pub(crate) fn create_card_view(
         // The selection plate, built by both layouts and owned (visibility, colour) by
         // refresh_highlight. What each one marks is the layout's own unit of selection:
         // - Thumbnail mode selects the whole card -- caption row and preview together -- so its
-        //   ring wraps the card at the concentric `card_radius + OVERLAY_RING_INSET`. That inset
-        //   is what `theme::THUMB_BOTTOM_INSET` has to cover below the last row.
+        //   ring's frame is the card expanded by `OVERLAY_RING_INSET`, drawn at the card's own
+        //   radius (`OverlayRadii::selection_ring`). That inset is what `theme::THUMB_BOTTOM_INSET`
+        //   has to cover below the last row.
         // - Icon-only mode selects the icon, so its plate wraps the icon's visible artwork
         //   (theme::icon_selection_plate) and the captions stay outside it.
         // masksToBounds=false on the plate's layer: its fill and border are drawn inside its own

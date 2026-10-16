@@ -883,7 +883,9 @@ pub(crate) fn overlay_radii(card_radius: f64, thumbnail_padding: f64) -> Overlay
     let inner = (card_radius - thumbnail_padding.max(0.0)).max(0.0);
     OverlayRadii {
         card: card_radius.max(0.0),
-        selection_ring: card_radius.max(0.0) + OVERLAY_RING_INSET,
+        // The ring's frame sits `OVERLAY_RING_INSET` outside the card (see `overlay_radii`'s caller
+        // and docs/design-style: the ring keeps the card's own radius rather than running parallel).
+        selection_ring: card_radius.max(0.0),
         thumbnail_preview: THUMBNAIL_PREVIEW_RADIUS,
         thumbnail_icon: RADIUS_CONTROL,
         close_button: rounded_inset_radius(inner, 20.0, 20.0),
@@ -2683,7 +2685,8 @@ mod tests {
     fn overlay_radii_are_derived_from_the_configured_card_radius() {
         let radii = overlay_radii(effective_overlay_card_radius(32.0), 8.0);
         assert_eq!(radii.card, RADIUS_PANEL);
-        assert_eq!(radii.selection_ring, RADIUS_PANEL + OVERLAY_RING_INSET);
+        // The ring keeps the card's own radius (its frame still insets `OVERLAY_RING_INSET`).
+        assert_eq!(radii.selection_ring, RADIUS_PANEL);
         assert_eq!(radii.thumbnail_preview, 0.0);
         assert_eq!(radii.thumbnail_icon, RADIUS_CONTROL);
         assert_eq!(radii.close_button, 8.0);

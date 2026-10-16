@@ -145,7 +145,7 @@ onto them. The visible result is a UI that stops looking almost-aligned.
 
 ### P1-2 · Radius scale 8 / 12 / 16 + concentric derivation
 
-- Collapse the 13 radii. Selection rings become `card_radius + ring_inset`; the overlay computes its
+- Collapse the 13 radii. The selection ring keeps the effective card radius (its frame insets `ring_inset`); the overlay computes its
   tile/close radii from `appearance.corner_radius`.
 - **Files**: `settings/components.rs:926,955,1065,1104`, `settings/widgets.rs:116,1223,1954,2001,2385,2625`,
   `settings/select.rs:345,858,1059`, `settings/sidebar.rs:188`, `settings/tooltip.rs:438,496`,

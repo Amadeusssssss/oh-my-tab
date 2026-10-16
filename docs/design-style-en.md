@@ -497,8 +497,10 @@ density and the larger one to separate sections; never mix `12` and `14` for the
 | Window radius | platform-dependent (measured; currently 26) | The settings window itself |
 
 **Concentric rule.** A rounded container with padding gives its inner element
-`max(0, outer_radius - padding)`. A selection ring drawn around a card is
-`card_radius + ring_inset` so the two stay parallel; never pick the ring radius by hand.
+`max(0, outer_radius - padding)`. The switcher's selection ring is the deliberate exception: its frame
+sits `ring_inset` (3pt) outside the card, but its corner radius is the effective **card radius itself**,
+so the blue corner matches the card's curvature instead of running parallel 3pt out. The ring radius is
+still derived from the card radius, never picked by hand.
 The switcher selection ring uses a 3pt `ring_inset` and selects the **whole card** — the caption row
 and the window preview together — so the switcher's card area keeps an 8pt bottom inset
 (`theme::THUMB_BOTTOM_INSET`) to cover that 3pt of outward reach, or the card viewport (which ends at

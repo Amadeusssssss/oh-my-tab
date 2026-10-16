@@ -123,7 +123,7 @@
 
 ### P1-2 · 圆角收敛为 8 / 12 / 16 + 同心推导
 
-- 把 13 种圆角合并。选中环改为 `卡片圆角 + 环内缩`；浮窗的缩略图块、关闭按钮圆角由
+- 把 13 种圆角合并。选中环保持生效的卡片圆角本身（外框内缩 `环内缩`）；浮窗的缩略图块、关闭按钮圆角由
   `appearance.corner_radius` 计算得出。
 - **文件**：`settings/components.rs:926,955,1065,1104`、`settings/widgets.rs:116,1223,1954,2001,2385,2625`、
   `settings/select.rs:345,858,1059`、`settings/sidebar.rs:188`、`settings/tooltip.rs:438,496`、
