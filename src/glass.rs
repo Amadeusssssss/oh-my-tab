@@ -109,8 +109,14 @@ extern "C" fn vibrant_label_allows_vibrancy(
 /// 0.648 where the light ink reaches only 2.45:1, below the panel tier. alt-tab-macos uses the same legacy
 /// materials for the same reason (semantic materials follow the view's appearance, which a user-preference
 /// theme cannot rely on).
+///
+/// Light mode uses the legacy **light** material (raw 1), the brightest of the pinned set; the adjacent
+/// `mediumLight` (8) still read a shade dark on the switcher in light mode. It replaced
+/// `underWindowBackground` (21), which is the material *under* a window background rather than a light
+/// floating-panel surface. Pinned materials keep the light look independent of the view's appearance, for
+/// the same reason the dark side avoids the semantic `hudWindow` (13).
 const FROST_MATERIAL_DARK: i64 = 9; // ultraDark (legacy)
-const FROST_MATERIAL_LIGHT: i64 = 21; // underWindowBackground
+const FROST_MATERIAL_LIGHT: i64 = 1; // light (legacy)
 
 /// One panel's backdrop options.
 ///

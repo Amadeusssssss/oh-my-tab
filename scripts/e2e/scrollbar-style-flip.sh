@@ -5,7 +5,7 @@
 # 是 NSViewWidthSizable,文档跟着缩,里面宽度可伸缩的自绘控件被挤压 —— 开关宽 38 → 21("开关变形"),
 # 行内按钮右缘整体左移 17pt。
 #
-# 修复 = ① document 不再随宽度自适应(见 widgets.rs)+ ② 每次窗口变 key / app 激活都实测滚动条占位,
+# 修复 = ① document 不再随宽度自适应(见 widgets.rs)+ ② 设置窗口变 key / app 激活都实测滚动条占位,
 # 变了就按**实际可视宽度**重排内容(见 scroller.rs 的 resync)。
 #
 # 明确不做什么:不重申 `setScrollerStyle(.overlay)`。实测(2026-09-22)它运行中只瞬时有效(占位
@@ -91,6 +91,18 @@ def check(ok: bool, label: str, detail: str = "") -> None:
     (checks if ok else problems).append(f"{label}{(': ' + detail) if detail else ''}")
 
 
+def legacy_state_proven(record: dict) -> bool:
+    """A record only proves the legacy state was reached when the page uses a space-taking (legacy)
+    scroller, i.e. the footprint is non-zero. An all-overlay run would satisfy the deformation and
+    clipping checks while testing nothing, so this predicate is what rejects it."""
+    return record["style"] == 0 and record["footprint"] > 0.0
+
+
+# Counter-example: an all-overlay record must never count as proof of the legacy state (this is the
+# failure that defeated the check before it existed).
+assert not legacy_state_proven({"label": "synthetic overlay", "style": 1, "footprint": 0.0})
+
+
 def sh(*command: str) -> subprocess.CompletedProcess:
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:
@@ -125,7 +137,7 @@ def observe(label: str) -> dict:
     if not data:
         raise SystemExit(f"e2e scrollbar-style-flip: FAIL: no geometry frame after {label}")
     about_root = next(e["root"] for e in data["settings_roots"] if e["page"] == "about")
-    page = next((entry for entry in data["pages"] if entry["root"] == "about_root"), None)
+    page = next((entry for entry in data["pages"] if entry["root"] == about_root), None)
     if page is None:
         raise SystemExit(f"e2e scrollbar-style-flip: FAIL: About page missing after {label}")
     return {
@@ -138,14 +150,14 @@ def observe(label: str) -> dict:
             for n in data["views"]
             if n["root"] == about_root and n["class"] == "OhMyTabHtmlSwitch"
         ],
-        "content_right": content_right_edge(data),
+        "content_right": content_right_edge(data, about_root),
     }
 
 
 last_seq = 0
 
 
-def content_right_edge(data: dict) -> float:
+def content_right_edge(data: dict, about_root: str) -> float:
     """页面里最靠右的内容(行内按钮 / 自绘开关 / 卡片分隔线)的右缘,用于判断有没有被裁。"""
     views = data["views"]
     edges = []
@@ -198,6 +210,11 @@ time.sleep(1.2)
 flipped = observe("after flip, before activation")
 print(f"  info after flip: {flipped}")
 check(
+    legacy_state_proven(flipped),
+    "the system really switched the settings page to space-taking legacy scrollers",
+    f"style={flipped['style']} footprint={flipped['footprint']}",
+)
+check(
     bool(flipped["switches"]) and all(width >= 1.5 * height for width, height in flipped["switches"]),
     "no self-drawn switch is squeezed while the system is in legacy mode",
     f"switch w/h={flipped['switches']} (baseline {baseline['switches']}) style={flipped['style']}",
@@ -218,6 +235,11 @@ time.sleep(2.0)
 after = observe("after activation")
 print(f"  info after activation: {after}")
 
+check(
+    legacy_state_proven(after),
+    "the legacy state still holds after activation (the clipping checks are not vacuous)",
+    f"style={after['style']} footprint={after['footprint']}",
+)
 check(
     after["footprint"] <= 20.0,
     "the scroller footprint never exceeds a normal legacy width",

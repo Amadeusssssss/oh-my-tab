@@ -12,7 +12,7 @@
 use objc2::msg_send;
 use objc2::runtime::AnyObject;
 use objc2_foundation::NSRect;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// The scroller footprint measured while building the settings page (frame width - clip width);
@@ -33,6 +33,36 @@ pub(crate) fn note_reserved(width: f64) {
 /// The scroller footprint the current layout was built with.
 pub(crate) fn reserved() -> f64 {
     RESERVED.lock().map(|reserved| *reserved).unwrap_or(0.0)
+}
+
+/// How many notifications have actually reached the resync stage. Exposed for
+/// `--smoke-settings-layout`, because comparing the settings view pointers before and after cannot
+/// tell "the handler filtered this window" from "the handler resynced": with no footprint mismatch
+/// the resync is a no-op either way.
+static RESYNC_ENTRIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Records one notification that passed the window filter and is about to resync.
+pub(crate) fn note_resync_entered() {
+    RESYNC_ENTRIES.fetch_add(1, Ordering::SeqCst);
+}
+
+/// How many notifications have reached the resync stage since the process started.
+pub(crate) fn resync_entries() -> usize {
+    RESYNC_ENTRIES.load(Ordering::SeqCst)
+}
+
+/// Whether a scroller notification should drive the resync. `object_is_window` says whether the
+/// notification carries a window object; `object_is_settings_window` whether that window is the
+/// settings window.
+///
+/// The handler is registered for window-did-become-key as well as app activation, and the window
+/// notification is delivered for *any* of our windows — including the switcher panel. Without this
+/// filter, summoning the switcher (which makes its panel key) rebuilt the whole settings content
+/// synchronously inside the overlay's `makeKeyAndOrderFront`, so the panel only appeared once that
+/// finished. An application object (the activation notification) and a note with no object at all
+/// (the `performSelectorOnMainThread` hop carries none) still resync.
+pub(crate) fn resync_applies_to(object_is_window: bool, object_is_settings_window: bool) -> bool {
+    !object_is_window || object_is_settings_window
 }
 
 /// The current scroller footprint of one scroll view (0 for anything that is not a scroll view).
@@ -92,5 +122,24 @@ mod tests {
         // Restore the module default so no later test sees the probe value.
         note_reserved(0.0);
         assert_eq!(reserved(), 0.0);
+    }
+
+    /// The switcher panel (and any other one of our windows) becoming key must not resync; the
+    /// settings window, an application object and an object-less hop must.
+    #[test]
+    fn resync_applies_only_to_the_settings_window_or_a_non_window_object() {
+        assert!(
+            resync_applies_to(false, false),
+            "object-less hop (app activation via hop)"
+        );
+        assert!(
+            resync_applies_to(false, true),
+            "an application object is not a window"
+        );
+        assert!(resync_applies_to(true, true), "the settings window itself");
+        assert!(
+            !resync_applies_to(true, false),
+            "any other window, e.g. the switcher panel"
+        );
     }
 }

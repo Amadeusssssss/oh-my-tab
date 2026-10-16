@@ -1459,24 +1459,107 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // guard this kills the smoke process and the test fails.
         {
             let controller = crate::CONTROLLER.lock().unwrap().map(|target| target.0);
-            if let Some(controller) = controller {
-                // A notification delivered synchronously from inside the borrow must defer (a
-                // nested settings borrow used to abort the process).
-                with_settings_ui(|_| {
-                    crate::on_scroller_style_changed(
-                        controller,
-                        sel!(handleScrollerStyleChanged:),
-                        std::ptr::null_mut(),
-                    );
-                });
-                // The deferred call arrives with no notification object, exactly like this direct
-                // one: messaging that nil note (the diagnostic) used to panic inside an `extern "C"`
-                // callback and abort. Both paths must survive.
+            let Some(controller) = controller else {
+                log_info!(
+                    "[smoke-settings-layout] no controller for the scroller-notification smoke"
+                );
+                hide_settings();
+                return false;
+            };
+            let settings_window = crate::settings::settings_window_ptr();
+            if settings_window.is_null() {
+                log_info!("[smoke-settings-layout] no settings window for the scroller-notification smoke");
+                hide_settings();
+                return false;
+            }
+            // A notification delivered synchronously from inside the borrow must defer (a
+            // nested settings borrow used to abort the process).
+            with_settings_ui(|_| {
                 crate::on_scroller_style_changed(
                     controller,
                     sel!(handleScrollerStyleChanged:),
                     std::ptr::null_mut(),
                 );
+            });
+            // The deferred call arrives with no notification object, exactly like this direct
+            // one: messaging that nil note (the diagnostic) used to panic inside an `extern "C"`
+            // callback and abort. Both paths must survive, and an object-less note must still reach
+            // the resync (the scroller style can change while the settings window is already key).
+            let before_null = crate::scroller::resync_entries();
+            crate::on_scroller_style_changed(
+                controller,
+                sel!(handleScrollerStyleChanged:),
+                std::ptr::null_mut(),
+            );
+            let null_ok = crate::scroller::resync_entries() == before_null + 1;
+            // A window-did-become-key notification for any window that is not the settings window --
+            // the switcher panel is the real one -- must be filtered out: it used to rebuild the
+            // whole settings content synchronously, stalling the overlay's summon behind it.
+            let become_key_name = make_nsstring("NSWindowDidBecomeKeyNotification");
+            let foreign_window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+            let foreign_window: *mut AnyObject = msg_send![foreign_window,
+                initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(80.0, 80.0)),
+                styleMask: 0u64,
+                backing: 2u64,
+                defer: false
+            ];
+            if foreign_window.is_null() {
+                log_info!("[smoke-settings-layout] could not create a foreign window for the scroller-notification smoke");
+                CFRelease(become_key_name as *const c_void);
+                hide_settings();
+                return false;
+            }
+            let foreign_note: *mut AnyObject = msg_send![
+                class!(NSNotification),
+                notificationWithName: become_key_name,
+                object: foreign_window
+            ];
+            let before_foreign = crate::scroller::resync_entries();
+            crate::on_scroller_style_changed(
+                controller,
+                sel!(handleScrollerStyleChanged:),
+                foreign_note,
+            );
+            let foreign_ok = crate::scroller::resync_entries() == before_foreign;
+            // Positive control: the settings window's own become-key must still resync, or an
+            // implementation that early-returns for *every* window would pass the check above.
+            let settings_note: *mut AnyObject = msg_send![
+                class!(NSNotification),
+                notificationWithName: become_key_name,
+                object: settings_window
+            ];
+            let before_settings = crate::scroller::resync_entries();
+            crate::on_scroller_style_changed(
+                controller,
+                sel!(handleScrollerStyleChanged:),
+                settings_note,
+            );
+            let settings_ok = crate::scroller::resync_entries() == before_settings + 1;
+            release_obj(foreign_window);
+            CFRelease(become_key_name as *const c_void);
+            // The app's activation notification shares this handler and carries the application, not
+            // a window: it must still resync.
+            let active_name = make_nsstring("NSApplicationDidBecomeActiveNotification");
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let active_note: *mut AnyObject = msg_send![
+                class!(NSNotification),
+                notificationWithName: active_name,
+                object: app
+            ];
+            let before_app = crate::scroller::resync_entries();
+            crate::on_scroller_style_changed(
+                controller,
+                sel!(handleScrollerStyleChanged:),
+                active_note,
+            );
+            let app_ok = crate::scroller::resync_entries() == before_app + 1;
+            CFRelease(active_name as *const c_void);
+            if !(null_ok && foreign_ok && settings_ok && app_ok) {
+                log_info!(
+                    "[smoke-settings-layout] scroller notification filter wrong: object_less={null_ok} foreign={foreign_ok} settings={settings_ok} app={app_ok}"
+                );
+                hide_settings();
+                return false;
             }
         }
         let Some((window, pages)) =

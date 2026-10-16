@@ -909,6 +909,26 @@ pub(crate) extern "C" fn on_scroller_style_changed(
             crate::ffi::nsstring_to_rust(name)
         });
     }
+    // This handler is registered for window-did-become-key too, and that notification is delivered
+    // for *any* of our windows. Without this filter the switcher panel becoming key rebuilt the whole
+    // settings content synchronously inside the overlay show, so the panel only appeared once that
+    // finished. Only the settings window's own activation may drive the resync; an application object
+    // (app activation) and the object-less hop above still do.
+    let object = if _note.is_null() {
+        std::ptr::null_mut::<AnyObject>()
+    } else {
+        unsafe { msg_send![_note, object] }
+    };
+    let object_is_window: bool =
+        !object.is_null() && unsafe { msg_send![object, isKindOfClass: class!(NSWindow)] };
+    if !crate::scroller::resync_applies_to(
+        object_is_window,
+        object == crate::settings::settings_window_ptr(),
+    ) {
+        crate::log_debug!("[scroller] resync skipped: window is not the settings window");
+        return;
+    }
+    crate::scroller::note_resync_entered();
     crate::scroller::on_activation_resync();
 }
 

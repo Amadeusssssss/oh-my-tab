@@ -889,6 +889,19 @@ fn start_inline_update_check() {
     }
 }
 
+/// The settings window pointer, or null when it has not been created (or was invalidated).
+///
+/// Callers must not cache it: `invalidate_settings_window` releases the window, so a stale pointer
+/// would dangle. Used by the scroller-notification filter to ignore every *other* window of ours
+/// (the switcher panel and friends) that also becomes key.
+pub(crate) fn settings_window_ptr() -> *mut AnyObject {
+    with_settings_ui(|ui| {
+        ui.as_ref()
+            .map(|ui| ui.window)
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
 /// Landing point of the update-notification click: open the settings window, jump to the
 /// About page, and start an inline check. Once the settings window exists, its host view
 /// is registered, so the "update found" UI renders INLINE in the About page (see
