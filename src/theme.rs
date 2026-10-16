@@ -216,7 +216,7 @@ pub(crate) const THUMBNAIL_PREVIEW_RADIUS: f64 = 0.0;
 /// the canvas' own transparent margin rather than as a slab behind the icon. It must stay under
 /// the canvas margin itself -- 10.75pt for the artwork's 0.805 share of a 110pt canvas -- or the
 /// plate would leave the icon's own box and start filling the card's side margins.
-pub(crate) const SELECTION_RING_WIDTH: f64 = 7.0;
+pub(crate) const SELECTION_RING_WIDTH: f64 = 10.5;
 /// The ring's stroke, drawn inward from the plate's edge (CALayer draws a border inside the
 /// frame). What is left of SELECTION_RING_WIDTH is the wash the rim sits on.
 pub(crate) const SELECTION_RING_STROKE: f64 = 2.0;

@@ -407,7 +407,7 @@ Markdown 更新说明的一级标题使用 `sidebar-title` 粗体，二级标题
 最后一排的选中环裁掉。这 8pt 从标题栏自身高度中扣除，不占用卡片尺寸预算，`overlay` 里有编译期断言保证覆盖。
 
 **纯图标**模式的切换器卡片不用这个环，而是用一块**色板**贴住图标**实际可见的图形**（artwork）：图形四周各
-外扩 `7pt`（`theme::SELECTION_RING_WIDTH`），所以色板**比图标画布还窄**，读起来是画布透明边距里的一圈
+外扩 `10.5pt`（`theme::SELECTION_RING_WIDTH`），所以色板**比图标画布还窄**，读起来是画布透明边距里的一圈
 环，而不是图标背后的一块底色。填色用 `selection_plate_bg`——比列表行的 `selection_bg` 更重，因为要在半透明玻璃上托住一整个图标——描边 `2pt`（`theme::SELECTION_RING_STROKE`）用 `accent`，圆角曲线用**超椭圆**
 （`CALayer.cornerCurve`）。圆角取图形自身的圆角加环宽（`theme::icon_selection_plate_radius`），这样环在四角
 和四边一样宽；按色板自身边长取比例会把四个角掐尖。`ICON_ARTWORK_RATIO` 是图形占画布的比例（Apple 自己的

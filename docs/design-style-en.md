@@ -492,7 +492,7 @@ the footer band) would clip the ring on the last row. That inset comes out of th
 height, not out of the card-size budget, and `overlay` asserts the coverage at compile time.
 
 An **icon-only** switcher tile does not use that ring. It marks selection with a *plate* that hugs the
-icon's visible **artwork**: the artwork plus `7pt` on every side (`theme::SELECTION_RING_WIDTH`), so the
+icon's visible **artwork**: the artwork plus `10.5pt` on every side (`theme::SELECTION_RING_WIDTH`), so the
 plate is *narrower* than the icon canvas and reads as a ring in the icon's own transparent margin, not as a
 slab behind it. It is filled with `selection_plate_bg` -- a heavier wash than a list row's
 `selection_bg`, because a whole icon has to read against translucent glass -- rimmed with `2pt` of `accent`
