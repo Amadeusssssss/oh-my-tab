@@ -181,13 +181,16 @@ scripts/codex-review-selftest.sh            # check the helper itself, against a
   in `--note` so the next round reads it.
 
 The reviewer prompt carries a repository checklist (the patch-side view of the next four rules) and the prompt
-lives in the script. The model and the speed come from `codex-review.toml` at the repository root
-(`[review] model` / `fast`); the file is optional, and without it the reviewer runs on `gpt-6.1-sol` with Fast
-mode off. `OMT_REVIEW_MODEL` and `OMT_REVIEW_FAST` override one setting each. `fast = true` asks Codex for
-Fast mode (`service_tier = "priority"`), which is billed at a higher rate; `false` sends `service_tier
-= "default"` explicitly so a Fast mode configured in `~/.codex/config.toml` cannot leak into a review. A
-configuration that cannot be read refuses the round rather than being ignored, and each round's outcome records
-the settings it ran under.
+lives in the script. The model, the speed and the reasoning effort come from `codex-review.toml` at the
+repository root (`[review] model` / `fast` / `reasoning_effort`); the file is optional, and without it the
+reviewer runs on `gpt-6.1-sol` with Fast mode off and no reasoning flag. `OMT_REVIEW_MODEL`, `OMT_REVIEW_FAST`
+and `OMT_REVIEW_REASONING_EFFORT` override one setting each. `fast = true` asks Codex for Fast mode
+(`service_tier = "priority"`), which is billed at a higher rate; `false` sends `service_tier = "default"`
+explicitly so a Fast mode configured in `~/.codex/config.toml` cannot leak into a review. `reasoning_effort`
+is one of the model's own levels (`codex debug models` lists them); omitting the key sends no flag, so the
+model default or a globally configured level stays in force. A configuration that cannot be read refuses the
+round rather than being ignored, and each round's outcome records the settings it ran under, including
+whether Codex declined the requested reasoning effort.
 
 ### What the reviewer is asked to weigh here
 

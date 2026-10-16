@@ -26,13 +26,16 @@
 # one working tree still put both tasks' changes in front of the reviewer — a tree per task is what
 # makes two reviews independent.
 #
-# The reviewer runs on the model and the speed named by codex-review.toml at the repository root
-# ([review] model / fast); with that file absent the defaults are gpt-6.1-sol and no Fast mode.
-# OMT_REVIEW_MODEL and OMT_REVIEW_FAST override one setting each, for a harness that wants to try
-# another model or speed without editing a tracked file. `fast = true` asks Codex for Fast mode,
-# which it spells service_tier "priority"; `fast = false` sends service_tier "default" explicitly, so
-# a Fast mode configured in ~/.codex/config.toml or .codex/config.toml cannot leak into a review. The
-# tier is chosen per turn and does not stick, so a resumed round is told again.
+# The reviewer runs on the model, the speed and the reasoning effort named by codex-review.toml at the
+# repository root ([review] model / fast / reasoning_effort); with that file absent the defaults are
+# gpt-6.1-sol, no Fast mode and no reasoning flag. OMT_REVIEW_MODEL, OMT_REVIEW_FAST and
+# OMT_REVIEW_REASONING_EFFORT override one setting each, for a harness that wants to try another model,
+# speed or effort without editing a tracked file. `fast = true` asks Codex for Fast mode, which it
+# spells service_tier "priority"; `fast = false` sends service_tier "default" explicitly, so a Fast
+# mode configured in ~/.codex/config.toml or .codex/config.toml cannot leak into a review. An omitted
+# reasoning_effort sends no model_reasoning_effort flag, so codex's model default or a globally
+# configured level stays in force. Both settings are chosen per turn and do not stick, so a resumed
+# round is told again.
 #
 # The reviewer is asked to write its findings in Chinese, with the severity tokens left in English.
 #
@@ -95,6 +98,13 @@ FAST=0
 FAST_SOURCE="the built-in default"
 SERVICE_TIER="default"
 SERVICE_TIER_REJECTED="no"
+# Unset by default, and an unset effort is sent as no flag at all rather than as a level: codex has no
+# neutral value that would override a globally configured level, and inventing one would run the review
+# at an effort the file never stated. The archive records the literal "-" for it, which no valid effort
+# can collide with.
+REASONING_EFFORT=""
+REASONING_EFFORT_SOURCE="the built-in default"
+REASONING_EFFORT_REJECTED="no"
 CONFIG_FILE="$ROOT/codex-review.toml"
 
 BASE_DIR="$ROOT/.agent-review"
@@ -212,12 +222,13 @@ usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [-
   --timeout <sec>     bound a run that has not finished in this long (default 1800, 0 = none)
   --finish            clear this task's reviewer session: the user's call, not the agent's
 
-The model and the speed are read from codex-review.toml at the repository root ([review] model / fast).
-That file is optional: without it the reviewer runs on gpt-6.1-sol with Fast mode off. With it, a bad
-value, an unknown key or an unreadable file refuses the round instead of being ignored, because a review
-that silently ran on another model or another speed is not the review its settings describe. --tasks and
---finish never read it, so a broken file cannot make a session unclearable. OMT_REVIEW_MODEL and
-OMT_REVIEW_FAST override one setting each and take precedence over the file.
+The model, the speed and the reasoning effort are read from codex-review.toml at the repository root
+([review] model / fast / reasoning_effort). That file is optional: without it the reviewer runs on
+gpt-6.1-sol with Fast mode off and no reasoning flag. With it, a bad value, an unknown key or an
+unreadable file refuses the round instead of being ignored, because a review that silently ran on another
+model, speed or effort is not the review its settings describe. --tasks and --finish never read it, so a
+broken file cannot make a session unclearable. OMT_REVIEW_MODEL, OMT_REVIEW_FAST and
+OMT_REVIEW_REASONING_EFFORT override one setting each and take precedence over the file.
 
 The session is kept until the user says the task is done, so that the reviewer remembers its own
 findings across the rounds of one task. --finish is the agent's only way to end it early and it is
@@ -507,6 +518,10 @@ announce_task
 # this function exists to prevent: a config delivered by symlink would stop applying, without a word,
 # the moment its target went away.
 MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+# Lowercase only, because codex spells the levels lowercase and silently accepting "High" as "high"
+# would mean the review ran at a level the file did not state. The value is checked for shape only;
+# whether a model supports it is codex's answer, and a rejection is reported and archived, not ignored.
+REASONING_RE='^[a-z][a-z0-9_-]{0,31}$'
 
 resolve_settings() {
     if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
@@ -543,10 +558,10 @@ except (OSError, tomllib.TOMLDecodeError) as exc:
     print("cannot read %s: %s" % (path, exc))
     raise SystemExit(1)
 
-# Only the two documented keys are accepted, at the top level and inside [review]: a typo here would
-# otherwise change which model or which speed the review runs at, silently.
+# Only the three documented keys are accepted, at the top level and inside [review]: a typo here would
+# otherwise change which model, speed or reasoning effort the review runs at, silently.
 allowed_top = {"review"}
-allowed_review = {"model", "fast"}
+allowed_review = {"model", "fast", "reasoning_effort"}
 unknown = sorted(set(data) - allowed_top)
 if unknown:
     print("unknown key %s in %s (only [review] is read)" % (", ".join(repr(k) for k in unknown), path))
@@ -559,7 +574,7 @@ if not isinstance(review, dict):
 unknown = sorted(set(review) - allowed_review)
 if unknown:
     print(
-        "unknown key %s in [review] of %s (only model and fast are read)"
+        "unknown key %s in [review] of %s (only model, fast and reasoning_effort are read)"
         % (", ".join(repr(k) for k in unknown), path)
     )
     raise SystemExit(1)
@@ -583,8 +598,26 @@ if "fast" in review:
         print("fast in %s must be true or false; got %r" % (path, fast))
         raise SystemExit(1)
 
+# The reasoning effort is optional and has no neutral value, so it is parsed the same way but printed
+# only when the file sets it: an omitted key sends no flag and the built-in default stands. Printing no
+# line also keeps the key/value/origin parse unambiguous, because read would otherwise collapse an
+# empty middle field. Comment text lives inside this heredoc, so it must not carry a lone quote either:
+# bash 3.2 scans the body while it looks for the end of the enclosing command substitution.
+reasoning, reasoning_from_file = "", False
+if "reasoning_effort" in review:
+    reasoning = review["reasoning_effort"]
+    reasoning_from_file = True
+    if not isinstance(reasoning, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", reasoning):
+        print(
+            "reasoning_effort in %s must be a lowercase effort name of letters, digits, '_' and '-' "
+            "(for example low, medium, high, xhigh or max); got %r" % (path, reasoning)
+        )
+        raise SystemExit(1)
+
 print("model\t%s\t%s" % (model, "file" if model_from_file else "default"))
 print("fast\t%s\t%s" % ("1" if fast else "0", "file" if fast_from_file else "default"))
+if reasoning_from_file:
+    print("reasoning_effort\t%s\tfile" % reasoning)
 PY
 )" || status=$?
         if [[ "$status" -ne 0 ]]; then
@@ -602,6 +635,10 @@ PY
                 fast)
                     [[ "$value" == 1 ]] && FAST=1 || FAST=0
                     [[ "$origin" == file ]] && FAST_SOURCE="codex-review.toml" || FAST_SOURCE="the built-in default"
+                    ;;
+                reasoning_effort)
+                    REASONING_EFFORT="$value"
+                    REASONING_EFFORT_SOURCE="codex-review.toml"
                     ;;
             esac
         done <<< "$parsed"
@@ -629,6 +666,14 @@ PY
         esac
         FAST_SOURCE="OMT_REVIEW_FAST"
     fi
+    if [[ -n "${OMT_REVIEW_REASONING_EFFORT:-}" ]]; then
+        if [[ ! "$OMT_REVIEW_REASONING_EFFORT" =~ $REASONING_RE ]]; then
+            echo "OMT_REVIEW_REASONING_EFFORT is not a reasoning effort name: '$OMT_REVIEW_REASONING_EFFORT'" >&2
+            exit 64
+        fi
+        REASONING_EFFORT="$OMT_REVIEW_REASONING_EFFORT"
+        REASONING_EFFORT_SOURCE="OMT_REVIEW_REASONING_EFFORT"
+    fi
 
     # Fast mode is codex's service_tier "priority". Off is sent as an explicit "default" rather than
     # omitted, because an omitted setting inherits a Fast mode configured in ~/.codex/config.toml or in
@@ -643,6 +688,7 @@ PY
 
 resolve_settings
 echo "reviewer: model=$MODEL ($MODEL_SOURCE), fast=$([[ "$FAST" == 1 ]] && echo on || echo off) ($FAST_SOURCE)"
+echo "reviewer: reasoning_effort=${REASONING_EFFORT:--} ($REASONING_EFFORT_SOURCE)"
 
 # A retry resumes *that* round, so it keeps that round's kind: the one thing a retry must never do is
 # turn a design consultation that was never answered into a code review verdict. Read under the lock,
@@ -898,6 +944,9 @@ archive_round() {
         echo "fast=$([[ "$FAST" == 1 ]] && echo on || echo off)"
         echo "fast_source=$FAST_SOURCE"
         echo "service_tier=$SERVICE_TIER"
+        echo "reasoning_effort=${REASONING_EFFORT:--}"
+        echo "reasoning_effort_source=$REASONING_EFFORT_SOURCE"
+        echo "reasoning_effort_rejected=${REASONING_EFFORT_REJECTED:-no}"
         echo "service_tier_rejected=${SERVICE_TIER_REJECTED:-no}"
     } > "$ROUNDS_DIR/$stamp-outcome.txt"
     echo "$stamp"
@@ -1288,7 +1337,15 @@ fi
 if [[ ! -f "$SESSION_FILE" ]]; then
     echo "Starting new Codex reviewer session..."
     status=0
-    run_codex exec --model "$MODEL" -c service_tier="$SERVICE_TIER" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT" || status=$?
+    # `set --` rather than an array: macOS ships bash 3.2, where expanding an empty array under
+    # `set -u` is an error. The effort flag is inserted before the prompt only when one is configured,
+    # so an omitted reasoning_effort sends no model_reasoning_effort argument at all.
+    set -- exec --model "$MODEL" -c service_tier="$SERVICE_TIER"
+    if [[ -n "$REASONING_EFFORT" ]]; then
+        set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
+    fi
+    set -- "$@" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT"
+    run_codex "$@" || status=$?
     # Logged after the CLI ran, because only then does the new session have an id: the record has to
     # name the session it began, or a later reader cannot follow it to its rollout. A round whose CLI
     # never created one is recorded with no id, which is the honest description of that attempt.
@@ -1311,10 +1368,15 @@ else
     # not end up recorded twice, once here and once by the handler.
     log_round_session
     status=0
-    # The service tier is sent again here because it does not stick: codex resolves it per turn, and a
-    # resumed turn with no -c flag on this machine comes back at the default speed even when the first
-    # round asked for Fast mode.
-    run_codex exec resume "$SESSION_ID" --model "$MODEL" -c service_tier="$SERVICE_TIER" --json -o "$MESSAGE_FILE" "$PROMPT" || status=$?
+    # The service tier and the reasoning effort are sent again here because neither sticks: codex
+    # resolves both per turn, and a resumed turn with no -c flag comes back at the default speed and
+    # effort even when the first round asked otherwise.
+    set -- exec resume "$SESSION_ID" --model "$MODEL" -c service_tier="$SERVICE_TIER"
+    if [[ -n "$REASONING_EFFORT" ]]; then
+        set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
+    fi
+    set -- "$@" --json -o "$MESSAGE_FILE" "$PROMPT"
+    run_codex "$@" || status=$?
     # A resume against a thread the CLI no longer holds fails before any turn: the session is gone, and
     # the log has to say `lost` rather than `resumed`, or the memory gap stays invisible. The wording is
     # the CLI's own; it is matched because it is the only signal that separates "this session is gone"
@@ -1348,6 +1410,10 @@ stream_message = ""
 # at the default speed. That message is the only signal that the requested speed was dropped, so it is
 # matched on its stable part. It is recorded, not treated as a failed round: the review itself is valid.
 tier_rejected = False
+# The same shape of signal for a reasoning effort codex will not use: an error item, with the round
+# still answered. Matched on the setting's own words plus the shared tail, so neither warning can fire
+# on the other's message.
+reasoning_rejected = False
 
 try:
     with open(events_path, "r", encoding="utf-8") as f:
@@ -1377,6 +1443,8 @@ try:
                     detail = str(item.get("message") or "")
                     if "service tier" in detail and "not advertised as supported for model" in detail:
                         tier_rejected = True
+                    if "reasoning effort" in detail and "not advertised as supported for model" in detail:
+                        reasoning_rejected = True
 except FileNotFoundError:
     pass
 
@@ -1434,6 +1502,7 @@ with open(status_path, "w", encoding="utf-8") as f:
     f.write("completed=%s\n" % ("yes" if completed else "no"))
     f.write("error=%s\n" % (errors[0] if errors else ""))
     f.write("service_tier_rejected=%s\n" % ("yes" if tier_rejected else "no"))
+    f.write("reasoning_effort_rejected=%s\n" % ("yes" if reasoning_rejected else "no"))
     f.write("message_chars=%d\n" % len(message))
     f.write("looks_like_verdict=%s\n" % ("yes" if looks_like_verdict else "no"))
     f.write("round_status=%s\n" % round_status)
@@ -1456,6 +1525,9 @@ cli_error="$(status_field error)"
 # Whether codex declined the requested speed. It does not fail such a run, so this is the only evidence
 # that "fast = on" did not actually take effect. Read before archive_round so the outcome carries it.
 SERVICE_TIER_REJECTED="$(status_field service_tier_rejected)"
+# The same conservative treatment for the effort: a run whose effort codex declined still produced a
+# valid review, so the round keeps its verdict and its exit code and only the mismatch is surfaced.
+REASONING_EFFORT_REJECTED="$(status_field reasoning_effort_rejected)"
 # The classification above reports the *shape* of the message. A verdict-shaped message still does not make a
 # round: the turn has to have completed, the CLI has to have exited cleanly and the run must not have been
 # killed. A retry resumes a round that reached none of that, so it tests this field, not the shape.
@@ -1500,6 +1572,15 @@ if [[ "$SERVICE_TIER_REJECTED" == "yes" ]]; then
     else
         echo "Note: codex did not accept the requested service tier '$SERVICE_TIER'." >&2
     fi
+fi
+
+# The effort was requested, not delivered, and the review is still valid. Warned and archived rather
+# than failed, and only reachable when one was actually configured: an unset effort sends no flag.
+if [[ "$REASONING_EFFORT_REJECTED" == "yes" ]]; then
+    echo >&2
+    echo "Note: codex did not accept the requested reasoning effort '$REASONING_EFFORT' for model '$MODEL'" >&2
+    echo "and ran this round without it. The level requested via $REASONING_EFFORT_SOURCE is therefore NOT" >&2
+    echo "confirmed for this round; the levels a model supports are listed by \`codex debug models\`." >&2
 fi
 
 if [[ "$CODE" -eq 0 ]]; then

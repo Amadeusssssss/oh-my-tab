@@ -30,7 +30,7 @@ helper="$script_dir/codex-review.sh"
 # while the assertions still read the top-level paths, and the gate would fail for a reason that belongs to
 # the caller's shell. The same holds for a model or speed override. The cases that test any of those
 # variables set it on the call itself.
-unset OMT_REVIEW_TASK OMT_REVIEW_MODEL OMT_REVIEW_FAST
+unset OMT_REVIEW_TASK OMT_REVIEW_MODEL OMT_REVIEW_FAST OMT_REVIEW_REASONING_EFFORT
 
 tmp="$(mktemp -d)"
 # The pre-check below asks whether the tree is clean, so the runs that test it must keep the harness's
@@ -59,19 +59,22 @@ task_key="$(printf '%s' "$prompt" | sed -n "s/.*belongs to task '\\([a-z0-9._-]*
 echo called >> "$STUB_DIR/calls.txt"
 if read -t 1 _; then echo "data" > "$STUB_DIR/stdin.txt"; else echo "rc=$?" > "$STUB_DIR/stdin.txt"; fi
 
-out=""; prev=""; is_resume=0; model=""; resume_id=""; tier=""
+out=""; prev=""; is_resume=0; model=""; resume_id=""; tier=""; reasoning=""
 for a in "$@"; do
     [[ "$prev" == "-o" ]] && out="$a"
     [[ "$prev" == "--model" || "$prev" == "-m" ]] && model="$a"
     [[ "$a" == "resume" ]] && is_resume=1
     [[ "$prev" == "resume" ]] && resume_id="$a"
-    # The helper passes the speed as `-c service_tier=<tier>`; recorded so a case can assert that the
-    # requested tier reaches the CLI on the first round *and* on a resume, which is where it used to be lost.
+    # The helper passes the speed as `-c service_tier=<tier>` and the thinking level as
+    # `-c model_reasoning_effort=<level>`; recorded so a case can assert that both reach the CLI on
+    # the first round *and* on a resume, which is where a per-turn setting is otherwise lost.
     [[ "$prev" == "-c" && "$a" == service_tier=* ]] && tier="${a#service_tier=}"
+    [[ "$prev" == "-c" && "$a" == model_reasoning_effort=* ]] && reasoning="${a#model_reasoning_effort=}"
     prev="$a"
 done
 printf '%s' "$model" > "$STUB_DIR/last-model.txt"
 printf '%s' "$tier" > "$STUB_DIR/last-tier.txt"
+printf '%s' "$reasoning" > "$STUB_DIR/last-reasoning.txt"
 printf '%s' "$is_resume" > "$STUB_DIR/last-resume.txt"
 # The id it was actually told to resume, not only that it was a resume: the thread id below is built from
 # the prompt, so a round that resumed another task's session would otherwise look like the right one.
@@ -92,14 +95,20 @@ start() {
 tier_rejected_item() {
     python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured service tier `%s` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests." % (sys.argv[1] or "none")}}, ensure_ascii=False))' "${tier:-}"
 }
+# The real CLI's wording when it will not use the requested reasoning effort: the same shape as the
+# tier rejection, naming the level actually requested so a hard-coded match would not be flattered.
+reasoning_rejected_item() {
+    python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured reasoning effort `%s` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests." % (sys.argv[1] or "none")}}, ensure_ascii=False))' "${reasoning:-}"
+}
 # An unrelated error item: the tier warning must not fire on every error the CLI prints.
 unrelated_error_item() {
     python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"stream disconnected before completion"}}, ensure_ascii=False))'
 }
-# The sharper counter-example: the *same* generic phrase, about a different setting. A match that only
-# looked for "not advertised as supported for model" would archive a service-tier rejection here.
+# The sharper counter-example for both warnings: the *same* generic phrase about a setting the helper
+# does not classify. A match that only looked for "not advertised as supported for model" would
+# archive a rejection here.
 other_setting_rejected_item() {
-    python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured reasoning effort `ultra` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests."}}, ensure_ascii=False))'
+    python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured verbosity `loud` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests."}}, ensure_ascii=False))'
 }
 msg() {
     [[ -n "$out" ]] && printf '%s\n' "$1" > "$out"
@@ -149,6 +158,8 @@ case "$mode" in
     # A completed, valid review whose requested speed codex declined: the round still passes, and the
     # warning plus the archived flag are the only evidence that fast mode did not take effect.
     tier-rejected) start; tier_rejected_item; msg "$(passing)"; turn_done ;;
+    # A completed, valid review whose requested reasoning effort codex declined.
+    reasoning-rejected) start; reasoning_rejected_item; msg "$(passing)"; turn_done ;;
     # The counter-example for that warning: an error item that is not about the service tier.
     error-item)   start; unrelated_error_item; msg "$(passing)"; turn_done ;;
     # The sharper counter-example: the same generic phrase about a *different* setting, which must not be
@@ -255,6 +266,7 @@ expect_value "the first review asks for gpt-6.1-sol" "gpt-6.1-sol" "$tmp/last-mo
 # id of a resume, so asserting it there would be asserting the wrong round.
 expect_value "and it really was a first review" "0" "$tmp/last-resume.txt"
 expect_value "with Fast mode off by default" "default" "$tmp/last-tier.txt"
+expect_value "with no reasoning effort flag by default" "" "$tmp/last-reasoning.txt"
 echo "a run that exited 0 without finishing its turn"
 run no-completed
 check "it is refused" 1 "turn.completed" "$tmp/err.txt"
@@ -959,13 +971,16 @@ echo "the model and speed the reviewer runs on, on every round"
 # (service_tier=default) rather than the absence of an argument.
 expect_value "the reviewer runs on gpt-6.1-sol" "gpt-6.1-sol" "$tmp/last-model.txt"
 expect_value "with Fast mode off" "default" "$tmp/last-tier.txt"
+expect_value "with no reasoning effort by default" "" "$tmp/last-reasoning.txt"
 expect "the round says which settings it used" "reviewer: model=gpt-6.1-sol (the built-in default), fast=off (the built-in default)" "$tmp/out.txt"
+expect "and says the effort is unset" "reasoning_effort=- (the built-in default)" "$tmp/out.txt"
 
 # A resume has to repeat the tier: codex resolves it per turn, so a resumed round that omits it runs at
 # the default speed even when the first round asked for Fast (measured on codex-cli 0.162.1).
 run ok
 expect_value "a re-review is a resume" "1" "$tmp/last-resume.txt"
 expect_value "and it carries the tier again" "default" "$tmp/last-tier.txt"
+expect_value "and no effort flag again" "" "$tmp/last-reasoning.txt"
 
 echo "OMT_REVIEW_MODEL names another model, OMT_REVIEW_FAST another speed"
 OMT_REVIEW_MODEL=another-model run ok
@@ -988,6 +1003,23 @@ check "a model with a newline is refused" 64 "OMT_REVIEW_MODEL" "$tmp/err.txt"
 OMT_REVIEW_MODEL='a b' run ok
 check "a model with a space is refused" 64 "OMT_REVIEW_MODEL" "$tmp/err.txt"
 
+echo "OMT_REVIEW_REASONING_EFFORT names a thinking level"
+OMT_REVIEW_REASONING_EFFORT=high run ok
+check "the run with high reasoning effort is produced" 0 - "$tmp/out.txt"
+expect_value "OMT_REVIEW_REASONING_EFFORT is passed through" "high" "$tmp/last-reasoning.txt"
+expect "the round says where the effort came from" "reasoning_effort=high (OMT_REVIEW_REASONING_EFFORT)" "$tmp/out.txt"
+OMT_REVIEW_REASONING_EFFORT=low run ok
+expect_value "a different level reaches the CLI" "low" "$tmp/last-reasoning.txt"
+# The flag belongs on a first round too, not only on a resume: a fresh task starts a new session.
+OMT_REVIEW_REASONING_EFFORT=high run ok --task effort-first
+check "the first round of a new task runs" 0 - "$tmp/out.txt"
+expect_value "and it carries the effort as well" "high" "$tmp/last-reasoning.txt"
+expect_value "on a first review, not a resume" "0" "$tmp/last-resume.txt"
+for bad in High "has space" 2 '!'; do
+    OMT_REVIEW_REASONING_EFFORT="$bad" run ok
+    check "OMT_REVIEW_REASONING_EFFORT='$bad' is refused" 64 "OMT_REVIEW_REASONING_EFFORT" "$tmp/err.txt"
+done
+
 echo "codex-review.toml configures the model and the speed"
 # The file is read from the repository root, which is this throwaway repo. Each case rewrites it; the
 # last one removes it so the remaining cases run on the built-in defaults.
@@ -1005,6 +1037,15 @@ run ok
 expect_value "a missing model falls back on its own" "gpt-6.1-sol" "$tmp/last-model.txt"
 expect_value "while the file's fast still applies" "priority" "$tmp/last-tier.txt"
 expect "each setting's source is reported separately" "model=gpt-6.1-sol (the built-in default), fast=on (codex-review.toml)" "$tmp/out.txt"
+write_config '[review]' 'reasoning_effort = "xhigh"'
+run ok
+expect_value "the file's reasoning_effort is used" "xhigh" "$tmp/last-reasoning.txt"
+expect "and the round names the file as its source" "reasoning_effort=xhigh (codex-review.toml)" "$tmp/out.txt"
+write_config '[review]' 'model = "file-model"' 'reasoning_effort = "max"'
+run ok
+expect_value "a file effort and a file model combine" "max" "$tmp/last-reasoning.txt"
+expect_value "the model is still the file's" "file-model" "$tmp/last-model.txt"
+expect_value "and an omitted fast falls back on its own" "default" "$tmp/last-tier.txt"
 write_config '[review]' 'model = "file-model"' 'fast = false'
 run ok
 expect_value "fast = false is off" "default" "$tmp/last-tier.txt"
@@ -1017,7 +1058,7 @@ expect_value "and the model override wins over the file" "env-model" "$tmp/last-
 
 echo "a configuration that cannot be read refuses the round"
 calls_before_config="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
-for bad_config in 'model = [' 'fast = "yes"' 'model = 12' 'model = ""' '[review]
+for bad_config in 'model = [' 'fast = "yes"' 'model = 12' 'model = ""' 'reasoning_effort = "High"' 'reasoning_effort = 3' 'reasoning_effort = ""' '[review]
 unknown = 1' '[other]
 model = "x"' '[review]
 model = "has
@@ -1064,6 +1105,9 @@ run ok
 check "a bad value is refused" 64 "must be true or false" "$tmp/err.txt"
 run ok --task alpha
 check "a bad value refuses a named task too" 64 "must be true or false" "$tmp/err.txt"
+printf '%s\n' '[review]' 'reasoning_effort = "High"' > codex-review.toml
+run ok
+check "an uppercase effort is refused rather than lowercased" 64 "reasoning_effort" "$tmp/err.txt"
 calls_after_bad="$(wc -l < "$tmp/calls.txt" 2>/dev/null | tr -d ' ' || echo 0)"
 if [[ "$calls_before_bad" == "$calls_after_bad" ]]; then
     echo "  ok   a refused configuration never reaches the reviewer"
@@ -1136,6 +1180,9 @@ expect "and its source" "model_source=the built-in default" "$last_outcome"
 expect "and the speed" "fast=off" "$last_outcome"
 expect "and the tier actually requested" "service_tier=default" "$last_outcome"
 expect "and that nothing was rejected" "service_tier_rejected=no" "$last_outcome"
+expect "and the reasoning effort (unset)" "reasoning_effort=-" "$last_outcome"
+expect "and the effort's own source" "reasoning_effort_source=the built-in default" "$last_outcome"
+expect "and that the effort was not rejected" "reasoning_effort_rejected=no" "$last_outcome"
 
 echo "a speed codex declines is reported and archived, not treated as a failed round"
 STUB_MODE=tier-rejected run tier-rejected
@@ -1149,7 +1196,23 @@ else
 fi
 last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
 expect "the outcome carries the rejection" "service_tier_rejected=yes" "$last_outcome"
+expect "and the effort is not mislabelled by it" "reasoning_effort_rejected=no" "$last_outcome"
 expect "and the round still produced its review" "reason=none" "$last_outcome"
+echo "an effort codex declines is reported and archived, not treated as a failed round"
+OMT_REVIEW_REASONING_EFFORT=extreme run reasoning-rejected
+check "the review still counts" 0 - "$tmp/out.txt"
+if grep -q '^reasoning_effort_rejected=yes$' .agent-review/last-status.txt; then
+    echo "  ok   the status records the rejected effort"
+else
+    echo "  FAIL the status did not record the rejected effort"
+    failures=$((failures + 1))
+fi
+last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
+expect "the outcome carries the rejected effort" "reasoning_effort_rejected=yes" "$last_outcome"
+expect "and names the level that was requested" "reasoning_effort=extreme" "$last_outcome"
+expect "and the round still produced its review" "reason=none" "$last_outcome"
+expect "the warning names the level" "did not accept the requested reasoning effort 'extreme'" "$tmp/err.txt"
+expect_absent "and it is not misreported as a tier rejection" "did not accept the requested service tier" "$tmp/err.txt"
 STUB_MODE=error-item run error-item
 check "an unrelated error item does not fail the round" 0 - "$tmp/out.txt"
 # The fixture is asserted to have emitted its error: without this, a call that silently ran the happy
@@ -1158,17 +1221,20 @@ expect "the fixture really emitted an error item" "stream disconnected before co
 expect_absent "and it is not reported as a tier rejection" "did not accept the requested service tier" "$tmp/err.txt"
 last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
 expect "with no rejection in the archive" "service_tier_rejected=no" "$last_outcome"
+expect "and not as an effort rejection either" "reasoning_effort_rejected=no" "$last_outcome"
 # The same generic phrase about a different setting: matching it alone would archive a tier rejection
 # that never happened, so this is the case that gives the tier-specific match its teeth. `run` takes the
 # mode as its *first* argument, so the mode is passed there and not only as a prefix: a prefix naming a
 # mode that the call then overrides runs the happy path, and the counter-example proves nothing.
 STUB_MODE=other-setting run other-setting
 check "a rejection of another setting is not a failed round" 0 - "$tmp/out.txt"
-expect "the fixture really emitted the other setting's rejection" "reasoning effort" .agent-review/last-review.jsonl
+expect "the fixture really emitted the other setting's rejection" "verbosity" .agent-review/last-review.jsonl
 expect "and the generic phrase really was in it" "not advertised as supported for model" .agent-review/last-review.jsonl
 expect_absent "and it is not reported as a tier rejection either" "did not accept the requested service tier" "$tmp/err.txt"
+expect_absent "and not as an effort rejection either" "did not accept the requested reasoning effort" "$tmp/err.txt"
 last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
 expect "with no tier rejection in the archive either" "service_tier_rejected=no" "$last_outcome"
+expect "and no effort rejection in the archive either" "reasoning_effort_rejected=no" "$last_outcome"
 
 echo "the handshake helper's own failure paths"
 rm -f "$tmp/nope-ready" "$tmp/bad.pid"
