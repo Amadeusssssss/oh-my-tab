@@ -14,14 +14,43 @@ The app is Rust-only and calls AppKit, CoreGraphics, and ApplicationServices thr
 cargo fmt
 cargo check
 cargo clippy
-cargo test
+scripts/cargo-test.sh
 scripts/dev-restart.sh
 ```
 
+- `scripts/cargo-test.sh` runs the suite and **fails when the run executed no test**. A plain `cargo test`
+  exits 0 for a filter that matched nothing (measured: `running 0 tests ... ok`), so a typo in a filter reads
+  as a pass; the wrapper makes that case a failure. Pass a filter as an argument and it keeps that guard.
 - The normal `cargo test` suite is headless-safe; GUI/permission-dependent smoke tests are marked `#[ignore]`.
 - Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
 - Cross-module, unsafe/FFI, concurrency, configuration, build, or release changes require the full gate above. Before handing off a completed feature, always run the full gate and keep all checks clean.
-- Start the app with `scripts/dev-restart.sh`, never directly with `cargo run`. For runtime changes, run it after the full gate. If it reports `restart FAILED`, inspect the newest log under `~/Library/Logs/oh-my-tab/`, diagnose, and retry.
+- Start the app with `scripts/dev-restart.sh`, never directly with `cargo run`.
+- `scripts/dev-restart.sh --check` verifies a launch and then **stops it**, leaving neither the process nor
+  its launchd job behind; that is the shape an automated check wants. Use it when an A2 or GUI check needs a
+  real instance and the run is done afterwards. It promises only what it can prove: `instance: stopped`, not
+  "nothing changed" — the config file, clipboard history and caches are the app's and the run does not
+  restore them. Interactive iteration keeps the default, which leaves the window open.
+- **A launch is verified from the running process, never from the plist on disk.** The script waits for the
+  app's own `[launch] pid=… executable=… version=… bundle=…` record — written by the process itself, so it can
+  only describe the process that wrote it — and fails when the pid, the executable path or the version
+  disagree, or when the process exited right after writing it. When the log window is unusable (rotated,
+  truncated, unreadable) the run reports `build timestamp: unverified` instead of passing; that is a report,
+  not a pass. Report the `build-version` the script prints, which is the one the process reported.
+- **One build/test/launch transaction at a time, across worktrees.** Every worktree shares one bundle id, one
+  launchd label and one app log — that is what keeps the TCC grants and the keychain ACL valid across
+  rebuilds — so two concurrent runs fight over one instance and the loser's bootout stops an instance the
+  other run is verifying. `scripts/dev-restart.sh` takes a `lockf` claim in the git common directory before it
+  stops anything, and waits up to `--lock-wait=<sec>` (default 900) before failing with exit 75. The claim
+  covers the transaction only: **the app the script leaves running is not protected**, and the next run may
+  replace it. `scripts/dev-lock-selftest.sh` checks the claim offline, including the cross-worktree case.
+- **Stop instances by identity, never by name.** Enumerate, verify each pid's executable path, terminate that
+  pid individually (TERM, then KILL only if it refuses), and name the pids in the output. A broad
+  `pkill -x oh-my-tab` also reaches copies this run cannot account for. The packaged install under
+  /Applications registers the same global shortcut, so it is stopped too — with its pids printed, because it
+  is the user's own app — and nothing may quietly restore the two-instance situation that once made new
+  features look dead.
+- For runtime changes, run `scripts/dev-restart.sh` after the full gate. If it reports `restart FAILED`,
+  inspect the newest log under `~/Library/Logs/oh-my-tab/`, diagnose, and retry.
 - When the onboarding guide does not need verification, launch with `--no-onboarding` (for example, `scripts/dev-restart.sh --no-onboarding`) so it does not appear; only run without it when testing onboarding flows.
 - `scripts/dev-restart.sh` defaults to a **debug** build (`cargo build`): fast iteration with every debug assertion on. Use it for functional iteration and handoff. It re-assembles and re-signs the dev bundle only when the built binary, a bundled resource or the signing identity changed (an input fingerprint decides), and it signs with the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery) -- signing without a secure timestamp, so a local build never depends on Apple's timestamp service. The accepted development identities are the Apple-issued one and the self-signed `oh-my-tab-sign`; **ad-hoc is refused**, and a failure to sign with the Apple identity **aborts the build** unless `--allow-signing-fallback` asks for the self-signed identity on purpose (`--require-stable-signing` demands the Apple identity, both for a fresh build and when reusing an existing bundle). That stable designated requirement is what keeps the login-keychain ACL of the clipboard key and the TCC grants valid across rebuilds: with a self-signed or ad-hoc identity, macOS judges the ACL by the binary, so every rebuild re-prompts.
 - For feel/perf validation (scrolling, animation, latency), run `scripts/dev-restart.sh --opt`. It uses the `dev-opt` cargo profile (`target/dev-opt/`): optimized like release while keeping `debug-assertions`, so runtime speed is representative and development still fails fast.
@@ -81,6 +110,55 @@ step 2, and both can be asked together.
 
 A task is not complete because the code compiles, the tests pass, the feature works, or the implementation
 looks reasonable. Independent review is mandatory.
+
+Before reporting completion, all of the following are true:
+
+- the requested implementation is complete;
+- the applicable gate ran and is clean (an unavailable GUI tier is unrun, not passed);
+- independent review has run in this task's session;
+- every valid finding was either fixed or **deferred under *Review budget and triage*** — recorded in
+  `docs/review-backlog.md` with its reason and revisit trigger, and stated in `--note`. There is no
+  "no valid MEDIUM may remain" requirement: the budget and the impact classes decide what is fixed now,
+  and a remaining finding that is out of scope is reported, not hidden;
+- the fixes were re-reviewed in the same session, within the budget;
+- no unresolved BLOCKER or HIGH finding remains, and no in-scope finding was deferred to end a round.
+
+Do **not** run `--finish` here: the session stays open until the user says the task is done. Report completion
+and, if the session is still open, say so and offer to close it.
+
+## Investigation budget and stopping
+
+Step 1 asks for the relevant code to be understood before it is changed. It does not ask for that to continue
+indefinitely, and treating "certain" as the goal is the failure mode this section exists to stop: certainty has
+no stopping point, so an agent aiming for it spends the budget on its own instrument and reaches the user with
+nothing built. Bind the depth of an **exploratory** investigation to what it costs to be wrong, not to how large
+the uncertainty feels.
+
+- **Name the fork before the dig.** Before a read that is not obviously necessary, say what the competing
+  readings are and which action each one implies. If every branch leads to the same next action, the answer
+  cannot change what you do — stop investigating and do it.
+- **Take the cheapest discriminating observation first.** One observation that separates two hypotheses beats
+  ten that corroborate one.
+- **Two misses end the branch.** Two consecutive exploratory steps that did not change the plan mean this
+  branch has saturated: the next message either acts or asks a question. It stops *this* line of exploration
+  and names the next step; it is not a claim that the information is objectively complete.
+- **Prefer acting when acting is reversible.** The cheaper a change is to undo, the less it has to be proven
+  first; `git` can revert an uncommitted edit in a moment, a persisted-state migration or a keychain change
+  cannot.
+- **Ask instead of dissolving a real ambiguity.** When two readings genuinely differ in cost, or in what the
+  reader ends up seeing, put the choice to the user.
+- **Recognise the anti-patterns by name:** commit archaeology as anxiety management; precision theatre —
+  measuring something the decision does not depend on; collecting confirmations after the answer is settled;
+  and treating "I could check one more thing" as a reason to.
+
+A progress prompt, not a gate: **more than roughly ten read-only tool calls, or several minutes, with no
+write** means the next message should name the decision that is still open and why it is worth another look.
+The count is a nudge. The test that decides is the one above it — *will this information change what I do
+next?*
+
+**This section never overrides a requirement to check.** Security, concurrency, data-migration and FFI/lifetime
+work needs the verification it needs; a user-specified read-only scope is a scope, not a budget to spend; and
+"reversible" is judged by what the user loses, not by how few files the change touches.
 
 ## Review budget and triage
 
@@ -161,12 +239,24 @@ scripts/agent-review-selftest.sh            # check the helper itself, against a
   what the reviewer remembers, not the diff**: two agents in one working tree still put both tasks' changes in
   front of the reviewer, so a tree per task is what makes two reviews independent, and what is in scope for a
   task is what `--note` says.
-- Only a round that actually concluded counts. A transport failure, a turn that never completed, a message
-  that is not a verdict or a timeout is reported as a failed round with the reason and the archived evidence
-  under `.agent-review/rounds/`, and is never counted toward completion. A tree that matches HEAD is refused
-  before anything runs — a round that reviewed no change is not a review — with two exceptions: `--design`,
-  which is asked before there is anything to review, and `--retry`, which resumes a round that produced no
-  verdict on a tree that legitimately has not changed since.
+- **A round without a verdict is not a review.** Only a round that actually concluded counts. A transport
+  failure, a turn that never completed, a message that is not a verdict or a timeout is reported as a failed
+  round with the reason and the archived evidence under `.agent-review/rounds/`, and is never counted toward
+  completion. Retry it with `--retry` **at most twice, then stop and tell the user**; a retry resumes the same
+  kind of round it was (a design round stays a design round), and says that nothing in the tree changed rather
+  than claiming an update.
+- **An unrecoverable round and a lost session are different things.** Several failed attempts mean something is
+  wrong with the transport or the configuration as often as they mean the session is gone, so report what the
+  helper printed rather than asserting the session no longer exists. Once a resume is confirmed lost, say so —
+  the reviewer's memory of its earlier findings is gone — and continue with `--fresh`, handing the still-open
+  findings and every deferral over in `--note`. A session is never discarded silently, and `--fresh` says when
+  it replaces one.
+- **A tree that matches HEAD is refused** (exit 65) before anything runs — a round that reviewed no change is
+  not a review — with two exceptions: `--design`, which is asked before there is anything to review, and
+  `--retry`, which resumes a round that produced no verdict on a tree that legitimately has not changed since.
+- **A re-review revisits every previous finding and classifies it** — RESOLVED, PARTIALLY RESOLVED,
+  UNRESOLVED, or REJECTED WITH VALID JUSTIFICATION — then looks for regressions and newly introduced problems.
+  A finding is never treated as fixed merely because the code changed.
 - The reviewer inspects the diff and surrounding code, verifies correctness, and looks for regressions, edge
   cases, concurrency and lifetime problems, error handling, API misuse, performance, architecture, and
   missing tests. It must not modify files, implement fixes, refactor, or resolve findings itself.

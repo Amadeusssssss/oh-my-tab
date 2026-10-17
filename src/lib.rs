@@ -2737,6 +2737,29 @@ fn application_reopen_smoke() -> bool {
     }
 }
 
+/// Emit the one line that names the running process and the build it reports to itself.
+///
+/// Read by `scripts/dev-restart.sh` to prove a launch reached the build that was just made: the
+/// plist on disk can describe a build this process never loaded. Every field comes from the process
+/// itself — its own pid, its own executable path, its own main bundle — so a record can only ever
+/// describe the process that wrote it. This is an identity claim, not a readiness one.
+fn log_launch_identity() {
+    let executable = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // NSBundle is main-thread only, which is where `run` executes.
+    let (version, identifier) = unsafe {
+        (
+            crate::ffi::bundle_info_string("CFBundleVersion"),
+            crate::ffi::bundle_info_string("CFBundleIdentifier"),
+        )
+    };
+    log_info!(
+        "{}",
+        logger::launch_identity_line(std::process::id(), &executable, &version, &identifier)
+    );
+}
+
 /// App entry: the full startup/smoke/run loop (called by the thin bin wrapper; behavior
 /// is unchanged by the lib/bin split).
 pub fn run() {
@@ -2826,6 +2849,7 @@ pub fn run() {
             is_dev,
         );
     }
+    log_launch_identity();
 
     // 2. Register custom ObjC classes
     overlay::register_card_class();

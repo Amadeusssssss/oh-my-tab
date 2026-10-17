@@ -36,7 +36,7 @@ The app is written in Rust and calls AppKit, CoreGraphics, and ApplicationServic
 - <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: a preview that follows each window's own aspect ratio (extremely wide or tall windows are narrowed to stay readable); needs **Screen Recording** permission, otherwise icon-only cards.
 - <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab / Shift+Tab / arrow keys / mouse; the shortcut can be Option+Tab.
 - <img height="14" src="docs/icons/tools.svg"> **Window control** (optional): Option+arrow keys maximize, snap or minimize; add Shift to move a window to the next display.
-- <img height="14" src="docs/icons/zap.svg"> **Quick actions** (optional): Option+I/E/D/L open Settings, Finder, the desktop and the lock screen; double-tap Control to locate the pointer.
+- <img height="14" src="docs/icons/zap.svg"> **Quick actions** (optional): Option+I/E/D/L open Settings, Finder (maximized or small window, two separate bindings), the desktop and the lock screen; double-tap Control to locate the pointer.
 - <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images and files — search, pin, delete, expiry and encrypted storage.
 - <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration and side-button → shortcut mapping.
 - <img height="14" src="docs/icons/star.svg"> **Appearance and settings**: light / dark / system, liquid glass, tint, radius and font size, all managed in Settings.

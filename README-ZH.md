@@ -34,7 +34,7 @@ oh-my-tab 是一款使用 Rust 原生开发的 macOS 工具，集成了窗口切
 - <img height="14" src="docs/icons/image.svg"> **窗口缩略图**：预览按窗口自身的宽高比显示（比例极端时收窄到合理范围）；需要**屏幕录制**权限，未授权时退化为纯图标卡片。
 - <img height="14" src="docs/icons/key.svg"> **灵活导航**：Tab / Shift+Tab / 方向键 / 鼠标；快捷键可改为 Option+Tab。
 - <img height="14" src="docs/icons/tools.svg"> **窗口控制**（可选）：Option+方向键最大化、分屏、最小化；加 Shift 移到相邻显示器。
-- <img height="14" src="docs/icons/zap.svg"> **快捷操作**（可选）：Option+I/E/D/L 打开设置、访达、桌面、锁屏；双击 Control 定位鼠标。
+- <img height="14" src="docs/icons/zap.svg"> **快捷操作**（可选）：Option+I/E/D/L 打开设置、访达（最大化窗口 / 小窗口，两个可分别绑定的动作）、桌面、锁屏；双击 Control 定位鼠标。
 - <img height="14" src="docs/icons/copy.svg"> **历史剪贴板**（可选）：文本、图片与文件条目，可搜索、置顶、删除、过期，并加密持久化。
 - <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**（可选）：滚动模式、反向滚动、按设备指针加速、侧键 → 快捷键映射。
 - <img height="14" src="docs/icons/star.svg"> **外观与设置**：浅色 / 深色 / 跟随系统、液态玻璃、色调、圆角、字号，都在设置里统一管理。

@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # pragma: no cover - the rewrite is still duplicate
     tomllib = None
 
 _TABLE_HEADER = re.compile(r"^\[\s*([A-Za-z0-9_.\-]+)\s*\]$")
+_ARRAY_TABLE_HEADER = re.compile(r"^\[\[\s*([A-Za-z0-9_.\-]+)\s*\]\]$")
 
 
 def _table_of(line):
@@ -56,6 +57,59 @@ def set_bool(text, table, key, value):
     if not inserted:
         raise ValueError(f"the config has no [{table}] table to write {key} into")
     return "".join(updated)
+
+
+def _table_header_of(line):
+    """The table a line opens, for both `[table]` and `[[table]]` headers."""
+    array_match = _ARRAY_TABLE_HEADER.match(line.strip())
+    if array_match:
+        return array_match.group(1)
+    return _table_of(line)
+
+
+def replace_key_bindings(text, items):
+    """Return `text` with the whole `[key_bindings]` table replaced by `items`.
+
+    `items` is a sequence of (action, trigger) pairs, each written enabled. Every other table is
+    preserved verbatim, so a scenario that forces specific bindings does not also drop the user's
+    other settings. The caller validates the result with `tomllib` before writing.
+    """
+    kept = []
+    skipping = False
+    for line in text.splitlines(keepends=True):
+        header = _table_header_of(line)
+        if header is not None:
+            skipping = header == "key_bindings" or header.startswith("key_bindings.")
+            if skipping:
+                continue
+        if skipping:
+            continue
+        kept.append(line)
+
+    block = ["\n[key_bindings]\nenabled = true\n"]
+    for action, trigger in items:
+        block.append("\n[[key_bindings.items]]\n")
+        block.append(f'action = "{action}"\n')
+        block.append(f'trigger = "{trigger}"\n')
+        block.append("enabled = true\n")
+    return "".join(kept) + "".join(block)
+
+
+def apply_key_bindings(path, items):
+    """Rewrite only the `[key_bindings]` table; refuse to leave an unparseable config behind."""
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    updated = replace_key_bindings(text, items)
+    if tomllib is not None:
+        parsed = tomllib.loads(updated)
+        assert parsed["key_bindings"]["enabled"] is True
+        assert len(parsed["key_bindings"]["items"]) == len(items)
+        for table in tomllib.loads(text):
+            if table != "key_bindings":
+                assert table in parsed, f"replace_key_bindings dropped [{table}]"
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+    return updated
 
 
 def apply(path, table, key, value):
@@ -116,6 +170,34 @@ def _selftest():
     else:
         raise AssertionError("a missing table must be refused")
 
+    # The whole key-bindings table is replaced while every other table survives. The
+    # counter-example is a scenario that adds its own items without removing the user's list: the
+    # app would then see duplicate triggers and silently drop one of them.
+    base = (
+        '[keyboard]\nmodifier = "command"\n\n'
+        "[key_bindings]\nenabled = false\n\n"
+        '[[key_bindings.items]]\naction = "quick.open_finder"\ntrigger = "option+e"\nenabled = true\n\n'
+        "[windows]\nenabled = true\n"
+    )
+    out = replace_key_bindings(
+        base,
+        [
+            ("quick.open_finder", "control+option+e"),
+            ("quick.open_finder_small", "control+option+shift+e"),
+        ],
+    )
+    assert out.count("[[key_bindings.items]]") == 2, out
+    assert 'trigger = "option+e"' not in out, out
+    parsed = _parsed(out)
+    if parsed is not None:
+        assert parsed["keyboard"]["modifier"] == "command"
+        assert parsed["windows"]["enabled"] is True
+        assert parsed["key_bindings"]["enabled"] is True
+        assert [item["action"] for item in parsed["key_bindings"]["items"]] == [
+            "quick.open_finder",
+            "quick.open_finder_small",
+        ]
+
     print("config_switch selftest: ok")
 
 
@@ -127,7 +209,17 @@ if __name__ == "__main__":
         if literal not in ("true", "false"):
             raise SystemExit("the value must be true or false")
         apply(path, table, key, literal == "true")
+    elif len(sys.argv) >= 4 and sys.argv[1] == "--set-bindings":
+        path = sys.argv[2]
+        items = []
+        for spec in sys.argv[3:]:
+            action, separator, trigger = spec.partition("=")
+            if not separator or not action or not trigger:
+                raise SystemExit(f"bad binding spec: {spec!r}")
+            items.append((action, trigger))
+        apply_key_bindings(path, items)
     else:
         raise SystemExit(
-            "usage: config_switch.py --selftest | --set <path> <table> <key> <true|false>"
+            "usage: config_switch.py --selftest | --set <path> <table> <key> <true|false> |"
+            " --set-bindings <path> <action=trigger>..."
         )

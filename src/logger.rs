@@ -416,9 +416,109 @@ fn now_timestamp() -> String {
     }
 }
 
+/// The line a development script reads to prove which process and which build is running.
+///
+/// It is emitted once, early, on the calling thread, and carries the three facts a launch check
+/// cannot get from the bundle on disk: the pid that answered, the executable that pid runs, and the
+/// `CFBundleVersion` that executable's own bundle reports. A line is not a readiness signal — it
+/// says who started, never that initialization finished.
+pub(crate) fn launch_identity_line(
+    pid: u32,
+    executable: &str,
+    bundle_version: &str,
+    bundle_identifier: &str,
+) -> String {
+    // Every value is escaped for a single line: a path may contain a newline, and a value that broke
+    // the line would let a reader attribute the fields of one record to another.
+    format!(
+        "[launch] pid={} executable={} version={} bundle={}",
+        pid,
+        escape_field(executable),
+        escape_field(bundle_version),
+        escape_field(bundle_identifier)
+    )
+}
+
+/// Replace the characters that would let a value escape its field, so one record stays one line
+/// and every field can be split out unambiguously.
+fn escape_field(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            ' ' => escaped.push_str("\\s"),
+            '=' => escaped.push_str("\\e"),
+            '[' => escaped.push_str("\\o"),
+            ']' => escaped.push_str("\\c"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    if escaped.is_empty() {
+        return "-".to_string();
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_launch_identity_line_carries_every_field_on_one_line() {
+        let line = launch_identity_line(
+            4242,
+            "/Applications/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab",
+            "20261017103000",
+            "com.eacryo.oh-my-tab.dev",
+        );
+        let expected = concat!(
+            "[launch] pid=4242 ",
+            "executable=/Applications/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab ",
+            "version=20261017103000 bundle=com.eacryo.oh-my-tab.dev"
+        );
+        assert_eq!(line, expected);
+        assert!(!line.contains('\n'), "a record must stay one line");
+    }
+
+    #[test]
+    fn a_hostile_value_cannot_forge_a_second_record_or_a_new_field() {
+        // The counterexample this escapes for: a path containing a newline and a "version=" string
+        // would otherwise let the last record win, which is exactly a wrong build reported as right.
+        let line = launch_identity_line(1, "/tmp/a\n[launch] pid=999 version=evil", "1", "b");
+        assert!(!line.contains('\n'), "{line}");
+        assert_eq!(line.matches("[launch]").count(), 1, "{line}");
+        assert_eq!(line.matches(" version=").count(), 1, "{line}");
+        assert!(line.contains("version=1"), "{line}");
+        assert!(line.contains("evil"), "the value is kept, escaped: {line}");
+    }
+
+    #[test]
+    fn an_empty_field_is_a_marker_rather_than_a_missing_key() {
+        let line = launch_identity_line(7, "", "", "");
+        assert_eq!(line, "[launch] pid=7 executable=- version=- bundle=-");
+    }
+
+    #[test]
+    fn the_field_codec_is_the_one_the_script_decodes() {
+        // scripts/dev-restart.sh decodes with the inverse of this table; the two must stay
+        // inverse or a path containing a space silently stops matching the built binary. Each
+        // entry is the escape the script must undo, so the test states the contract the script
+        // consumes instead of only the one the encoder produces.
+        let cases = [
+            ("a b", "a\\sb"),
+            ("a\\b", "a\\\\b"),
+            ("a=b", "a\\eb"),
+            ("a[b]c", "a\\ob\\cc"),
+            ("a\nb", "a\\nb"),
+            ("a\rb", "a\\rb"),
+            ("", "-"),
+        ];
+        for (plain, encoded) in cases {
+            assert_eq!(escape_field(plain), encoded, "encoding {plain:?}");
+        }
+    }
 
     #[test]
     fn levels_map_to_padded_labels() {
