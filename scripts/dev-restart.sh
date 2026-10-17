@@ -8,7 +8,7 @@
 #   scripts/dev-restart.sh -- --force-onboarding   # `--` 之后的 argv 原样透传给应用
 #   scripts/dev-restart.sh --force-onboarding      # 脚本不认识的 --* 参数也照样透传
 #   scripts/dev-restart.sh --no-onboarding         # 跳过本次启动的引导
-# 开关只在本次启动生效:脚本每次先 pkill 旧实例,不会残留。
+# 开关只在本次启动生效:脚本每次先按身份停掉旧实例,不会残留。
 # 为什么不用环境变量:开发版由 launchd 启动,而 launchd 任务不继承调用者环境;以前靠白名单转发
 # OH_MY_TAB_*,一旦过滤写漏就会把整份环境(云凭证、代理)灌进任务与日志 —— 2026-09-22 出过这次
 # 事故。现在只有 argv 一个通道:本脚本**不读、不转发、不回显任何环境变量**,也不要再加回来;
@@ -24,7 +24,10 @@
 #   scripts/dev-restart.sh -- --force-onboarding   # argv after `--` is forwarded verbatim
 #   scripts/dev-restart.sh --force-onboarding      # any `--*` argument the script does not own
 #   scripts/dev-restart.sh --no-onboarding         # suppress the guide for this launch
-# Switches apply to this launch only: the script pkills old instances first, nothing sticks.
+# Switches apply to this launch only: the script stops old instances by identity first, nothing
+# sticks. Stopping an instance is a transaction under a cross-worktree claim (scripts/lib/dev-lock.sh);
+# the claim is released when this script returns, so the window it leaves is NOT protected.
+#   scripts/dev-restart.sh --lock-wait=60           # seconds to wait for another worktree's transaction
 # Why no environment variables: the dev build is started by launchd, and a launchd job does not
 # inherit the caller's environment. The allowlist that used to forward OH_MY_TAB_* dumped the whole
 # environment (cloud credentials, proxies) into the job and the logs whenever the filter was wrong --
@@ -46,6 +49,8 @@ app_args=()
 after_separator=0
 require_stable_signing=0
 allow_signing_fallback=0
+lock_wait_seconds=900
+check_mode=0
 for arg in "$@"; do
     if [ "$after_separator" = "1" ]; then
         app_args+=("$arg")
@@ -57,6 +62,21 @@ for arg in "$@"; do
         --require-stable-signing) require_stable_signing=1 ;;
         --allow-signing-fallback) allow_signing_fallback=1 ;;
         --no-onboarding) app_args+=("$arg") ;;
+        --check)
+            # Verify a launch, then stop it: the shape an automated check wants, which is the
+            # opposite of the interactive default. It leaves neither this run's process nor its
+            # launchd job behind, and makes no claim about config, clipboard or cache state.
+            check_mode=1
+            ;;
+        --lock-wait=*)
+            lock_wait_seconds="${arg#--lock-wait=}"
+            case "$lock_wait_seconds" in
+                ''|*[!0-9]*)
+                    echo "restart FAILED: --lock-wait needs a whole number of seconds: $arg"
+                    exit 2
+                    ;;
+            esac
+            ;;
         -h|--help)
             echo "Usage: scripts/dev-restart.sh [--opt] [--require-stable-signing] [--allow-signing-fallback] [--no-onboarding] [-- <app args>...]"
             echo "  (no flag)  debug build: fast iteration, complete debug assertions"
@@ -67,6 +87,10 @@ for arg in "$@"; do
             echo "                            fallback bundle has a DIFFERENT identity and loses the keychain"
             echo "                            and TCC grants recorded for the Apple identity)"
             echo "  --no-onboarding  forward to the app and suppress the guide for this launch"
+            echo "  --check    verify the launch, then stop it and its launchd job (leaves nothing running)"
+            echo "  --lock-wait=<sec>  wait this long for another worktree's build/test/launch transaction"
+            echo "                     (default 900); the claim is released when this script returns, so the"
+            echo "                     window it leaves is NOT protected from the next run"
             echo "  -- ARGS    forward ARGS to the app executable, verbatim"
             echo "  --FLAG     every other --flag[=value] is forwarded to the app as well, e.g."
             echo "             scripts/dev-restart.sh --open-settings=about --force-onboarding"
@@ -116,9 +140,192 @@ if [ ! -s "$dev_release_doc" ]; then
     exit 1
 fi
 
-# 移除脚本上一次提交的用户级 launchd 任务,否则 launchd 会在 pkill 后自动拉起旧实例。
+# 开发实例的互斥声明:同一时刻只允许一个 构建-测试-启动 事务,跨 worktree 生效。
+# The development-instance claim: one build-test-launch transaction at a time, across worktrees.
+# Every worktree shares the bundle id, launchd label and app log below, so two concurrent runs
+# fight over one instance and the loser's bootout kills an instance the other run is verifying.
+# The claim covers the transaction only -- the app this script leaves running is NOT protected,
+# and the next run may replace it (see the note printed on success).
+source "$repo_dir/scripts/lib/dev-lock.sh"
+lock_path="$(omt_lock_dir "$repo_dir")"
+if [ -z "$lock_path" ]; then
+    echo "restart FAILED: cannot locate the development lock (is this a git repository?)"
+    exit 1
+fi
+omt_lock_acquire "$lock_path" "$lock_wait_seconds"
+lock_status=$?
+if [ "$lock_status" -eq 75 ]; then
+    echo "restart FAILED: another worktree is mid-transaction and did not release within ${lock_wait_seconds}s"
+    echo "hint: wait for it, or raise the wait with --lock-wait=<seconds>"
+    exit 75
+fi
+if [ "$lock_status" -ne 0 ]; then
+    echo "restart FAILED: cannot take the development lock at $lock_path"
+    exit 1
+fi
+# The claim is ours from here, so this is the one place that must release it however the script ends:
+# even a failure before any cleanup state exists below.
+trap 'omt_lock_release' EXIT
+
+# --- run lifecycle ----------------------------------------------------------------
+#
+# What this run owns and what it concluded. Cleanup is decided from these values and nowhere else,
+# so a failure, an interruption and a normal finish all release exactly what this run created --
+# never an instance a later run has taken over.
+#
+# `owned_job` is set the moment the launchd job is submitted; `owned_pid` when the process is found.
+# The gap between them is real: the app can be running before the first poll sees it, so cleanup
+# must be able to find the instance it started even when no pid was ever recorded.
+owned_pid=""
+owned_job=0
+owned_launch_attempted=0
+app_pid_start=""
+# Whether a successful finish should announce the stop. Only --check stops what it started.
+announce_stop=0
+run_failed=0
+verified=1
+
+# The pid this run started, when the poll had not recorded one before an interruption.
+#
+# Booted out of launchd is not stopped: the job removal stops the job, not the process it started.
+# The instance is found the same way the launcher finds it -- by the executable of this build -- so
+# cleanup still ends it, and the search never reaches another worktree's binary.
+#
+# This is called more than once on purpose. A job can start the app between one lookup and the
+# bootout that follows it, so a single lookup before bootout proves nothing: the lookup after the
+# job is gone is the one that sees a late instance.
+adopt_started_instance() {
+    if [ -n "$owned_pid" ]; then
+        return 0
+    fi
+    [ "$owned_launch_attempted" -eq 1 ] || return 0
+    local candidate
+    candidate="$(find_dev_app_pid)"
+    [ -n "$candidate" ] || return 0
+    owned_pid="$candidate"
+    app_pid_start="$(ps -p "$candidate" -o lstart= 2>/dev/null)"
+}
+
+# Ask the app to quit the way a user does, then stop it only if that did not work.
+#
+# Returns 0 when the instance is gone after an orderly exit, 1 when the stop had to escalate.
+# The quit goes through `request_app_quit` rather than a call site so the offline selftest can
+# replace it: a hard-coded /usr/bin/osascript reaches the host's AppleEvent path even under a
+# function of the same name, which is exactly what made an earlier selftest claim an isolation
+# it did not have.
+request_app_quit() {
+    /usr/bin/osascript -e "tell application id \"$dev_bundle_id\" to quit" >/dev/null 2>&1 || true
+}
+
+quit_then_stop() {
+    local pid="$1"
+    kill -0 "$pid" 2>/dev/null || return 0
+    request_app_quit
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        # The graceful path did not take. Stop it anyway -- leaving it running would keep a
+        # development switch alive on the user's machine -- but report the escalation.
+        stop_pid_by_identity "$pid" "$dev_app_binary" >/dev/null 2>&1 || true
+        sleep 0.2
+        kill -0 "$pid" 2>/dev/null || return 1
+        return 1
+    fi
+    return 0
+}
+# End the run: release what this run owns, then the claim, then exit with the original status.
+#
+# The cleanup order matters. A launchd job left loaded respawns the app the moment this script exits,
+# so it is booted out first. The app is then asked to quit the way a user quits it, because the app
+# runs its orderly cleanup (clipboard history, pointer settings) from its termination path; a signal
+# skips that path, so it is the escalation, not the method. A forced stop is reported as an abnormal
+# cleanup and turns a success into a failure -- the run must not claim a clean stop it did not get.
+finish_run() {
+    local status="$1"
+    local forced=0
+
+    # Booted out FIRST, and whenever a submit was attempted -- not only when one was confirmed: an
+    # interrupted submit may have created the job without this run ever learning so. Removing the
+    # job before looking for the process is what closes the late-start window: the job is the thing
+    # that can start a new instance, so it goes away before the last lookup.
+    if [ "$owned_job" -eq 1 ] || [ "$owned_launch_attempted" -eq 1 ]; then
+        launchctl bootout "$launch_target" >/dev/null 2>&1 || true
+        wait_for_job_gone || true
+    fi
+
+    # Now discover what to stop. A job that started the app between an earlier lookup and the bootout
+    # left a process this run never recorded, so keep looking for a moment rather than once: the
+    # process may still be starting when the job disappears.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        adopt_started_instance
+        [ -n "$owned_pid" ] && break
+        sleep 0.2
+    done
+
+    if [ -n "$owned_pid" ]; then
+        quit_then_stop "$owned_pid" || forced=1
+    fi
+
+    if [ "$owned_job" -eq 1 ] && launchctl print "$launch_target" >/dev/null 2>&1; then
+        echo "cleanup FAILED: launchd job $launch_label is still loaded"
+        status=1
+    fi
+
+    # The residue question is asked of the machine, not of the pid this run happened to save: a
+    # process it never recorded still has to be gone before the run may say it cleaned up.
+    if [ "$owned_launch_attempted" -eq 1 ]; then
+        # Give an already-signalled process a moment to leave before calling it residue.
+        for _ in 1 2 3 4 5 6 7 8; do
+            [ -n "$(find_all_dev_app_pids)" ] || break
+            sleep 0.25
+        done
+        residue="$(find_all_dev_app_pids)"
+        if [ -n "$residue" ]; then
+            # A process that appeared only now was never recorded above; it is still this run's to
+            # stop. It goes through the SAME orderly path: quitting first is what lets the app run
+            # its own cleanup, and a signal is the escalation, never the method. Whatever this
+            # path has to escalate is recorded in `forced`, so the run cannot report a clean stop it
+            # did not achieve -- the verdict below is decided after every stop has happened.
+            for pid in $residue; do
+                quit_then_stop "$pid" || forced=1
+            done
+            residue="$(find_all_dev_app_pids)"
+        fi
+        if [ -n "$residue" ]; then
+            echo "cleanup FAILED: pid $residue of this build is still running"
+            status=1
+        fi
+    fi
+
+    # Decided last, after every stop attempt: a stop that had to escalate is an abnormal cleanup.
+    if [ "$forced" -eq 1 ] && [ "$status" -eq 0 ]; then
+        echo "check FAILED: an instance was force-stopped, so its orderly exit cleanup did not run"
+        status=1
+    fi
+
+    # The stop is announced only here, after every check above passed: a message printed before the
+    # cleanup ran could describe a state this run never reached.
+    if [ "$status" -eq 0 ] && [ "$check_mode" -eq 1 ] && [ "$announce_stop" -eq 1 ]; then
+        echo "instance: stopped (--check leaves neither this run's process nor its launchd job)"
+    fi
+
+    omt_lock_release
+    exit "$status"
+}
+
+# Installed only now that finish_run exists: a trap that names a function defined later would fail
+# when it fires (`bash: finish_run: command not found`) and let the run continue building and
+# launching -- worse than no trap at all. The claim itself is released by the EXIT trap installed
+# when it was taken, which needs no state.
+trap 'finish_run 130' INT
+trap 'finish_run 143' TERM
+
+
+# 移除脚本上一次提交的用户级 launchd 任务,否则 launchd 会在停掉实例后自动拉起旧实例。
 # Remove the user-level launchd job submitted by the previous run; otherwise launchd
-# would automatically respawn the old instance after pkill.
+# would automatically respawn the old instance after it is stopped.
 launch_label="oh-my-tab-dev"
 launch_domain="gui/$(id -u)"
 launch_target="$launch_domain/$launch_label"
@@ -148,15 +355,136 @@ if ! wait_for_job_gone; then
     exit 1
 fi
 
-# 杀掉所有 oh-my-tab 实例:开发二进制 + 任意位置的打包 .app 都会注册同一个全局快捷键,
-# 两个进程并存时旧版会抢走 Cmd+Tab(用户曾因此误以为新功能没生效)。
-# 按完整进程名匹配,覆盖 /Applications、dist 和其它副本;无旧进程也不报错。
-# Kill every oh-my-tab instance: both the dev binary and the packaged .app register the
-# same global shortcut -- with two running, the older one hijacks Cmd+Tab (which once made
-# new features look dead). Match the complete process name so copies under /Applications,
-# dist, and other locations are all covered; no error when nothing is running.
-pkill -x 'oh-my-tab' 2>/dev/null
-sleep 0.5
+# 停实例:先枚举,再逐个核对可执行路径与 bundle 身份,确认后才 TERM,顽固的才 KILL。
+# Stop instances by identity, never by name: enumerate, verify each candidate's executable path
+# and the containing bundle's identifier, terminate that PID individually, and force-kill only a
+# verified PID that refuses to exit. A broad `pkill -x` would also reach a copy this run cannot
+# account for, and a stopped PID nobody named is a silent change to the user's machine.
+#
+# The dev instance is stopped without asking: it is what this script replaces. A packaged install
+# under /Applications registers the same global shortcut, and with two running the older one
+# hijacks Command+Tab (which once made new features look dead), so it is stopped too -- but its
+# PIDs are named in the output, because that is the user's own app.
+# 本次构建的应用进程:按可执行路径匹配,只返回第一个。
+# The process running the binary this script assembled. Matching the exact executable path keeps the
+# search inside this worktree's build, so it can never name another worktree's instance.
+find_dev_app_pid() {
+    /usr/bin/pgrep -f "$dev_app_binary" 2>/dev/null | awk 'NR == 1 { print; exit }'
+}
+
+# Every process running this build. The residue check asks whether ANY survived, so it cannot use
+# the first-match helper above: leftover instances are exactly the case where one pid is not the
+# whole answer.
+find_all_dev_app_pids() {
+    /usr/bin/pgrep -f "$dev_app_binary" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'
+}
+
+stop_pid_by_identity() {
+    local pid="$1"
+    local expected_binary="$2"
+    local actual
+    actual="$(ps -p "$pid" -o comm= 2>/dev/null)"
+    [ "$actual" = "$expected_binary" ] || return 1
+    kill -TERM "$pid" 2>/dev/null || return 1
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.2
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || return 1
+        sleep 0.2
+    fi
+    return 0
+}
+
+# Classify a candidate before touching it. Its executable path alone is not proof of ownership: the
+# same name is what two different bundles share. The containing .app bundle is what decides -- the
+# dev bundle this script replaces, a packaged install that shares the global shortcut, or something
+# this run cannot account for, which is reported and stops the launch instead of being killed.
+bundle_identifier_of() {
+    local exe="$1"
+    local app=""
+    case "$exe" in
+        *.app/Contents/MacOS/*) app="${exe%%/Contents/MacOS/*}" ;;
+    esac
+    [ -n "$app" ] && [ -f "$app/Contents/Info.plist" ] || return 1
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null
+}
+
+stopped_dev_pids=()
+stopped_dev_owners=()
+stopped_packaged_pids=()
+unknown_instances=()
+while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    candidate_exe="$(ps -p "$candidate" -o comm= 2>/dev/null)"
+    [ -n "$candidate_exe" ] || continue
+    # A bare binary under this repository's own build directories is this worktree's build.
+    case "$candidate_exe" in
+        "$dev_app_binary")
+            # This worktree's own instance: reported through the same list as every other dev stop,
+            # so the most common case -- restarting back to back -- names the pid it replaced.
+            if stop_pid_by_identity "$candidate" "$dev_app_binary"; then
+                stopped_dev_pids+=("$candidate")
+                stopped_dev_owners+=("pid $candidate from this worktree ($repo_dir)")
+            else
+                unknown_instances+=("pid $candidate $candidate_exe (could not be stopped)")
+            fi
+            continue
+            ;;
+        *) ;;
+    esac
+    candidate_bundle="$(bundle_identifier_of "$candidate_exe" || true)"
+    case "$candidate_bundle" in
+        "$dev_bundle_id")
+            # Another dev build: the same bundle id by design, so it is what this run replaces. The
+            # owning worktree is read from the verified executable path, so the user can tell which
+            # checkout the instance that just disappeared belonged to.
+            owner="${candidate_exe%%/dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab}"
+            if [ "$owner" = "$candidate_exe" ]; then
+                owner="an unrecognised location"
+            fi
+            if stop_pid_by_identity "$candidate" "$candidate_exe"; then
+                stopped_dev_pids+=("$candidate")
+                stopped_dev_owners+=("pid $candidate from $owner")
+            else
+                unknown_instances+=("pid $candidate $candidate_exe (could not be stopped)")
+            fi
+            ;;
+        com.eacryo.oh-my-tab)
+            if stop_pid_by_identity "$candidate" "$candidate_exe"; then
+                stopped_packaged_pids+=("$candidate")
+            else
+                unknown_instances+=("pid $candidate $candidate_exe (could not be stopped)")
+            fi
+            ;;
+        *)
+            unknown_instances+=("pid $candidate $candidate_exe (bundle: ${candidate_bundle:-none})")
+            ;;
+    esac
+done < <(pgrep -x 'oh-my-tab' 2>/dev/null || true)
+
+if [ ${#unknown_instances[@]} -gt 0 ]; then
+    # Refusing beats killing: an instance this script cannot identify is not this run's to stop,
+    # and two instances would fight over the global shortcut, so the launch stops here.
+    echo "restart FAILED: an oh-my-tab instance this run does not own is running:"
+    for entry in "${unknown_instances[@]}"; do
+        echo "  $entry"
+    done
+    echo "hint: quit it yourself, then run this script again"
+    exit 1
+fi
+
+if [ ${#stopped_dev_pids[@]} -gt 0 ]; then
+    echo "stopped the previous dev instance:"
+    for entry in "${stopped_dev_owners[@]}"; do
+        echo "  $entry"
+    done
+fi
+if [ ${#stopped_packaged_pids[@]} -gt 0 ]; then
+    echo "stopped a running packaged install (pid ${stopped_packaged_pids[*]}) -- it shares the global shortcut"
+fi
+sleep 0.3
 
 # 每次都删除旧的开发版 .app,避免旧资源或旧 Info.plist 混入新包。
 # 若现有包是 release-dev.sh 产出的发布渠道包,先提示会被本地开发包覆盖(两者共用同一
@@ -472,41 +800,195 @@ fi
 launch_output_dir="$HOME/Library/Logs/oh-my-tab"
 mkdir -p "$launch_output_dir"
 launch_output="$launch_output_dir/dev-launchd-open.log"
+
+# The log window this launch may be judged by: only bytes written after this point can describe it.
+# Taken BEFORE the job is submitted -- a fast launch can write its only record within the first
+# second, and a window opened afterwards would exclude exactly the line it is looking for.
+# The inode and size together identify the window: a rotated log is a different file, and a
+# truncated one is shorter than the offset, so neither can pass for "nothing written since".
+dev_log_path="$HOME/Library/Logs/oh-my-tab/oh-my-tab.log"
+dev_log_offset=0
+dev_log_inode=""
+if [ -f "$dev_log_path" ]; then
+    dev_log_offset="$(/usr/bin/stat -f %z "$dev_log_path" 2>/dev/null || echo 0)"
+    dev_log_inode="$(/usr/bin/stat -f %i "$dev_log_path" 2>/dev/null || echo "")"
+fi
+
+# Both flags are set BEFORE the submit call, and owned_job is withdrawn only when the submit
+# provably created nothing. The order is the point: a submission can succeed and be interrupted
+# before any line after it runs, and a cleanup that trusts a flag assigned afterwards would skip
+# bootout and leave a job that later starts the app. Over-claiming costs one bootout of a label this
+# run never created; under-claiming leaves a development instance running.
+owned_launch_attempted=1
+owned_job=1
 submit_error="$(launchctl submit -l "$launch_label" -o "$launch_output" -e "$launch_output" -- \
     "$repo_dir/scripts/dev-launchd-wrapper.sh" --from-launchd "$launch_label" \
     "${open_command[@]}" 2>&1)"
 submit_status=$?
 if [ "$submit_status" -ne 0 ] && ! launchctl print "$launch_target" >/dev/null 2>&1; then
+    # The submit failed and the label is absent, so nothing of this run exists to clean up.
+    owned_job=0
+    owned_launch_attempted=0
     echo "restart FAILED: launchctl submit error"
     [ -n "$submit_error" ] && echo "$submit_error"
-    exit 1
+    finish_run 1
 fi
 if [ "$submit_status" -ne 0 ]; then
     echo "warning: launchctl submit returned $submit_status, but the job is active; continuing"
     [ -n "$submit_error" ] && echo "$submit_error"
 fi
 
-# 轮询等待真实应用进程存活(最长 5 秒)。
-# 不能只检查 wrapper PID:它可能仍在等待 `open -W`,即使应用本身已经退出。
-# Poll for the real app process (up to 5 seconds). Checking only the wrapper PID is a
-# false positive because it can remain blocked in `open -W` after the app exits.
-find_dev_app_pid() {
-    /usr/bin/pgrep -f "$dev_app_binary" 2>/dev/null | awk 'NR == 1 { print; exit }'
+# Read the launch identity record this run's process wrote, from this launch's window only.
+#
+# The record is written by the app itself, so it can only describe the process that wrote it.
+# The checks below are deliberately separate rather than one grep: each one excludes a different
+# way of being wrong -- a stale line, another process, another build -- and a check that passes for
+# the wrong reason is worse than no check.
+launch_record_pid=""; launch_record_exe=""; launch_record_version=""; launch_record_bundle=""
+read_launch_record() {
+    local pid="$1"
+    local line
+    # A rotated or truncated log cannot express "after this point", so the window is unusable and
+    # the caller must report the launch as unverified rather than as verified.
+    local size
+    size="$(/usr/bin/stat -f %z "$dev_log_path" 2>/dev/null || echo 0)"
+    # A rotated file is a different inode, and a short one is a truncated window: neither can
+    # express "bytes written after this point", so the window is unusable and the caller reports
+    # the launch as unverified rather than reading whatever history the new file happens to hold.
+    if [ -n "$dev_log_inode" ]; then
+        current_inode="$(/usr/bin/stat -f %i "$dev_log_path" 2>/dev/null || echo "")"
+        [ "$current_inode" = "$dev_log_inode" ] || return 2
+    fi
+    if [ "$size" -lt "$dev_log_offset" ]; then
+        return 2
+    fi
+    [ -r "$dev_log_path" ] || return 2
+    line="$(tail -c +$((dev_log_offset + 1)) "$dev_log_path" 2>/dev/null \
+        | grep -a "^.*\[launch\] pid=${pid} " | tail -1)"
+    [ -n "$line" ] || return 1
+    launch_record_pid="$pid"
+    launch_record_exe="$(printf '%s\n' "$line" | sed -n 's/.* executable=\([^ ]*\) .*/\1/p')"
+    launch_record_version="$(printf '%s\n' "$line" | sed -n 's/.* version=\([^ ]*\) .*/\1/p')"
+    launch_record_bundle="$(printf '%s\n' "$line" | sed -n 's/.* bundle=\([^ ]*\).*/\1/p')"
+    return 0
+}
+
+# Undo the field escaping exactly as src/logger.rs applies it. A hand-written sed pipeline gets the
+# backslash count wrong, which makes a path containing a space stop matching the built binary, so
+# the rules live beside the encoder and the running decoder is a small helper the codec test and
+# the selftest both exercise.
+unescape_field() {
+    printf '%s' "$1" | python3 "$repo_dir/scripts/lib/decode-launch-field.py"
 }
 
 for _ in 1 2 3 4 5; do
     sleep 1
     app_pid="$(find_dev_app_pid)"
     if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
+        owned_pid="$app_pid"
+        # Capture the process start time now. Identity is this value, not the path: a pid can be
+        # reused, and the same path can later run a different build, so "the same pid is alive" and
+        # "the path matches" each prove less than "this same process is still the one asked".
+        app_pid_start="$(ps -p "$app_pid" -o lstart= 2>/dev/null)"
         wrapper_pid="$(launchctl print "$launch_target" 2>/dev/null \
         | awk '$1 == "pid" && $2 == "=" { print $3; exit }')"
-        # 读出本次构建写入的 CFBundleVersion(build-version),便于确认运行的是哪次构建。
-        # Read the CFBundleVersion written by this build so it's clear which build is running.
-        build_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
+        # 本脚本刚构建出的版本,用来和进程自报的版本比对。
+        # The version this run just built, used only to compare against what the process reports.
+        expected_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
             "$dev_app/Contents/Info.plist" 2>/dev/null)"
-        echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
-        echo "build-version: ${build_version:-unknown}"
+        # Give the app a moment to write its launch record; it is emitted during startup.
+        record_status=1
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if read_launch_record "$app_pid"; then
+                record_status=0
+                break
+            elif [ "$?" -eq 2 ]; then
+                record_status=2
+                break
+            fi
+            sleep 0.5
+        done
+        case "$record_status" in
+            0)
+                # Identity, path and version must all agree, and the process must still be alive:
+                # a launch record followed by an immediate exit is not a running build.
+                record_exe_plain="$(unescape_field "$launch_record_exe")"
+                launch_problem=""
+                current_start="$(ps -p "$app_pid" -o lstart= 2>/dev/null)"
+                if ! kill -0 "$app_pid" 2>/dev/null; then
+                    launch_problem="the process exited after its launch record"
+                elif [ -z "$current_start" ] || [ "$current_start" != "$app_pid_start" ]; then
+                    launch_problem="pid $app_pid is no longer the process this run started"
+                elif [ "$record_exe_plain" != "$dev_app_binary" ]; then
+                    launch_problem="the record names $record_exe_plain, not $dev_app_binary"
+                elif [ -z "$expected_version" ]; then
+                    # Without the version this run built there is nothing to compare against, so the
+                    # launch cannot be confirmed -- reported as unverified, never assumed to match.
+                    launch_problem=""
+                    verified=0
+                elif [ "$launch_record_version" != "$expected_version" ]; then
+                    launch_problem="the process reports version $launch_record_version, this build is $expected_version"
+                fi
+                if [ -n "$launch_problem" ]; then
+                    echo "restart FAILED: the running process does not match this build: $launch_problem"
+                    echo "-- newest app log: $dev_log_path"
+                    run_failed=1
+                    break
+                fi
+                if [ "$verified" -eq 1 ]; then
+                    echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
+                    echo "build-version: ${launch_record_version:-unknown} (reported by the running process)"
+                else
+                    echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
+                    echo "build timestamp: unverified (this run could not read the version it built)"
+                    echo "build-version: unknown (the comparison had no expected value)"
+                fi
+                ;;
+            1)
+                # No record in this window. That is "no evidence", not "the app failed to start": the
+                # app may be logging to a path this script does not read (logging.file_path), and the
+                # process being alive is what distinguishes that from a launch that died. A dead
+                # process is a failure; a live one is unverified.
+                if kill -0 "$app_pid" 2>/dev/null; then
+                    verified=0
+                    echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
+                    echo "build timestamp: unverified (no launch record in this log window)"
+                    echo "build-version: unknown (the app may be writing to a configured log path)"
+                else
+                    echo "restart FAILED: pid $app_pid exited before writing a launch record"
+                    echo "-- newest app log: $dev_log_path"
+                    run_failed=1
+                    break
+                fi
+                ;;
+            *)
+                # The log cannot express "after this point" (rotated, truncated, unreadable), so the
+                # launch is unverified -- reported as unverified, never as verified.
+                verified=0
+                echo "restart ok (app pid $app_pid${wrapper_pid:+, wrapper pid $wrapper_pid})"
+                echo "build timestamp: unverified (the app log window is unusable: $dev_log_path)"
+                echo "build-version: unknown (read from the log, which could not be used)"
+                ;;
+        esac
         echo "build-profile: $build_profile"
+        if [ "$check_mode" -eq 1 ]; then
+            # --check owns this instance, so it reports what it actually established. Three outcomes,
+            # decided once: the launch failed, it could not be verified, or it was verified.
+            # The stop is claimed only after cleanup has actually succeeded, so the message can never
+            # describe a state the run did not reach: finish_run prints its own failures and exits.
+            if [ "$run_failed" -ne 0 ]; then
+                finish_run 1
+            fi
+            if [ "$verified" -eq 0 ]; then
+                # Cleanup still happens, but a verification that could not decide is not a pass: an
+                # automated caller must never read "unverified" as "passed".
+                echo "check FAILED: the launch could not be verified, so this run does not report success"
+                finish_run 1
+            fi
+            announce_stop=1
+            finish_run 0
+        fi
+        echo "instance: running, not protected -- the claim was released; the next run may replace it"
         # 把本次透传的 argv 回显出来,便于确认验证开关真的生效了。argv 是调用者自己写下的
         # 内容,回显它不涉及任何环境变量。
         # Echo this launch's forwarded argv so it is obvious the verification switches took effect.
@@ -527,4 +1009,4 @@ echo "-- newest app log:"
 ls -t "$HOME/Library/Logs/oh-my-tab/oh-my-tab.log" \
     "$HOME/Library/Logs/oh-my-tab/oh-my-tab.log."* \
     "$HOME/Library/Logs/oh-my-tab/oh-my-tab-"*.log 2>/dev/null | head -1
-exit 1
+finish_run 1
