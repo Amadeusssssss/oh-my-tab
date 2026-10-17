@@ -2535,6 +2535,13 @@ pub fn effective_glass_saturation() -> f64 {
     numeric_flag_or("glass-saturation", 1.0).clamp(0.0, 4.0)
 }
 
+/// The frosted material's light-mode brightness floor, resolved: the shipped
+/// [`crate::glass::FROST_FLOOR_ALPHA`], or the `--glass-floor` launch override while the value is being
+/// tuned on a dark backdrop. Frost only -- Liquid Glass and `opaque` never read this.
+pub fn effective_glass_floor() -> f64 {
+    numeric_flag_or("glass-floor", crate::glass::FROST_FLOOR_ALPHA).clamp(0.0, 1.0)
+}
+
 /// `NSGlassEffectView`'s private `_variant`, from the `--glass-variant` launch switch only.
 ///
 /// Deliberately not read from the config: the variant is not a user choice (two attempts at labelling

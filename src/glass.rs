@@ -361,6 +361,7 @@ unsafe fn build_backdrop(
     let size = frame.size;
     let material = PanelMaterial::effective();
     let compensation_alpha = options.compensation_alpha;
+    let floor = crate::config::effective_glass_floor();
     match material {
         PanelMaterial::LiquidGlass if AnyClass::get(c"NSGlassEffectView").is_some() => {
             let glass_class = AnyClass::get(c"NSGlassEffectView").unwrap();
@@ -571,6 +572,7 @@ unsafe fn build_backdrop(
                 let _: () = msg_send![effect, setMaskImage: mask];
                 release_obj(mask);
             }
+            install_floor_veil(effect, size, floor);
             release_obj(effect);
             InstalledBackdrop {
                 material: PanelMaterial::Frost,
@@ -672,6 +674,35 @@ const BACKDROP_BLUR_RADIUS: f64 = 12.0;
 /// purple), and multiplying the strength by 255 twice (the alpha collapsed to 20%).
 const GLASS_TINT_LIGHT: &str = "eeeeee66";
 const GLASS_TINT_DARK: &str = "1c1c1e99";
+
+/// The **frosted** material's light-mode brightness floor: the alpha of a flat white veil laid over the
+/// material and under the panel's content.
+///
+/// Frost blurs the desktop through itself (`BehindWindow`), so its surface follows the backdrop: over a
+/// dark desktop it lands in the mid-luminance band, where a selection rim drawn in `accent` measures ~1:1.
+/// That is a property of where the accent sits: `#0A84FF`'s WCAG relative luminance is 0.238
+/// (`0.2126R + 0.7152G + 0.0722B` over the sRGB transfer curve), which is *inside* the band rather than
+/// above or below it. The band itself is the code's own record, not a new measurement -- see
+/// `FROST_MATERIAL_LIGHT` above, where the pinned `light` material measured the footer captions at 2.48:1
+/// on a dark backdrop. Lifting the whole surface is the one fix that leaves the rim's colour alone.
+///
+/// The cost is one-for-one and stated rather than hidden: the desktop keeps `(1 - alpha)` of its visible
+/// contrast, so 0.4 keeps 60% of it, i.e. cuts it by 40%. `config::effective_glass_floor` resolves this
+/// value with the `--glass-floor` launch override.
+///
+/// The value was chosen by eye while the override was being tuned on a dark backdrop: the lift is larger
+/// where the backdrop is darker, and 0.4 is the point where the panel stopped reading as dim. The checked-in
+/// instrument, `scripts/e2e/panel-contrast.sh`, has not been run against it; that gap is recorded in
+/// `docs/review-backlog.md`.
+///
+/// Scope: **frost only**. Liquid Glass carries its own measured per-mode tints (above) and `opaque` has no
+/// backdrop to composite, so neither is affected.
+pub(crate) const FROST_FLOOR_ALPHA: f64 = 0.4;
+
+/// Tag for the floor veil: the one decoration a material swap must leave behind, and the one the live
+/// theme path has to add or drop. Distinct from the overlay's card tags (0xE7F1-0xE7F7), which live inside
+/// the panel content that shares this view tree.
+const FLOOR_VEIL_TAG: isize = 0xF10A;
 
 /// The tint for the *resolved* mode.
 pub(crate) fn resolved_glass_tint_hex() -> u32 {
@@ -1281,6 +1312,19 @@ unsafe fn grow_window_for_insets(window: *mut AnyObject, insets: crate::theme::P
     let _: () = msg_send![window, setFrame: frame, display: false];
 }
 
+/// Whether a retired hierarchy's child is panel content -- which moves to the new hierarchy -- rather than
+/// one of the retired material's own decorations, which stay behind with it.
+///
+/// Three decorations are excluded. The passive glass fill: leaving it behind keeps frost/opaque untinted
+/// and stops a fresh fill from stacking on every material round trip. The panel outline: its parent is the
+/// material root and for `opaque` that root *is* `content_parent`, so carrying it over would draw two
+/// strokes, the stale one in the previous theme's colour. The light-mode floor veil: it belongs to the frost
+/// that installed it, and carrying it over would both violate the veil's frost-only scope and stack a
+/// second one on frost on every round trip.
+fn carries_over(child: usize, retired: [Option<usize>; 3]) -> bool {
+    !retired.into_iter().flatten().any(|view| view == child)
+}
+
 /// Replace an installed backdrop because the material changed. The panel's content views
 /// move to the new hierarchy while the old one is still alive; replacing the window's
 /// content view afterwards retires the old root with no dangling children.
@@ -1292,19 +1336,19 @@ pub(crate) unsafe fn swap_backdrop(
     options: BackdropOptions,
 ) -> InstalledBackdrop {
     let mut new = build_backdrop(frame, corner_radius, options);
+    // The veil is found by tag rather than by reading each child's tag: the panel's own content views are
+    // plain `NSView`s, which do not answer `tag`.
+    let retired_veil: *mut AnyObject = msg_send![old.content_parent, viewWithTag: FLOOR_VEIL_TAG];
+    let retired = [
+        old.compensation_view.map(|view| view.0 as usize),
+        old.outline_view.map(|view| view.0 as usize),
+        (!retired_veil.is_null()).then_some(retired_veil as usize),
+    ];
     let subviews: *mut AnyObject = msg_send![old.content_parent, subviews];
     let count: usize = msg_send![subviews, count];
     for index in 0..count {
         let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        // The retired hierarchy's darkening fill is not panel content: leaving it behind keeps
-        // frost/opaque untinted and stops a fresh fill from stacking on every material round trip.
-        if old.compensation_view.is_some_and(|fill| fill.0 == child) {
-            continue;
-        }
-        // Neither is the retired outline. Its parent is the material root, and for `opaque` that root *is*
-        // `content_parent`, so without this the old stroke would be carried into the new hierarchy and the
-        // panel would draw two -- the stale one still in the previous theme's colour.
-        if old.outline_view.is_some_and(|outline| outline.0 == child) {
+        if !carries_over(child as usize, retired) {
             continue;
         }
         let _: () = msg_send![new.content_parent, addSubview: child];
@@ -1399,6 +1443,9 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
     }
     if let Some(effect) = backdrop.effect_view {
         let _: () = msg_send![effect.0, setMaterial: frost_material()];
+        // The floor veil follows the resolved theme, and this is the only path a live appearance change
+        // takes, so it is where the veil is added or dropped.
+        sync_floor_veil(effect.0);
     }
     if let Some(plain) = backdrop.opaque_view {
         let _: () = msg_send![plain.0, setWantsLayer: true];
@@ -1440,6 +1487,7 @@ pub(crate) struct MaterialTuning {
     pub(crate) blur_radius: f64,
     pub(crate) saturation: f64,
     pub(crate) variant: i64,
+    pub(crate) floor: f64,
 }
 
 impl MaterialTuning {
@@ -1450,6 +1498,7 @@ impl MaterialTuning {
             blur_radius: crate::config::effective_glass_blur_radius(),
             saturation: crate::config::effective_glass_saturation(),
             variant: crate::config::effective_glass_variant(),
+            floor: crate::config::effective_glass_floor(),
         }
     }
 }
@@ -1586,10 +1635,101 @@ unsafe fn set_compensation_tint(layer: *mut AnyObject, tint_hex: u32, alpha: u32
     layer_set_background(layer, hex_to_cg_color(compensation_hex));
 }
 
+/// The floor veil's colour: opaque white's RGB with the quantized alpha in the low byte.
+fn floor_veil_hex(alpha: f64) -> u32 {
+    0xFFFF_FF00 | ((alpha.clamp(0.0, 1.0) * 255.0).round() as u32)
+}
+
+/// Lay the frost's light-mode brightness floor over the material, under the panel's content. Called from
+/// the frost branch only: Liquid Glass and `opaque` must not be touched (see `FROST_FLOOR_ALPHA`). Dark
+/// mode is skipped by construction -- its material already sits below the accent, so the veil would only
+/// wash the panel out.
+///
+/// An `NSImageView`, not a plain `NSView`: `setTag:`/`viewWithTag:` are `NSControl`'s, and both the material
+/// swap and the live theme path have to find this one decoration again. `insertSubview:atIndex:0` keeps it
+/// under the panel's content, which the build path adds afterwards and the live path has already added.
+unsafe fn install_floor_veil(parent: *mut AnyObject, size: NSSize, alpha: f64) {
+    if alpha <= 0.0 || crate::theme::resolved_is_dark() || parent.is_null() {
+        return;
+    }
+    let veil: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let veil: *mut AnyObject =
+        msg_send![veil, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)];
+    let _: () = msg_send![veil, setTag: FLOOR_VEIL_TAG];
+    let _: () = msg_send![veil, setWantsLayer: true];
+    let veil_layer: *mut AnyObject = msg_send![veil, layer];
+    if !veil_layer.is_null() {
+        layer_set_background(veil_layer, hex_to_cg_color(floor_veil_hex(alpha)));
+    }
+    let _: () = msg_send![veil, setAutoresizingMask: 18u64];
+    // `NSWindowBelow` (raw -1) with a nil sibling puts the veil under everything the parent already holds --
+    // which is what the live path needs, since the panel's content is in place by then. `insertSubview:atIndex:`
+    // is not an AppKit method despite reading like one: `-[NSView insertSubview:atIndex:]` does not exist and
+    // the send panics.
+    let _: () = msg_send![
+        parent,
+        addSubview: veil,
+        positioned: -1isize,
+        relativeTo: std::ptr::null_mut::<AnyObject>()
+    ];
+    release_obj(veil); // the parent owns it
+    crate::log_debug!("[glass] floor veil installed on the frost: alpha={alpha:.2}");
+}
+
+/// Add or drop the floor veil so it matches the *resolved* theme on a hierarchy that is already up.
+///
+/// The veil's presence is a theme property, not only a build-time one: the panel window is reused across
+/// appearances, so a light -> dark switch has to take it away and a dark -> light switch has to put it back
+/// (under the content, which is installed by then).
+/// How many floor veils the given content parent holds. The panel smoke reads this to assert the veil's
+/// lifecycle -- one in light mode, none in dark, and never two after a theme flip or a material round trip
+/// (both were real defects). The veil's colour is pinned separately, by the pure `floor_veil_hex` test.
+pub(crate) unsafe fn floor_veil_count(parent: *mut AnyObject) -> usize {
+    // Every tagged child is counted, not the single object `viewWithTag:` returns: two veils sharing a tag
+    // would otherwise measure as one, and "exactly one, never stacked" is the promise this backs.
+    //
+    // `tag` is `NSControl`'s, so it is asked for before it is sent -- the panel's own content views are
+    // plain `NSView`s and would trap on it.
+    let tag_selector = objc2::sel!(tag);
+    let subviews: *mut AnyObject = msg_send![parent, subviews];
+    let count: usize = msg_send![subviews, count];
+    (0..count)
+        .filter(|index| {
+            let child: *mut AnyObject = msg_send![subviews, objectAtIndex: *index as isize];
+            let responds: bool = msg_send![child, respondsToSelector: tag_selector];
+            if !responds {
+                return false;
+            }
+            let tag: isize = msg_send![child, tag];
+            tag == FLOOR_VEIL_TAG
+        })
+        .count()
+}
+
+unsafe fn sync_floor_veil(parent: *mut AnyObject) {
+    if parent.is_null() {
+        return;
+    }
+    let existing: *mut AnyObject = msg_send![parent, viewWithTag: FLOOR_VEIL_TAG];
+    let alpha = crate::config::effective_glass_floor();
+    if !crate::theme::resolved_is_dark() && alpha > 0.0 {
+        if existing.is_null() {
+            let frame: NSRect = msg_send![parent, frame];
+            install_floor_veil(parent, frame.size, alpha);
+        }
+    } else if !existing.is_null() {
+        let _: () = msg_send![existing, removeFromSuperview];
+        crate::log_debug!(
+            "[glass] floor veil removed: the resolved theme is dark, or the floor is off"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        glass_style_index, parse_dev_outline, resolved_glass_tint_hex, DevOutline, PanelMaterial,
+        carries_over, floor_veil_hex, glass_style_index, parse_dev_outline,
+        resolved_glass_tint_hex, DevOutline, PanelMaterial,
     };
     use std::time::Duration;
 
@@ -1750,5 +1890,30 @@ mod tests {
             };
             assert_eq!(degraded, reinstall);
         }
+    }
+
+    /// The veil's alpha is quantized into the colour's low byte and clamped, so a `--glass-floor` outside
+    /// 0..1 cannot produce a colour that is not a white veil at some alpha.
+    #[test]
+    fn floor_veil_alpha_is_clamped_and_quantized() {
+        assert_eq!(floor_veil_hex(0.0), 0xFFFF_FF00);
+        assert_eq!(floor_veil_hex(0.4), 0xFFFF_FF66);
+        assert_eq!(floor_veil_hex(1.0), 0xFFFF_FFFF);
+        assert_eq!(floor_veil_hex(-3.0), 0xFFFF_FF00);
+        assert_eq!(floor_veil_hex(9.0), 0xFFFF_FFFF);
+    }
+
+    /// Only panel content travels to a new material hierarchy. The three retired decorations -- the passive
+    /// glass fill, the panel outline and the light-mode floor veil -- each stay behind, because each was
+    /// installed by the hierarchy being retired. The veil's omission here was a real defect: a material round
+    /// trip carried it to liquid glass and `opaque` and stacked a second one on frost.
+    #[test]
+    fn only_panel_content_travels_to_a_new_material_hierarchy() {
+        let retired = [Some(11usize), Some(22), Some(33)];
+        assert!(carries_over(99, retired), "content must travel");
+        for decoration in [11usize, 22, 33] {
+            assert!(!carries_over(decoration, retired), "{decoration} must stay");
+        }
+        assert!(carries_over(99, [None, None, None]));
     }
 }

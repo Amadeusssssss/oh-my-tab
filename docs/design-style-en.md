@@ -196,6 +196,15 @@ The floating panels (switcher, clipboard, keystroke display) offer three materia
 Material only ever changes which surface sits behind the panel content — text colors, spacing,
 radius, and the palette remain exactly as specified here.
 
+**The frost's light-mode brightness floor.** Frost composites the desktop through itself, so its own
+surface follows the backdrop: over a dark desktop it lands in the mid-luminance band, where `accent`
+(`#0A84FF`, WCAG relative luminance 0.238) sits — a selection rim drawn on such a surface measures ~1:1
+against it. So in light mode a flat white veil (`glass::FROST_FLOOR_ALPHA`, currently `0.4`, tunable with
+`--glass-floor`) is laid over the frost and under the panel's content. Its cost is one-for-one and stated
+rather than hidden: the desktop keeps `(1 - alpha)` of its visible contrast, so `0.4` keeps 60% of it. The scope
+is **frost only** — Liquid Glass carries its own measured per-mode tints instead, and `opaque` has no
+backdrop to composite; dark mode is untouched, because its material already sits below the accent.
+
 The panel's outline is the same on all three materials: a 1pt inside stroke in `card_border` over the
 panel's own rounded rect. It is drawn as a decoration above the material rather than as a layer border
 on the material itself, because the three material views differ (frost carries a rounded mask image,

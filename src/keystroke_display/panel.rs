@@ -1293,6 +1293,9 @@ pub(super) fn smoke_runner() -> bool {
                 // The frost mask belongs to the system frost material; a launch switch that forces the
                 // development-only blended surface has no material view to mask.
                 && (dev_only_material_forced || backdrop_frost_mask_valid())
+                // The floor veil belongs to frost in light mode: one there, none in dark mode, and never
+                // more than one. This smoke already flips the theme below, so both directions are read.
+                && (dev_only_material_forced || backdrop_floor_veil_valid())
                 // The palette surface is painted by the shipped materials; the development-only blur
                 // surface paints nothing (its own check is the backdrop layer in `backdrop_structure_valid`).
                 && (dev_only_material_forced || backdrop_surface_matches_palette())
@@ -1419,6 +1422,10 @@ pub(super) fn smoke_runner() -> bool {
             None,
         );
         changed &= unsafe { backdrop_surface_matches_palette() };
+        // Every repaint above is also where the floor veil must be added or dropped: the theme each step
+        // applies is the one the veil's presence follows, so this reads both directions, in the light and
+        // in the dark.
+        changed &= unsafe { backdrop_floor_veil_valid() };
         // The system-appearance entry point (the "auto" theme path) must repaint it too: that
         // notification does not go through the config-change coordinator. Each step starts from the
         // opposite theme, so a missing repaint leaves the surface mismatched -- a step that set the
@@ -1430,6 +1437,7 @@ pub(super) fn smoke_runner() -> bool {
             }
             crate::apply_system_appearance_refresh();
             changed &= unsafe { backdrop_surface_matches_palette() };
+            changed &= unsafe { backdrop_floor_veil_valid() };
         }
         {
             let mut config = crate::config::CONFIG.write().unwrap();
@@ -2989,6 +2997,23 @@ unsafe fn backdrop_frost_mask_valid() -> bool {
     }
     let mask: *mut AnyObject = msg_send![effect.0, maskImage];
     !mask.is_null()
+}
+
+/// Whether the installed frost carries the light-mode floor veil exactly when it should.
+///
+/// The veil is added and dropped by the theme path and excluded from a material swap, and each of those was
+/// a real defect: a stale veil in dark mode, or two of them after a theme flip or a round trip, is what this
+/// fails on. Its colour is pinned by the pure `glass::floor_veil_hex` test instead.
+unsafe fn backdrop_floor_veil_valid() -> bool {
+    let Some(backdrop) = installed_backdrop() else {
+        return false;
+    };
+    let Some(effect) = backdrop.effect_view else {
+        // No effect view means this installation is not frost; the veil is a frost-only decoration.
+        return !matches!(backdrop.material, crate::glass::PanelMaterial::Frost);
+    };
+    let wanted = !crate::theme::resolved_is_dark() && crate::config::effective_glass_floor() > 0.0;
+    crate::glass::floor_veil_count(effect.0) == usize::from(wanted)
 }
 
 /// Whether the installed effect view carries the pinned frost material for the *resolved* mode.
