@@ -1298,6 +1298,94 @@ unsafe fn settings_sidebar_has_redundant_heading(view: *mut AnyObject) -> bool {
     })
 }
 
+/// Whether the General page's visible card titles start with Startup, then Menu bar icon, then
+/// Appearance -- the leading order the page promises.
+///
+/// Matched on the rendered header labels, in the document's own coordinate space (AppKit's y grows
+/// upward, so "first" is the largest y), which is what the user actually sees. A card move that
+/// skips this order is invisible to every other smoke check here.
+unsafe fn general_page_leads_with_startup_and_icon_cards() -> bool {
+    /// Walk a view tree, recording each visible label with its frame in the *page's* coordinate
+    /// space. The page is the root passed in and every card label is a descendant, so converting
+    /// each label's bounds to that root gives one comparable space for all of them.
+    fn collect(view: *mut AnyObject, root: *mut AnyObject, out: &mut Vec<(f64, String)>) {
+        unsafe {
+            if view.is_null() {
+                return;
+            }
+            let is_text_field: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+            if is_text_field {
+                let hidden: bool = msg_send![view, isHidden];
+                let text: *mut AnyObject = msg_send![view, stringValue];
+                if !hidden {
+                    // The card labels are laid out in the page document's own coordinate space, and
+                    // the settings view tree is not flipped relative to it, so the raw frame origin
+                    // is already the position to compare (reading it through convertRect:toView:
+                    // returned the flipped space and inverted the order). `root` is kept for the
+                    // recursion signature only.
+                    let _ = root;
+                    let frame: NSRect = msg_send![view, frame];
+                    out.push((frame.origin.y, crate::ffi::nsstring_to_rust(text)));
+                }
+            }
+            let children: *mut AnyObject = msg_send![view, subviews];
+            if children.is_null() {
+                return;
+            }
+            let count: usize = msg_send![children, count];
+            for index in 0..count {
+                let child: *mut AnyObject = msg_send![children, objectAtIndex: index as isize];
+                collect(child, root, out);
+            }
+        }
+    }
+    // The card headers are rendered by the shared card component as plain labels; matching on the
+    // text keeps this independent of the component's internals. Each key is unique to one card on
+    // this page, so the label identifies the card.
+    let general =
+        with_settings_ui(|ui| ui.as_ref().map(|ui| ui.page_view(SettingsPageId::General)));
+    let Some(general) = general else {
+        return false;
+    };
+    let mut labels = Vec::new();
+    collect(general, general, &mut labels);
+    // Check the whole leading sequence, not just the relative order of a few labels: a card moved
+    // above Startup, or inserted between the first two, would satisfy a pairwise comparison while
+    // breaking the promise. Only card headers are collected, so the page title and the rows inside
+    // each card cannot disturb the sequence. AppKit's y grows upward, so the largest y is first.
+    let mut headers: Vec<(f64, String)> = [
+        "settings.header_startup",
+        "settings.header_menu_bar_icon",
+        "settings.header_appearance",
+        "settings.header_language",
+        "settings.header_logging",
+        "settings.header_backup",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        let wanted = t(key);
+        labels
+            .iter()
+            .find(|(_, text)| *text == wanted)
+            .map(|(y, _)| (*y, wanted))
+    })
+    .collect();
+    if headers.len() < 4 {
+        log_info!(
+            "[smoke-settings-layout] only {} card headers found; cannot check the leading order",
+            headers.len()
+        );
+        return false;
+    }
+    headers.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let order: Vec<&str> = headers.iter().map(|(_, text)| text.as_str()).collect();
+    // The page's first four cards, top to bottom, must be exactly: startup, menu-bar icon,
+    // appearance, language. This catches both a swap and an insertion before or between them.
+    order[0] == t("settings.header_startup")
+        && order[1] == t("settings.header_menu_bar_icon")
+        && order[2] == t("settings.header_appearance")
+        && order[3] == t("settings.header_language")
+}
 /// Whether the expanded update card and its host sit inside the page document with the page's bottom
 /// padding, and the document covers the card's top edge (i.e. the whole card can be scrolled to).
 unsafe fn update_card_inside_document() -> bool {
@@ -1631,6 +1719,25 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             }
         }
         log_info!("[smoke-settings-layout] backup captions visible");
+        // Hiding the menu-bar icon removes the app's only always-present entry point, so the row's
+        // description is what tells the user Settings can still be reached. It sits on a `described`
+        // row, whose subtitle this app never renders -- exactly the shape that silently lost the
+        // clipboard warning above -- so the promise has to be asserted on the real view tree.
+        if !page_shows_visible_caption(pages[0], &t("settings.desc_hide_menu_bar_icon")) {
+            log_info!("[smoke-settings-layout] the hide-menu-bar-icon explanation is not visible");
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] hide-menu-bar-icon explanation visible");
+        // Startup is the General page's first card and the menu-bar icon its own card directly
+        // below: the ordering is what the user asked for, and a card move is invisible to every
+        // other check here.
+        if !general_page_leads_with_startup_and_icon_cards() {
+            log_info!("[smoke-settings-layout] the General page does not lead with the startup then icon cards");
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] General page leads with the startup and icon cards");
         // The hover tooltip is the outlet for a caption that cannot fit its row (design-style §9).
         // Assert it on the real view tree: the bubble must render the longest shipped caption in full,
         // not truncate it a second time -- the fixed 288pt bubble with its 220pt text budget did
@@ -3199,6 +3306,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             keystroke_display_max_extent_value: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
+            hide_menu_bar_icon: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
             scroll_mode: std::ptr::null_mut(),

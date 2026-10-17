@@ -16,6 +16,7 @@ use crate::i18n::t;
 use crate::icon_cache::clear_icon_cache;
 use crate::overlay::extract_uncached_icons;
 // cross-module shared state (owned by main.rs)
+use crate::log_debug;
 use crate::log_info;
 use crate::with_tab_state;
 
@@ -48,6 +49,11 @@ pub(crate) struct MenuUi {
     /// The clipboard pin item, tracked separately from the fixed-title items because its CHECK
     /// state changes at runtime (the pin), not only its title.
     pub(crate) clipboard_pin: Option<*mut AnyObject>,
+    /// The status item itself, so "hide menu bar icon" can toggle it after setup. Kept here (and not
+    /// only in `setup_status_bar`'s scope) because it outlives that function. The item is created
+    /// once and only its visibility changes, so every pointer registered above stays valid for the
+    /// process lifetime and no menu object is ever detached from a live item.
+    pub(crate) status_item: Option<*mut AnyObject>,
 }
 
 thread_local! {
@@ -57,12 +63,44 @@ thread_local! {
         services: None,
         fixed: None,
         clipboard_pin: None,
+        status_item: None,
     }) };
 }
 
 pub(crate) fn with_menu_ui<R>(f: impl FnOnce(&mut MenuUi) -> R) -> R {
     crate::debug_assert_main_thread();
     MENU_UI.with(|ui| f(&mut ui.borrow_mut()))
+}
+
+/// Hand the freshly created status item to the menu UI so it can be hidden and shown later.
+///
+/// `setup_status_bar` runs once at launch and keeps building the item where it always did; this only
+/// records the handle. `set_status_item_visible` then toggles visibility on that same live item, so
+/// the menu, its items and every target registered in `MenuUi` stay attached to it.
+pub(crate) fn register_status_item(item: *mut AnyObject) {
+    with_menu_ui(|ui| ui.status_item = Some(item));
+}
+
+/// Show or hide the menu-bar icon to match `startup.hide_menu_bar_icon`.
+///
+/// `NSStatusItem.isVisible` (macOS 10.12+) is the supported switch and the one AppKit itself uses
+/// for the "removable item" path: it hides the slot without tearing the item down, so menu-title
+/// refreshes, the pin's check state and the main-menu key equivalents keep working while the icon is
+/// hidden. Removing and recreating the item would instead strand every pointer `MenuUi` holds.
+/// Safe to call repeatedly and before `register_status_item` (a no-op then): the launch path applies
+/// the saved setting after setup, and a live config change applies it again.
+pub(crate) fn set_status_item_visible(visible: bool) {
+    if !visible {
+        log_info!("[menu] hiding the menu-bar icon (startup.hide_menu_bar_icon)");
+    }
+    let item = with_menu_ui(|ui| ui.status_item);
+    let Some(item) = item else {
+        log_debug!("[menu] no status item to update yet");
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![item, setVisible: visible];
+    }
 }
 
 const MENU_TITLE_MIN_WIDTH: f64 = 72.0;

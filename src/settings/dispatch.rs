@@ -16,6 +16,7 @@ pub(super) enum ControlField {
     Locale,
     LogLevel,
     LaunchAtLogin,
+    HideMenuBarIcon,
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
@@ -82,6 +83,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.locale, ControlField::Locale))
             .or_else(|| m(u.log_level, ControlField::LogLevel))
             .or_else(|| m(u.launch_at_login, ControlField::LaunchAtLogin))
+            .or_else(|| m(u.hide_menu_bar_icon, ControlField::HideMenuBarIcon))
             .or_else(|| m(u.windows_enabled, ControlField::WindowsEnabled))
             .or_else(|| m(u.show_minimized, ControlField::ShowMinimized))
             .or_else(|| {
@@ -534,6 +536,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::LaunchAtLogin => {
                     let state: isize = msg_send![u.launch_at_login, state];
                     cfg.startup.launch_at_login = state == 1;
+                }
+                ControlField::HideMenuBarIcon => {
+                    let state: isize = msg_send![u.hide_menu_bar_icon, state];
+                    cfg.startup.hide_menu_bar_icon = state == 1;
                 }
                 ControlField::WindowsEnabled => {
                     let state: isize = msg_send![u.windows_enabled, state];

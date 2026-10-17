@@ -138,6 +138,71 @@ pub(crate) fn open_new_finder_window() {
     }
 }
 
+/// Hide every regular application, revealing the desktop. Our own app is excluded: hiding it
+/// would strand the settings window and this app's own panels.
+///
+/// This is the all-apps form of Command+H, not "show desktop" (a Mission Control reveal) and not
+/// "minimize everything". Show all windows brings the apps back, including any the user had hidden
+/// before: the state is deliberately not tracked per app, so one switch mirrors the key.
+pub(crate) fn hide_all_apps() {
+    set_all_apps_visible(false);
+}
+
+/// Unhide every regular application.
+pub(crate) fn show_all_apps() {
+    set_all_apps_visible(true);
+}
+
+/// Hide or unhide every running regular (Dock-visible) application.
+///
+/// `NSRunningApplication` is the receiver that reaches other processes; `NSApplication` has no
+/// per-app hide that does. Both `hide` and `unhide` take no argument and return BOOL, so a partial
+/// failure is possible: it is logged rather than treated as fatal, because one unresponsive app must
+/// not stop the rest, and the two selectors are sent through separate typed `msg_send!` calls
+/// (a dynamic selector would leave objc2 without the return encoding).
+pub(crate) fn set_all_apps_visible(visible: bool) {
+    let own_pid = std::process::id() as i32;
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let apps: *mut AnyObject = msg_send![workspace, runningApplications];
+        let count: usize = msg_send![apps, count];
+        let mut changed = 0usize;
+        let mut failed = 0usize;
+        for i in 0..count {
+            let app: *mut AnyObject = msg_send![apps, objectAtIndex: i as isize];
+            if app.is_null() {
+                continue;
+            }
+            // NSApplicationActivationPolicyRegular = 0; background and helper agents have no
+            // windows to hide, and hiding one can break its host.
+            let policy: isize = msg_send![app, activationPolicy];
+            if policy != 0 {
+                continue;
+            }
+            let pid: i32 = msg_send![app, processIdentifier];
+            if pid <= 0 || pid == own_pid {
+                continue;
+            }
+            let ok: bool = if visible {
+                msg_send![app, unhide]
+            } else {
+                msg_send![app, hide]
+            };
+            if ok {
+                changed += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        log_debug!(
+            "[quick] {} all apps: {} changed, {} failed",
+            if visible { "show" } else { "hide" },
+            changed,
+            failed
+        );
+    }
+}
+
 /// Find Finder in the running applications (returns an NSRunningApplication, a +0 reference we do
 /// not own).
 unsafe fn find_finder_app() -> *mut AnyObject {

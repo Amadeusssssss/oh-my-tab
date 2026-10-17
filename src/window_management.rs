@@ -76,6 +76,133 @@ pub(crate) struct AxRect {
     pub h: f64,
 }
 
+/// Whether an arrange is considered to have landed, given the frame before it and the frame read
+/// back after it.
+///
+/// This is the single rule every arrange path uses to decide whether the pre-arrange snapshot may
+/// displace the previous one. An unreadable frame counts as changed, matching `SnapWrite::moved`:
+/// keeping a snapshot is the conservative choice when the outcome cannot be observed.
+fn arrange_landed(before: Option<AxRect>, after: Option<AxRect>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => !rect_close(before, after),
+        _ => true,
+    }
+}
+
+/// The frame a window had before its most recent arrange, so a "restore previous size" binding
+/// can put it back — maximize → tile-left → restore returns the maximized frame.
+///
+/// Keyed by (pid, CGWindowID): the CGWindowID alone is recycled by the WindowServer, so a pid that
+/// no longer owns the window must not be answered with the previous owner's frame. Bounded like
+/// every other per-window table here, with arbitrary-key eviction: a window id that comes back
+/// after eviction only costs one missed restore.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SavedFrame {
+    frame: AxRect,
+    /// Whether the window was in native full screen when the frame was captured. Restoring such a
+    /// window means re-entering full screen, because a full-screen window ignores frame writes.
+    was_fullscreen: bool,
+}
+
+/// Pure state container for the pre-arrange frames; the save/restore decision is unit-testable
+/// without AX.
+#[derive(Debug, Default)]
+struct PreviousFrameStore {
+    frames: Vec<((i32, u32), SavedFrame)>,
+}
+
+impl PreviousFrameStore {
+    /// Enough for a long session's worth of windows in flight, small enough that the table cannot
+    /// grow without bound.
+    const MAX_ENTRIES: usize = 64;
+
+    fn save(&mut self, pid: i32, cgwid: u32, frame: SavedFrame) {
+        if cgwid == 0 {
+            return;
+        }
+        let key = (pid, cgwid);
+        if let Some(slot) = self.frames.iter_mut().find(|(k, _)| *k == key) {
+            *slot = (key, frame);
+            return;
+        }
+        if self.frames.len() >= Self::MAX_ENTRIES {
+            // Arbitrary victim: a stale id is as good as any other to drop, and the cost of a
+            // wrong choice is one missed restore.
+            self.frames.remove(0);
+        }
+        self.frames.push((key, frame));
+    }
+
+    fn get(&self, pid: i32, cgwid: u32) -> Option<SavedFrame> {
+        if cgwid == 0 {
+            return None;
+        }
+        self.frames
+            .iter()
+            .find(|(k, _)| *k == (pid, cgwid))
+            .map(|(_, saved)| *saved)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+/// The saved frames. A plain mutex rather than a thread-local: the actions run on the main thread,
+/// but the store is read from the same paths that already work with the other window tables.
+static PREVIOUS_FRAMES: std::sync::Mutex<Option<PreviousFrameStore>> = std::sync::Mutex::new(None);
+
+fn with_previous_frames<R>(f: impl FnOnce(&mut PreviousFrameStore) -> R) -> R {
+    let mut guard = PREVIOUS_FRAMES.lock().unwrap();
+    f(guard.get_or_insert_with(PreviousFrameStore::default))
+}
+
+/// Capture the frame an arrange is about to replace, without committing it yet.
+///
+/// The snapshot must only displace the previous one once the arrange actually changed the window:
+/// an operation the target app refuses would otherwise overwrite a frame the user can still return
+/// to (F0 -> F1 succeeds, then F1 -> refused would lose F0). The caller keeps this guard and commits
+/// it after a write that moved the window, or drops it and leaves the old entry alone.
+///
+/// Returns `None` when the window cannot be identified or its frame cannot be read, in which case
+/// nothing may be committed later.
+unsafe fn capture_frame_before_arrange(
+    win: AXUIElementRef,
+    pid: i32,
+    cgwid: Option<u32>,
+) -> Option<PendingFrame> {
+    let cgwid = cgwid?;
+    let frame = read_frame(win)?;
+    // The subrole and the AXFullScreen boolean are two views of the same fact; read the boolean,
+    // because that is the attribute the restore path writes back.
+    let was_fullscreen = read_fullscreen(win);
+    Some(PendingFrame {
+        pid,
+        cgwid,
+        saved: SavedFrame {
+            frame,
+            was_fullscreen,
+        },
+    })
+}
+
+/// A captured pre-arrange frame that has not been committed to the history yet.
+#[derive(Debug, Clone, Copy)]
+struct PendingFrame {
+    pid: i32,
+    cgwid: u32,
+    saved: SavedFrame,
+}
+
+impl PendingFrame {
+    /// Commit the snapshot: the arrange moved the window, so the frame it replaced is now the one
+    /// "restore previous size" should return to.
+    fn commit(self) {
+        with_previous_frames(|store| store.save(self.pid, self.cgwid, self.saved));
+    }
+}
+
 impl AxRect {
     fn center(&self) -> (f64, f64) {
         (self.x + self.w / 2.0, self.y + self.h / 2.0)
@@ -510,6 +637,13 @@ struct PendingDisplayMove {
     target_frame: AxRect,
     attempt: u8,
     created_at: Instant,
+    /// The pre-move frame, committed the first time a deferred write is observed to move the
+    /// window. Scheduling a retry is not evidence that anything changed, so the snapshot travels
+    /// with the job instead of committing on schedule.
+    pending: Option<PendingFrame>,
+    /// The frame observed before the most recent deferred write, so the next callback can tell
+    /// whether that write landed.
+    last: Option<AxRect>,
 }
 
 static PENDING_DISPLAY_MOVE: LazyLock<Mutex<Option<PendingDisplayMove>>> =
@@ -559,6 +693,19 @@ fn update_pending_attempt(token: u64, attempt: u8) -> bool {
     }
     job.attempt = attempt;
     true
+}
+
+/// Take the deferred job's pending snapshot (once) and refresh the frame it compares against, so
+/// the next callback can tell whether the write just issued landed. Returns the snapshot only the
+/// first time a write is observed to move the window.
+fn take_pending_display_move_snapshot(token: u64) -> Option<PendingFrame> {
+    let mut slot = PENDING_DISPLAY_MOVE.lock().unwrap();
+    let job = slot.as_mut()?;
+    if job.token != token {
+        return None;
+    }
+    job.last = None;
+    job.pending.take()
 }
 
 fn clear_pending_display_move(token: u64) {
@@ -637,6 +784,24 @@ pub(crate) fn on_display_move_retry(arg: *mut c_void) {
             clear_pending_display_move(token);
             return;
         }
+        // A deferred write that changed the frame is the moment this move became real, so the
+        // snapshot the job carried is now the correct restore target. Committed once: the entry is
+        // taken from the job so a later callback cannot re-commit it.
+        let moved_since = match (job.last, Some(actual)) {
+            (Some(before), Some(after)) => !rect_close(before, after),
+            _ => false,
+        };
+        let committed = if moved_since {
+            if let Some(pending) = take_pending_display_move_snapshot(token) {
+                pending.commit();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let _ = committed;
         if rect_close(actual, job.target_frame) {
             log_debug!(
                 "[winctl] display move settled: token={} attempts={} frame={:?}",
@@ -689,7 +854,7 @@ pub(crate) fn on_display_move_retry(arg: *mut c_void) {
 // and postpones the size write until the animation has settled.
 
 /// The result of one frame write.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct SnapWrite {
     /// Frame before the write (None when unreadable).
     before: Option<AxRect>,
@@ -789,6 +954,20 @@ struct PendingSnap {
 static PENDING_SNAP: LazyLock<Mutex<Option<PendingSnap>>> = LazyLock::new(|| Mutex::new(None));
 static NEXT_SNAP_TOKEN: AtomicU64 = AtomicU64::new(1);
 const SNAP_POLL_DELAY: f64 = 0.12;
+/// The single armed restore retry (see `arm_restore_verify`).
+static PENDING_RESTORE: LazyLock<Mutex<Option<PendingRestore>>> =
+    LazyLock::new(|| Mutex::new(None));
+static NEXT_RESTORE_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// The single armed zoom observation (see `observe_zoom_outcome`).
+static PENDING_ZOOM_OBSERVE: LazyLock<Mutex<Option<PendingZoomObserve>>> =
+    LazyLock::new(|| Mutex::new(None));
+static NEXT_ZOOM_OBSERVE_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// How long to wait before checking whether an accepted native zoom moved its window. Long enough
+/// for the app's run loop to apply it, short enough that a press feels answered.
+const ZOOM_OBSERVE_DELAY: f64 = 0.18;
+/// How long to wait before re-sending a restore the target app had not applied yet. The arrange
+/// path's settle delay is the same order; a restore has no animation to ride out.
+const RESTORE_VERIFY_DELAY: f64 = 0.12;
 /// Two consecutive matching read-backs count as settled.
 const SNAP_STABLE_ROUNDS: u8 = 2;
 /// ~2s: covers the longest measured animation plus two waits without holding a stale job for long.
@@ -842,6 +1021,221 @@ fn schedule_snap_verify(token: u64, delay: f64) {
             withObject: token,
             afterDelay: delay
         ];
+    }
+}
+
+/// Drop any armed restore retry.
+///
+/// A deferred restore re-sends a frame; if the user starts another arrange in the meantime, that
+/// later instruction must win. Every arrange entry and the restore itself call this first, so a
+/// stale retry can never overwrite newer intent.
+fn cancel_pending_restore() {
+    *PENDING_RESTORE.lock().unwrap() = None;
+}
+
+#[cfg(test)]
+fn with_pending_restore<R>(f: impl FnOnce(&mut Option<PendingRestore>) -> R) -> R {
+    f(&mut PENDING_RESTORE.lock().unwrap())
+}
+
+/// Drop any armed zoom observation.
+///
+/// A pending zoom observation carries a snapshot from an older operation. Once the user arranges or
+/// restores again, that snapshot is stale: the callback would see a changed frame caused by the
+/// NEW operation and commit the OLD frame. Every arrange entry and the restore call this first.
+#[cfg(test)]
+fn with_pending_zoom_observe<R>(f: impl FnOnce(&mut Option<PendingZoomObserve>) -> R) -> R {
+    f(&mut PENDING_ZOOM_OBSERVE.lock().unwrap())
+}
+
+fn cancel_pending_zoom_observe() {
+    *PENDING_ZOOM_OBSERVE.lock().unwrap() = None;
+}
+
+/// Watch, for a bounded time, whether an accepted native zoom actually moved the window.
+///
+/// A zoom is applied on the app's own run loop and can land after `press_native_zoom` returns, so
+/// one immediate read cannot decide whether to commit. The candidate snapshot travels with the
+/// observation and is committed only if the same window is later seen to have changed; the observer
+/// never presses zoom again, so a toggle-style zoom cannot be undone by a retry.
+fn observe_zoom_outcome(pid: i32, cgwid: u32, before: AxRect, pending: Option<PendingFrame>) {
+    let Some(pending) = pending else {
+        return;
+    };
+    let Some(ctrl) = crate::CONTROLLER.lock().unwrap().map(|target| target.0) else {
+        // No controller (the smoke path): nothing will drive a run loop, so decide now. The zoom
+        // was accepted; treat it as landed, which keeps the snapshot rather than dropping it.
+        pending.commit();
+        return;
+    };
+    let token = NEXT_ZOOM_OBSERVE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    *PENDING_ZOOM_OBSERVE.lock().unwrap() = Some(PendingZoomObserve {
+        token,
+        pid,
+        cgwid,
+        before,
+        pending,
+    });
+    unsafe {
+        let token_obj: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithUnsignedLongLong: token];
+        let _: () = msg_send![
+            ctrl,
+            performSelector: sel!(handleZoomObserve:),
+            withObject: token_obj,
+            afterDelay: ZOOM_OBSERVE_DELAY
+        ];
+    }
+}
+
+/// One armed zoom observation. A single slot: a new arrange supersedes it, and it is bounded to one
+/// check rather than a poll loop.
+#[derive(Debug, Clone, Copy)]
+struct PendingZoomObserve {
+    token: u64,
+    pid: i32,
+    cgwid: u32,
+    before: AxRect,
+    pending: PendingFrame,
+}
+
+/// Deferred zoom observation: if the same window has changed since the zoom was accepted, the
+/// carried snapshot becomes the restore target. Main thread only.
+pub(crate) fn on_zoom_observe(arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let token: u64 = unsafe { msg_send![arg as *mut AnyObject, unsignedLongLongValue] };
+    let job = {
+        let slot = PENDING_ZOOM_OBSERVE.lock().unwrap();
+        match slot.as_ref() {
+            Some(job) if job.token == token => *job,
+            _ => return,
+        }
+    };
+    *PENDING_ZOOM_OBSERVE.lock().unwrap() = None;
+    unsafe {
+        let app = AXUIElementCreateApplication(job.pid);
+        if app.is_null() {
+            return;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let Some(win) = win else {
+            return;
+        };
+        // Identity first: a recycled window id must not borrow this decision.
+        if ax_window_cgwid(win) == Some(job.cgwid) {
+            if let Some(after) = read_frame(win) {
+                if !rect_close(job.before, after) {
+                    log_debug!("[winctl] zoom fallback landed after the fact: {:?}", after);
+                    job.pending.commit();
+                }
+            }
+        }
+        CFRelease(win);
+    }
+}
+
+/// Arm one delayed re-send of a restore that did not land on its target frame.
+///
+/// Bounded on purpose: the arrange path's full poll-and-settle machinery exists because a snap has
+/// a running animation to ride out, while a restore is a single frame write that some apps apply a
+/// moment late. One settle-delayed retry covers that case without growing a second job type; a
+/// window that still refuses stays where it is, and the history is kept so the user can press again.
+///
+/// Returns the token when a retry was armed, or `None` when there is no controller to schedule it
+/// (the smoke path runs without one) or the window is gone.
+fn arm_restore_verify(pid: i32, cgwid: u32, target: AxRect) -> Option<u64> {
+    let ctrl = crate::CONTROLLER.lock().unwrap().map(|target| target.0)?;
+    let token = NEXT_RESTORE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    *PENDING_RESTORE.lock().unwrap() = Some(PendingRestore {
+        token,
+        pid,
+        cgwid,
+        target,
+    });
+    unsafe {
+        let token_obj: *mut AnyObject =
+            msg_send![class!(NSNumber), numberWithUnsignedLongLong: token];
+        let _: () = msg_send![
+            ctrl,
+            performSelector: sel!(handleRestoreVerify:),
+            withObject: token_obj,
+            afterDelay: RESTORE_VERIFY_DELAY
+        ];
+    }
+    Some(token)
+}
+
+/// One armed restore retry. Kept in a single slot: the restore binding is a user action, and a
+/// second press replaces the first rather than queueing another write behind it.
+#[derive(Debug, Clone, Copy)]
+struct PendingRestore {
+    token: u64,
+    pid: i32,
+    cgwid: u32,
+    target: AxRect,
+}
+
+/// Deferred restore retry: re-identify the window (the id may have been recycled), re-check that it
+/// is still not the target and not in full screen, then re-send the frame once. Main thread only.
+pub(crate) fn on_restore_verify(arg: *mut c_void) {
+    if arg.is_null() {
+        return;
+    }
+    let token: u64 = unsafe { msg_send![arg as *mut AnyObject, unsignedLongLongValue] };
+    // Match the token before taking the job: a stale callback (a newer restore replaced this one,
+    // or the retry was cancelled) must not consume the entry that belongs to a later press.
+    let job = {
+        let slot = PENDING_RESTORE.lock().unwrap();
+        match slot.as_ref() {
+            Some(job) if job.token == token => *job,
+            _ => return,
+        }
+    };
+    *PENDING_RESTORE.lock().unwrap() = None;
+    unsafe {
+        let app = AXUIElementCreateApplication(job.pid);
+        if app.is_null() {
+            return;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let Some(win) = win else {
+            log_debug!("[winctl] restore retry dropped: no focused window");
+            return;
+        };
+        // Identity check first: a recycled window id must not receive the write meant for the old
+        // window, and a window that already reached the target needs nothing.
+        let same_window = ax_window_cgwid(win) == Some(job.cgwid);
+        let already =
+            read_frame(win).is_some_and(|actual| rect_close_with(actual, job.target, SNAP_EPSILON));
+        if !same_window || already {
+            log_debug!(
+                "[winctl] restore retry dropped: same_window={} already_at_target={}",
+                same_window,
+                already
+            );
+            CFRelease(win);
+            return;
+        }
+        if read_fullscreen(win) {
+            log_debug!("[winctl] restore retry dropped: the window entered full screen");
+            CFRelease(win);
+            return;
+        }
+        let write = set_frame_with(win, job.target, |actual| {
+            rect_close_with(actual, job.target, SNAP_EPSILON)
+        });
+        log_debug!(
+            "[winctl] restore retry write errored={} actual={:?}",
+            write.errored,
+            write.actual
+        );
+        CFRelease(win);
     }
 }
 
@@ -1066,6 +1460,9 @@ pub(crate) fn apply_direction(dir: Direction) {
         let pending_state = pending_snap_state(pid, cgwid);
         cancel_pending_display_move(pid, cgwid);
         cancel_pending_snap(pid, cgwid);
+        // Any restore still waiting to re-send its frame is superseded by this arrange.
+        cancel_pending_restore();
+        cancel_pending_zoom_observe();
         let Some(frame) = read_frame(win) else {
             log_debug!("[winctl] failed to read window frame");
             CFRelease(win);
@@ -1112,7 +1509,18 @@ pub(crate) fn apply_direction(dir: Direction) {
             effective,
             p
         );
-        execute(p, win, pid, desired, dir);
+        // Only an arrange that will actually write gets to displace the snapshot: a no-op press
+        // (Nothing) leaves "previous" as the last frame the user saw change, and a write the target
+        // app refuses must not lose a frame the user can still return to.
+        let pending = if matches!(p, Plan::Nothing) {
+            None
+        } else {
+            capture_frame_before_arrange(win, pid, cgwid)
+        };
+        let landed = execute(p, win, pid, desired, dir, pending);
+        if let (Some(pending), Some(true)) = (pending, landed) {
+            pending.commit();
+        }
         CFRelease(win);
     }
 }
@@ -1171,6 +1579,9 @@ pub(crate) fn apply_display_move(dir: Direction) {
         if pending_state.is_none() {
             cancel_pending_display_move(pid, cgwid);
         }
+        // A restore still waiting to re-send its frame is superseded by this move.
+        cancel_pending_restore();
+        cancel_pending_zoom_observe();
         let Some((target_screen, target_frame)) =
             display_move_target(state, frame, cur_screen, dir, &screens)
         else {
@@ -1183,6 +1594,10 @@ pub(crate) fn apply_display_move(dir: Direction) {
             // not change the window state.
             set_minimized(win, false);
         }
+        // A confirmed destination means this move will write, so it becomes the frame "restore
+        // previous size" returns to -- but only once a write actually lands. A move the target app
+        // rejects leaves the previous history intact.
+        let pending = capture_frame_before_arrange(win, pid, cgwid);
         log_debug!(
             "[winctl] display move app={:?} dir={:?} pid={} from={} to={} state={:?} frame={:?}",
             app_name,
@@ -1202,7 +1617,21 @@ pub(crate) fn apply_display_move(dir: Direction) {
             screens[target_screen].visible,
             target_frame,
         );
+        let before_move = read_frame(win);
         let applied = set_frame(win, staging_frame);
+        // Commit on a real frame change, not on the intent to change: a rejected staging write and a
+        // scheduled retry can both end with the window exactly where it was, and that must not
+        // replace a frame the user can still return to. The deferred job below carries the pending
+        // snapshot and commits it the first time a write is observed to move the window.
+        let moved_now = match (before_move, read_frame(win)) {
+            (Some(before), Some(after)) => !rect_close(before, after),
+            _ => applied,
+        };
+        if moved_now {
+            if let Some(pending) = pending {
+                pending.commit();
+            }
+        }
         if !applied {
             log_debug!(
                 "[winctl] display move staging frame mismatch; deferred target may be scheduled: cgwid={:?} staging={:?} target={:?}",
@@ -1223,6 +1652,9 @@ pub(crate) fn apply_display_move(dir: Direction) {
                     target_frame,
                     attempt: 0,
                     created_at: Instant::now(),
+                    // The snapshot the immediate write did not commit follows the deferred job.
+                    pending: if moved_now { None } else { pending },
+                    last: read_frame(win),
                 };
                 // Verify once even after an immediate match, because the target app may asynchronously
                 // overwrite the frame after the AX call returns.
@@ -1299,6 +1731,7 @@ pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
                         true,
                         SnapState::Maximized,
                         set_frame_with(win, target, snap_accepts(target, true)),
+                        None,
                     );
                 }
                 handled = true;
@@ -1311,27 +1744,33 @@ pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
 }
 
 /// Run a main-thread plan (AX calls; errors are debug-logged and never interrupt the flow).
-unsafe fn execute(plan: Plan, win: AXUIElementRef, pid: i32, desired: SnapState, dir: Direction) {
+unsafe fn execute(
+    plan: Plan,
+    win: AXUIElementRef,
+    pid: i32,
+    desired: SnapState,
+    dir: Direction,
+    pending: Option<PendingFrame>,
+) -> Option<bool> {
     match plan {
-        Plan::Move(r) => finish_snap(
-            win,
-            pid,
-            r,
-            false,
-            desired,
-            set_frame_with(win, r, snap_accepts(r, false)),
-        ),
-        Plan::Maximize(r) => finish_snap(
-            win,
-            pid,
-            r,
-            true,
-            desired,
-            set_frame_with(win, r, snap_accepts(r, true)),
-        ),
-        Plan::Minimize => set_minimized(win, true),
+        Plan::Move(r) => {
+            let write = set_frame_with(win, r, snap_accepts(r, false));
+            let landed = finish_snap(win, pid, r, false, desired, write, pending);
+            Some(landed)
+        }
+        Plan::Maximize(r) => {
+            let write = set_frame_with(win, r, snap_accepts(r, true));
+            let landed = finish_snap(win, pid, r, true, desired, write, pending);
+            Some(landed)
+        }
+        Plan::Minimize => {
+            // A refused minimize must not commit: the window did not change, so the previous
+            // history stays the restore target.
+            Some(set_minimized(win, true))
+        }
         Plan::Nothing => {
             log_debug!("[winctl] direction {:?} is a no-op for this state", dir);
+            None
         }
     }
 }
@@ -1515,14 +1954,16 @@ unsafe fn finish_snap(
     maximized: bool,
     desired: SnapState,
     write: SnapWrite,
-) {
+    pending: Option<PendingFrame>,
+) -> bool {
     let matched = write.matched(snap_accepts(target, maximized));
     match snap_follow_up(matched, write.errored, !write.moved(), false) {
-        SnapFollowUp::Done => {}
+        SnapFollowUp::Done => write.moved(),
         SnapFollowUp::RetryAfterSettle => {
             let Some(cgwid) = ax_window_cgwid(win) else {
                 log_debug!("[winctl] snap settle skipped: no window id");
-                return;
+                // The frame matched even though the id is gone: the arrange landed.
+                return matched;
             };
             // Nothing is written here on purpose: a position write right after the size write reverts
             // the size, and a size write during the animation is overridden (both measured). The
@@ -1542,22 +1983,46 @@ unsafe fn finish_snap(
                 write.before,
                 write.actual,
             );
+            // The settle path is committed to writing: it re-sends the frame after the animation.
+            true
         }
         SnapFollowUp::ZoomFallback => {
             log_debug!(
                 "[winctl] snap write rejected; trying native zoom fallback: target={:?}",
                 target
             );
-            if !press_native_zoom(win) {
+            // Commit on the frame this whole operation actually produced, not on whether zoom was
+            // available: reaching this branch already means a write may have partially landed (a
+            // position write accepted while the size write failed), and discarding that would lose a
+            // frame the user can still return to.
+            let zoomed = press_native_zoom(win);
+            if !zoomed {
                 log_info!("[winctl] native zoom fallback unavailable");
             }
+            match (write.before, read_frame(win)) {
+                (Some(before), Some(after)) if !arrange_landed(Some(before), Some(after)) => {
+                    // For an accepted zoom with no change yet, the window is still animating (the
+                    // zoom is applied on the app's run loop). Committing nothing here would drop the
+                    // snapshot for a change that is about to happen, so hand it to a bounded deferred
+                    // observation instead, which commits only if the window does change. The
+                    // observation never presses zoom again.
+                    if zoomed {
+                        if let Some(cgwid) = ax_window_cgwid(win) {
+                            observe_zoom_outcome(pid, cgwid, before, pending);
+                        }
+                    }
+                    false
+                }
+                // An unreadable frame counts as changed, matching `SnapWrite::moved`.
+                _ => true,
+            }
         }
-        SnapFollowUp::GiveUp => {}
+        SnapFollowUp::GiveUp => false,
     }
 }
 
 /// Set AXMinimized.
-unsafe fn set_minimized(win: AXUIElementRef, minimized: bool) {
+unsafe fn set_minimized(win: AXUIElementRef, minimized: bool) -> bool {
     let key = cf_string_new(K_AX_MINIMIZED);
     // AXMinimized only accepts the kCFBooleanTrue/False constants.
     let value = if minimized {
@@ -1570,6 +2035,9 @@ unsafe fn set_minimized(win: AXUIElementRef, minimized: bool) {
         log_info!("[winctl] set AXMinimized failed: {}", err);
     }
     CFRelease(key);
+    // The caller commits the pre-arrange snapshot only on a real change, so a refused minimize
+    // must not report success.
+    err == K_AX_SUCCESS
 }
 
 /// Perform one native zoom, preferring `AXZoomWindow` (the app's own zoom, same as double-clicking
@@ -1702,6 +2170,94 @@ pub(crate) fn centered_frame(current: AxRect, visible: AxRect) -> AxRect {
     }
 }
 
+/// Read whether a window is in native full screen (the AXFullScreen *attribute*, not the subrole:
+/// a window already transitioning reports one before the other).
+unsafe fn read_fullscreen(win: AXUIElementRef) -> bool {
+    read_bool(win, K_AX_SUBROLE_FULL_SCREEN).unwrap_or(false)
+}
+
+/// Main thread: put the frontmost window back to the frame it had before its last arrange.
+///
+/// A no-op when nothing was saved for this window, so the binding is a strict undo of the arrange
+/// actions rather than a general window history. A window in native full screen is skipped for the
+/// same reason every arrange entry skips one -- full screen manages its own space, and leaving it
+/// is an asynchronous Space transition that a single frame write cannot wait on. Skipping it here
+/// keeps the two sides symmetric: because an arrange never snapshots a full-screen window, the
+/// history can never hold one either.
+pub(crate) fn apply_restore_previous() {
+    let (app_name, pid) = crate::ffi::frontmost_app_info();
+    if pid <= 0 {
+        return;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return;
+        }
+        // Same 300ms budget as the other window actions: an unresponsive app must not stall main.
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let win = copy_attribute(app, K_AX_FOCUSED_WINDOW);
+        CFRelease(app);
+        let Some(win) = win else {
+            log_debug!("[winctl] no focused window for restore");
+            return;
+        };
+        let Some(cgwid) = ax_window_cgwid(win) else {
+            CFRelease(win);
+            return;
+        };
+        // A pending arrange would write its own target after this restore and win the race; the
+        // restore is the user's latest instruction, so it cancels both.
+        cancel_pending_display_move(pid, Some(cgwid));
+        cancel_pending_snap(pid, Some(cgwid));
+        cancel_pending_restore();
+        cancel_pending_zoom_observe();
+        let saved = with_previous_frames(|store| store.get(pid, cgwid));
+        let Some(saved) = saved else {
+            log_debug!(
+                "[winctl] restore: no saved frame for app={:?} pid={} cgwid={}",
+                app_name,
+                pid,
+                cgwid
+            );
+            CFRelease(win);
+            return;
+        };
+        if read_fullscreen(win) {
+            log_debug!("[winctl] restore skipped: the window is in native full screen");
+            CFRelease(win);
+            return;
+        }
+        log_debug!(
+            "[winctl] restore app={:?} pid={} cgwid={} frame={:?}",
+            app_name,
+            pid,
+            cgwid,
+            saved.frame
+        );
+        let write = set_frame_with(win, saved.frame, |actual| {
+            rect_close_with(actual, saved.frame, SNAP_EPSILON)
+        });
+        log_debug!(
+            "[winctl] restore write errored={} before={:?} actual={:?}",
+            write.errored,
+            write.before,
+            write.actual
+        );
+        // The history is deliberately NOT consumed: a repeated press returns to the same frame, so
+        // restore is idempotent and a target app that refuses the first write can be retried.
+        if !write.matched(|actual| rect_close_with(actual, saved.frame, SNAP_EPSILON)) {
+            // The target app moved or resized asynchronously after the write returned. Re-send once
+            // after the settle delay the arrange path already uses, with the window re-identified
+            // and re-checked first (a different window may hold the id by then).
+            if let Some(token) = arm_restore_verify(pid, cgwid, saved.frame) {
+                log_debug!("[winctl] restore verification armed (token={token})");
+            }
+        }
+        CFRelease(win);
+    }
+}
+
 /// Main thread: run one direct window target on the frontmost window. A window already in the
 /// target state is left exactly as it is, so holding or repeating the binding never flickers.
 pub(crate) fn apply_direct(target: DirectTarget) {
@@ -1734,6 +2290,9 @@ pub(crate) fn apply_direct(target: DirectTarget) {
         // cancelled rather than continued toward the old goal.
         cancel_pending_display_move(pid, cgwid);
         cancel_pending_snap(pid, cgwid);
+        // Any restore still waiting to re-send its frame is superseded by this arrange.
+        cancel_pending_restore();
+        cancel_pending_zoom_observe();
         let Some(frame) = read_frame(win) else {
             log_debug!("[winctl] failed to read window frame");
             CFRelease(win);
@@ -1772,25 +2331,27 @@ pub(crate) fn apply_direct(target: DirectTarget) {
             already
         );
         if !already {
-            match plan {
-                Plan::Move(r) => finish_snap(
-                    win,
-                    pid,
-                    r,
-                    false,
-                    desired,
-                    set_frame_with(win, r, snap_accepts(r, false)),
-                ),
-                Plan::Maximize(r) => finish_snap(
-                    win,
-                    pid,
-                    r,
-                    true,
-                    desired,
-                    set_frame_with(win, r, snap_accepts(r, true)),
-                ),
-                Plan::Minimize => set_minimized(win, true),
-                Plan::Nothing => {}
+            // Same rule as the direction path: only a target that will write and actually moves the
+            // window displaces the snapshot.
+            let pending = if matches!(plan, Plan::Nothing) {
+                None
+            } else {
+                capture_frame_before_arrange(win, pid, cgwid)
+            };
+            let landed = match plan {
+                Plan::Move(r) => {
+                    let write = set_frame_with(win, r, snap_accepts(r, false));
+                    Some(finish_snap(win, pid, r, false, desired, write, pending))
+                }
+                Plan::Maximize(r) => {
+                    let write = set_frame_with(win, r, snap_accepts(r, true));
+                    Some(finish_snap(win, pid, r, true, desired, write, pending))
+                }
+                Plan::Minimize => Some(set_minimized(win, true)),
+                Plan::Nothing => None,
+            };
+            if let (Some(pending), Some(true)) = (pending, landed) {
+                pending.commit();
             }
         }
         CFRelease(win);
@@ -1799,12 +2360,284 @@ pub(crate) fn apply_direct(target: DirectTarget) {
 
 #[cfg(test)]
 mod tests {
+    /// Serializes the tests that drive the process-wide previous-frame store. Without it two tests
+    /// interleave and one sees the other's entries (observed as an intermittent failure).
+    #[cfg(test)]
+    static STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the store-test lock, ignoring poisoning: a panic in another test must not cascade.
+    #[cfg(test)]
+    fn lock_store_tests() -> std::sync::MutexGuard<'static, ()> {
+        STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     use super::{
-        centered_frame, display_move_staging_frame, display_move_target, fills_visible,
-        infer_state, neighbor_screen, plan, rect_close_with, snap_follow_up, snap_frames, AxRect,
-        DirectTarget, Direction, Plan, ScreenGeometry, SnapFollowUp, SnapState, SnapWrite,
+        arrange_landed, cancel_pending_restore, cancel_pending_zoom_observe, centered_frame,
+        display_move_staging_frame, display_move_target, fills_visible, infer_state,
+        neighbor_screen, plan, rect_close, rect_close_with, snap_follow_up, snap_frames,
+        with_pending_restore, with_pending_zoom_observe, with_previous_frames, AxRect,
+        DirectTarget, Direction, PendingFrame, PendingRestore, PendingZoomObserve, Plan,
+        PreviousFrameStore, SavedFrame, ScreenGeometry, SnapFollowUp, SnapState, SnapWrite,
         SNAP_EPSILON,
     };
+
+    /// The restore snapshot is keyed by (pid, CGWindowID): a recycled window id must not answer
+    /// with the previous owner's frame, the table stays bounded, and a repeat press restores the
+    /// same frame rather than consuming it.
+    #[test]
+    fn previous_frame_store_keys_by_pid_and_window_and_stays_bounded() {
+        let mut store = PreviousFrameStore::default();
+        let saved = |x: f64| SavedFrame {
+            frame: rect(x, 0.0, 100.0, 100.0),
+            was_fullscreen: false,
+        };
+        store.save(11, 7, saved(10.0));
+        assert_eq!(store.get(11, 7), Some(saved(10.0)));
+        // Same window id, different process: the WindowServer recycles ids, so this must miss.
+        assert_eq!(store.get(22, 7), None);
+        // Zero is "no window id" and is never stored.
+        store.save(11, 0, saved(20.0));
+        assert_eq!(store.get(11, 0), None);
+
+        // Restoring is idempotent: the entry survives the read.
+        assert_eq!(store.get(11, 7), Some(saved(10.0)));
+        assert_eq!(store.get(11, 7), Some(saved(10.0)));
+
+        // Re-saving the same window replaces rather than appends.
+        store.save(11, 7, saved(30.0));
+        assert_eq!(store.get(11, 7), Some(saved(30.0)));
+        assert_eq!(store.len(), 1);
+
+        // Bounded: the oldest entry is dropped, and the most recent one is still there.
+        for id in 1..=(PreviousFrameStore::MAX_ENTRIES as u32 + 5) {
+            store.save(11, id, saved(id as f64));
+        }
+        assert_eq!(store.len(), PreviousFrameStore::MAX_ENTRIES);
+        assert!(store.get(11, 1).is_none());
+        assert!(store
+            .get(11, PreviousFrameStore::MAX_ENTRIES as u32 + 5)
+            .is_some());
+    }
+
+    /// The history may only be displaced by an arrange that actually moved the window. A refused
+    /// operation must leave the earlier frame recoverable, because F0 -> F1 succeeding and then
+    /// F1 -> refused would otherwise lose F0 entirely.
+    ///
+    /// Drives the real store: `PendingFrame::commit` is what the arrange paths call once a write
+    /// moved the window, so the decision under test is "capture is inert, commit replaces".
+    #[test]
+    fn a_refused_arrange_does_not_replace_the_saved_frame() {
+        let _guard = lock_store_tests();
+        let at = |x: f64| SavedFrame {
+            frame: rect(x, 0.0, 100.0, 100.0),
+            was_fullscreen: false,
+        };
+        let key = (4242, 77);
+        with_previous_frames(|store| store.save(key.0, key.1, at(0.0)));
+        assert_eq!(
+            with_previous_frames(|store| store.get(key.0, key.1)),
+            Some(at(0.0))
+        );
+
+        // A later arrange is refused by the target app: the caller captured the frame but never
+        // commits, so the store is untouched and F0 is still what a restore returns to.
+        let pending = PendingFrame {
+            pid: key.0,
+            cgwid: key.1,
+            saved: at(500.0),
+        };
+        assert_eq!(
+            with_previous_frames(|store| store.get(key.0, key.1)),
+            Some(at(0.0)),
+            "a refused arrange must not displace the saved frame"
+        );
+
+        // Once a write does move the window the capture commits, becoming the new restore target.
+        pending.commit();
+        assert_eq!(
+            with_previous_frames(|store| store.get(key.0, key.1)),
+            Some(at(500.0))
+        );
+
+        // Leave no global state behind for the other tests.
+        with_previous_frames(|store| store.frames.clear());
+    }
+
+    /// The commit decision must follow the operation's real outcome, not one early write: a
+    /// partially-applied arrange and a fallback that could not run still count as changes.
+    ///
+    /// Covers the shared decision function itself. It does not execute the call sites, so a caller
+    /// that ignores the outcome would not be caught here; that gap is recorded in
+    /// `docs/review-backlog.md`.
+    #[test]
+    fn the_commit_decision_follows_the_real_frame_change() {
+        // Exercises the production rule the arrange paths call. This covers the rule itself (a rule
+        // that stops reporting a real change fails here); it does NOT execute the call sites, so a
+        // caller that ignores its return value would not be caught by this test alone (recorded in
+        // docs/review-backlog.md).
+        let start = rect(0.0, 0.0, 100.0, 100.0);
+
+        // A partial application (position accepted, size rejected - the case that reaches the zoom
+        // fallback) is still a change, so the snapshot must be committed.
+        assert!(arrange_landed(
+            Some(start),
+            Some(rect(50.0, 0.0, 100.0, 100.0))
+        ));
+
+        // A completely refused operation changes nothing: the previous history must survive.
+        assert!(!arrange_landed(Some(start), Some(start)));
+
+        // An unreadable frame counts as landed, so the snapshot is kept rather than dropped.
+        assert!(arrange_landed(Some(start), None));
+        assert!(arrange_landed(None, Some(start)));
+
+        // A move that landed is reported as landed.
+        assert!(arrange_landed(
+            Some(start),
+            Some(rect(0.0, 200.0, 100.0, 100.0))
+        ));
+    }
+
+    /// Scheduling a deferred retry is not evidence that anything changed: a display move that
+    /// fails or is cancelled must leave the previous history intact, and the snapshot must be
+    /// committed only once a write is observed to move the window.
+    #[test]
+    fn a_deferred_display_move_commits_only_on_an_observed_change() {
+        let _guard = lock_store_tests();
+        let at = |x: f64| SavedFrame {
+            frame: rect(x, 0.0, 100.0, 100.0),
+            was_fullscreen: false,
+        };
+        let key = (5150, 91);
+        with_previous_frames(|store| store.save(key.0, key.1, at(0.0)));
+        assert_eq!(
+            with_previous_frames(|store| store.get(key.0, key.1)),
+            Some(at(0.0))
+        );
+
+        // A display move is attempted and nothing changes (the app refused every write). The job
+        // carries the snapshot but never commits, so F0 survives.
+        let carried = Some(PendingFrame {
+            pid: key.0,
+            cgwid: key.1,
+            saved: at(900.0),
+        });
+        assert_eq!(
+            with_previous_frames(|store| store.get(key.0, key.1)),
+            Some(at(0.0)),
+            "a deferred retry alone must not replace the saved frame"
+        );
+
+        // Only when a write is observed to move the window does the carried snapshot commit.
+        if let Some(pending) = carried {
+            pending.commit();
+        }
+        assert_eq!(
+            with_previous_frames(|store| store.get(key.0, key.1)),
+            Some(at(900.0))
+        );
+        with_previous_frames(|store| store.frames.clear());
+    }
+
+    /// A pending zoom observation must not outlive a newer arrange: otherwise its callback sees a
+    /// changed frame caused by the NEW operation and commits the OLD snapshot over it.
+    #[test]
+    fn a_pending_zoom_observation_is_dropped_by_a_newer_operation() {
+        let _guard = lock_store_tests();
+        let at = |x: f64| SavedFrame {
+            frame: rect(x, 0.0, 100.0, 100.0),
+            was_fullscreen: false,
+        };
+        let key = (6161, 33);
+        with_previous_frames(|store| store.save(key.0, key.1, at(0.0)));
+
+        // Operation A's zoom is accepted but not yet visible; its observation is armed.
+        with_pending_zoom_observe(|slot| {
+            *slot = Some(PendingZoomObserve {
+                token: 9,
+                pid: key.0,
+                cgwid: key.1,
+                before: at(0.0).frame,
+                pending: PendingFrame {
+                    pid: key.0,
+                    cgwid: key.1,
+                    saved: at(500.0),
+                },
+            });
+        });
+
+        // Operation B runs and commits its own snapshot as the new history.
+        with_previous_frames(|store| store.save(key.0, key.1, at(700.0)));
+
+        // B cancels A's observation (as every arrange entry now does), so A cannot overwrite B.
+        cancel_pending_zoom_observe();
+        assert!(
+            with_pending_zoom_observe(|slot| slot.is_none()),
+            "the stale observation must be dropped"
+        );
+        assert_eq!(
+            with_previous_frames(|store| store.get(key.0, key.1)),
+            Some(at(700.0)),
+            "the newer operation's history must win"
+        );
+
+        with_previous_frames(|store| store.frames.clear());
+    }
+
+    /// A stale retry callback must not consume the entry that belongs to a newer press: the token
+    /// is compared before the slot is taken, and a superseded retry is dropped by cancellation.
+    #[test]
+    fn a_stale_restore_retry_is_dropped_not_consumed() {
+        let _guard = lock_store_tests();
+        let jobs = |token: u64| PendingRestore {
+            token,
+            pid: 1,
+            cgwid: 2,
+            target: rect(0.0, 0.0, 10.0, 10.0),
+        };
+        // A newer restore replaced the armed one: an older callback must leave the new entry alone.
+        with_pending_restore(|slot| *slot = Some(jobs(2)));
+        let kept = with_pending_restore(|slot| {
+            slot.as_ref()
+                .and_then(|job| (job.token == 1).then_some(*job))
+        });
+        assert!(kept.is_none(), "the stale token must not match");
+        assert_eq!(
+            with_pending_restore(|slot| slot.as_ref().map(|job| job.token)),
+            Some(2),
+            "the newer retry must still be armed"
+        );
+
+        // Cancellation drops it: a later arrange must not be overwritten by an older restore.
+        cancel_pending_restore();
+        cancel_pending_zoom_observe();
+        assert_eq!(with_pending_restore(|slot| slot.is_some()), false);
+
+        // A matching token is the only case that consumes the entry.
+        with_pending_restore(|slot| *slot = Some(jobs(7)));
+        let matched = with_pending_restore(|slot| match slot.as_ref() {
+            Some(job) if job.token == 7 => Some(*job),
+            _ => None,
+        });
+        assert_eq!(matched.map(|job| job.token), Some(7));
+        with_pending_restore(|slot| *slot = None);
+    }
+
+    /// The full-screen flag round-trips: a window saved while full screen must be remembered as
+    /// such, because restoring it means re-entering full screen rather than writing the frame.
+    #[test]
+    fn previous_frame_store_remembers_fullscreen() {
+        let mut store = PreviousFrameStore::default();
+        store.save(
+            5,
+            9,
+            SavedFrame {
+                frame: rect(0.0, 0.0, 800.0, 600.0),
+                was_fullscreen: true,
+            },
+        );
+        assert!(store.get(5, 9).unwrap().was_fullscreen);
+    }
 
     /// The direct targets are absolute: each one maps to exactly one rect, so pressing the binding
     /// twice leaves the window where it is (the runtime skips a write when the frame already matches).

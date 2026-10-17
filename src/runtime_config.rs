@@ -45,6 +45,10 @@ struct ChangeFlags {
     // Any of the four in-panel action switches changed: the panel's published key snapshot has to
     // be rebuilt, or the tap keeps claiming (or ignoring) the old chord set.
     panel_actions: bool,
+    // The menu-bar icon visibility changed. Separate from `startup`, which syncs the login item:
+    // toggling the icon must not re-register the app with the system, and a login-item change must
+    // not restyle the status item.
+    menu_bar_icon: bool,
 }
 
 /// Whether an already-open settings window has to re-read the config in place after this change.
@@ -96,6 +100,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         locale: old.i18n.locale != new.i18n.locale,
         modifier: startup || old.keyboard.modifier != new.keyboard.modifier,
         startup: startup || old.startup.launch_at_login != new.startup.launch_at_login,
+        menu_bar_icon: startup || old.startup.hide_menu_bar_icon != new.startup.hide_menu_bar_icon,
         logging: startup || old.logging.level != new.logging.level,
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
@@ -216,6 +221,9 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
     if flags.startup {
         crate::autostart::sync(new.startup.launch_at_login);
+    }
+    if flags.menu_bar_icon {
+        crate::menu::set_status_item_visible(!new.startup.hide_menu_bar_icon);
     }
     if flags.logging {
         let level = match new.logging.level.as_str() {

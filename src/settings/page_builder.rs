@@ -760,6 +760,45 @@ pub(super) unsafe fn build_general_page(
 
     // Start hidden; page selection applies the permission state and resizes General's viewport.
     let _: () = msg_send![banner, setHidden: true];
+
+    // Startup card, first on the page: the two settings a new install most often needs.
+    let y = canvas.next_row(described_row_h);
+    // Launch-at-login switch: no title (the row label on the left already describes it).
+    ui.launch_at_login = SettingsRow::described(
+        general_view,
+        label_x,
+        y,
+        content_w - label_x * 2.0 - 58.0,
+        described_row_h,
+        &t("settings.row_launch_at_login"),
+        &t("settings.desc_launch_at_login"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+    );
+    bind_control(target, ui.launch_at_login);
+    canvas.card(&t("settings.header_startup"));
+
+    // Menu-bar icon: its own card, because hiding the icon is a distinct decision from what the app
+    // does at login — and the row has to say where Settings can still be reached without it.
+    canvas.next_section();
+    let y = canvas.next_row(described_row_h);
+    // `captioned`, not `described`: the latter never renders its subtitle, and this row has to carry
+    // the "Settings can still be reached" promise that keeps a hidden icon from stranding the user
+    // (asserted by --smoke-settings-layout).
+    ui.hide_menu_bar_icon = SettingsRow::captioned(
+        general_view,
+        label_x,
+        y,
+        content_w - label_x * 2.0 - 58.0,
+        described_row_h,
+        &t("settings.row_hide_menu_bar_icon"),
+        &t("settings.desc_hide_menu_bar_icon"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+    )
+    .2;
+    bind_control(target, ui.hide_menu_bar_icon);
+    canvas.card(&t("settings.header_menu_bar_icon"));
+
+    canvas.next_section();
     let theme_items = [
         t("settings.theme_dark"),
         t("settings.theme_light"),
@@ -923,22 +962,6 @@ pub(super) unsafe fn build_general_page(
         export_btn,
     );
     canvas.card(&t("settings.header_logging"));
-
-    canvas.next_section();
-    let y = canvas.next_row(described_row_h);
-    // Launch-at-login switch: no title (the row label on the left already describes it).
-    ui.launch_at_login = SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        content_w - label_x * 2.0 - 58.0,
-        described_row_h,
-        &t("settings.row_launch_at_login"),
-        &t("settings.desc_launch_at_login"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    );
-    bind_control(target, ui.launch_at_login);
-    canvas.card(&t("settings.header_startup"));
 
     // Backup: export the whole configuration to a file, or restore it on this or another Mac.
     // `captioned`, not `described`: the latter's subtitle is never rendered, and the import row has

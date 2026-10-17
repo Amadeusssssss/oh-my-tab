@@ -79,6 +79,7 @@ pub(crate) fn execute(action: Action) {
         Action::Minimize => {
             crate::window_management::apply_direct(crate::window_management::DirectTarget::Minimize)
         }
+        Action::RestorePrevious => crate::window_management::apply_restore_previous(),
         Action::Center => {
             crate::window_management::apply_direct(crate::window_management::DirectTarget::Center)
         }
@@ -124,6 +125,9 @@ pub(crate) fn execute(action: Action) {
         Action::ShowDesktop => {
             crate::mouse::system_action::fire("com.apple.showdesktop.awake");
         }
+        // The all-apps form of Command+H, not the Mission Control reveal "show desktop" fires.
+        Action::HideAllWindows => crate::quick_actions::hide_all_apps(),
+        Action::ShowAllWindows => crate::quick_actions::show_all_apps(),
         Action::PreviousApp => {
             crate::window_collector::activate_previous_app();
         }

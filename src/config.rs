@@ -738,6 +738,9 @@ pub struct LoggingSection {
 pub struct StartupSection {
     // Launch at login; defaults to false (bool::default() is false, so Default derives directly).
     pub launch_at_login: bool,
+    // Hide the menu-bar status item. Default false. Unlike launch_at_login this travels with
+    // export/import: it is a display preference, not a per-machine system registration.
+    pub hide_menu_bar_icon: bool,
 }
 
 /// Sparkle update settings.

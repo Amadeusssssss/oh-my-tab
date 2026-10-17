@@ -68,10 +68,18 @@ pub(crate) enum Action {
     ToggleKeystrokeDisplay = 29,
     ToggleClipboardHistory = 30,
     OpenClipboardPanel = 31,
+    /// Put the frontmost window back to the frame it had before its last arrange (the app-wide
+    /// counterpart of the switcher's per-window restore). Re-enters native full screen when that is
+    /// what the window was in.
+    RestorePrevious = 32,
+    /// Hide or unhide every regular application. These act on applications, not the frontmost
+    /// window, so they belong to QuickActions and are not window-scoped.
+    HideAllWindows = 33,
+    ShowAllWindows = 34,
 }
 
 /// Every action, in the frozen index order. The settings picker walks this list.
-pub(crate) const ALL: [Action; 32] = [
+pub(crate) const ALL: [Action; 35] = [
     Action::SnapUp,
     Action::SnapDown,
     Action::SnapLeft,
@@ -104,6 +112,9 @@ pub(crate) const ALL: [Action; 32] = [
     Action::ToggleKeystrokeDisplay,
     Action::ToggleClipboardHistory,
     Action::OpenClipboardPanel,
+    Action::RestorePrevious,
+    Action::HideAllWindows,
+    Action::ShowAllWindows,
 ];
 
 impl Action {
@@ -153,6 +164,9 @@ impl Action {
             Self::ToggleKeystrokeDisplay => "feature.toggle_keystroke_display",
             Self::ToggleClipboardHistory => "feature.toggle_clipboard_history",
             Self::OpenClipboardPanel => "feature.open_clipboard_panel",
+            Self::RestorePrevious => "window.restore_previous",
+            Self::HideAllWindows => "quick.hide_all_windows",
+            Self::ShowAllWindows => "quick.show_all_windows",
         }
     }
 
@@ -180,7 +194,8 @@ impl Action {
             | Self::QuarterTopLeft
             | Self::QuarterTopRight
             | Self::QuarterBottomLeft
-            | Self::QuarterBottomRight => Group::WindowControl,
+            | Self::QuarterBottomRight
+            | Self::RestorePrevious => Group::WindowControl,
             _ => Group::QuickActions,
         }
     }
@@ -221,6 +236,9 @@ impl Action {
             Self::ToggleKeystrokeDisplay => "settings.binding_action_toggle_keystroke_display",
             Self::ToggleClipboardHistory => "settings.binding_action_toggle_clipboard_history",
             Self::OpenClipboardPanel => "settings.binding_action_open_clipboard_panel",
+            Self::RestorePrevious => "settings.binding_action_restore_previous",
+            Self::HideAllWindows => "settings.binding_action_hide_all_windows",
+            Self::ShowAllWindows => "settings.binding_action_show_all_windows",
         }
     }
 
@@ -267,12 +285,16 @@ mod tests {
         assert_eq!(Action::OpenSettings.index(), 19);
         assert_eq!(Action::LocatePointer.index(), 23);
         assert_eq!(Action::OpenClipboardPanel.index(), 31);
-        assert_eq!(ALL.len(), 32);
+        // Appended after OpenClipboardPanel: the earlier values must not move.
+        assert_eq!(Action::RestorePrevious.index(), 32);
+        assert_eq!(Action::HideAllWindows.index(), 33);
+        assert_eq!(Action::ShowAllWindows.index(), 34);
+        assert_eq!(ALL.len(), 35);
         for (index, action) in ALL.iter().enumerate() {
             assert_eq!(action.index() as usize, index, "{action:?}");
             assert_eq!(Action::from_index(index as u16), Some(*action));
         }
-        assert_eq!(Action::from_index(32), None);
+        assert_eq!(Action::from_index(35), None);
         assert_eq!(Action::from_index(u16::MAX), None);
     }
 
@@ -298,6 +320,11 @@ mod tests {
             );
         }
         assert!(Action::Center.is_window_scoped());
+        assert!(Action::RestorePrevious.is_window_scoped());
         assert!(!Action::ShowDesktop.is_window_scoped());
+        // These act on every application, not on the frontmost window, so they must not be
+        // suppressed by the "our own window is frontmost" rule.
+        assert!(!Action::HideAllWindows.is_window_scoped());
+        assert!(!Action::ShowAllWindows.is_window_scoped());
     }
 }

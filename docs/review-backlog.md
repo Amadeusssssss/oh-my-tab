@@ -92,3 +92,5 @@
 
 - **新色板的深色模式与 Reduce Transparency 只在渲染稿上看过**（2026-10-16，图标选中样式审查 R1，LOW——未运行覆盖，延后）。浅色模式有真机截图；深色只有按代码数值渲染的模拟图，Reduce Transparency 完全没看过（Reduce Motion 无关：这次没有加动画）。触发：下次改动色板绘制时，或首次报告深色/降低透明度下选中态看不清时。
 - **一次未复现的测试失败**（2026-10-16，图标选中样式 + 缩略图色板改动，MEDIUM——门禁不稳，延后）。删掉一个测试后的那次 `cargo test --lib` 报 `1087 passed; 1 failed`，但失败名未被捕获（抓取用的 grep 模式写错了），此后连续 18 次全绿。最可能的原因：`theme` 的几何测试要跨多次调用读全局 `CONFIG`（`card_h()`、`card_title_font_size()` 各读一次），而同一测试二进制里 `overlay/cards.rs`、`clipboard/{persist,detail,text_style}.rs`、`onboarding.rs` 的测试模块会**写** `CONFIG`，并行执行时两次读之间可能被改。触发：它再失败时先抓名字（`cargo test --lib 2>&1 | grep -A8 '^failures:'`），或下次改动这些几何测试时——最省的修法是让几何函数只读一次配置（把两个行高作参数传入，测试改成纯函数调用）。
+
+- **窗口恢复提交判定的「调用点接线」没有自动化覆盖**（2026-10-17，隐藏菜单栏图标 + 窗口动作审查 R5，LOW——覆盖缺口，延后）。`arrange_landed` 本身有单元测试（把规则改成恒 false 会失败），但**调用点**是否使用它的返回值没有任何测试覆盖：把 `apply_direct` 改回忽略 `finish_snap` 的返回结果，现有测试仍会通过。真正覆盖需要驱动 AX 写回（`--smoke-*` 里没有可写窗口的稳定夹具），属于"测试仪器完善"而非用户可见缺陷，按仓库规则延后。触发：出现可按脚本写入 frame 的 A1 夹具时，或下次改动 `apply_direct`/`apply_direction`/`apply_display_move` 的提交路径时。

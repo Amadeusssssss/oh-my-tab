@@ -416,6 +416,7 @@ pub(super) struct SettingsUi {
     keystroke_display_max_extent_value: *mut AnyObject, // the slider's read-only readout
     log_level: *mut AnyObject, // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // launch at login
+    hide_menu_bar_icon: *mut AnyObject, // hide the menu-bar status item
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject, // enable mouse control
     scroll_mode: *mut AnyObject, // NSPopUpButton: default/line
@@ -1405,6 +1406,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.startup.launch_at_login
     );
     changed!(
+        "startup.hide_menu_bar_icon",
+        old.startup.hide_menu_bar_icon,
+        new.startup.hide_menu_bar_icon
+    );
+    changed!(
         "updates.automatically_check",
         old.updates.automatically_check,
         new.updates.automatically_check
@@ -1810,6 +1816,9 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             let _: () = msg_send![ui.log_level, selectItemAtIndex: ll_idx as isize];
             // launch_at_login: set the switch state from CONFIG.startup.launch_at_login.
             let _: () = msg_send![ui.launch_at_login, setState: if cfg.startup.launch_at_login { 1isize } else { 0isize }];
+            // hide_menu_bar_icon: the switch reflects the saved value; the status item itself is
+            // toggled by runtime_config, so the launch path and a live edit agree.
+            let _: () = msg_send![ui.hide_menu_bar_icon, setState: if cfg.startup.hide_menu_bar_icon { 1isize } else { 0isize }];
             let _: () = msg_send![
                 ui.update_auto_check,
                 setState: if cfg.updates.automatically_check { 1isize } else { 0isize }

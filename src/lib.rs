@@ -1200,6 +1200,18 @@ extern "C" fn on_display_move_retry(_self: *mut c_void, _cmd: Sel, arg: *mut c_v
 }
 
 /// Main-thread entry for the deferred snap settle (write the size after the app's animation).
+extern "C" fn on_zoom_observe(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    callback_guard::void("on_zoom_observe", || {
+        window_management::on_zoom_observe(arg)
+    });
+}
+
+extern "C" fn on_restore_verify(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
+    callback_guard::void("on_restore_verify", || {
+        window_management::on_restore_verify(arg)
+    });
+}
+
 extern "C" fn on_snap_verify(_self: *mut c_void, _cmd: Sel, arg: *mut c_void) {
     callback_guard::void("on_snap_verify", || window_management::on_snap_verify(arg));
 }
@@ -1599,6 +1611,18 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleRestoreVerify:),
+            on_restore_verify as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleZoomObserve:),
+            on_zoom_observe as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleAppActivation:),
             on_app_activated as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1855,6 +1879,9 @@ fn setup_status_bar() {
         // around the icon.
         let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: -1.0f64];
         let _: *mut AnyObject = msg_send![status_item, retain];
+        // Record the handle for "hide menu bar icon" before the item is configured: the toggle only
+        // flips visibility on this same item, so nothing below has to know it can be hidden.
+        crate::menu::register_status_item(status_item);
 
         let button: *mut AnyObject = msg_send![status_item, button];
 
@@ -2809,6 +2836,9 @@ pub fn run() {
 
     // 3. Setup status bar menu
     setup_status_bar();
+    // Apply the saved icon visibility once the item exists. Later changes arrive through
+    // runtime_config's menu_bar_icon flag, which calls the same function.
+    crate::menu::set_status_item_visible(!CONFIG.read().unwrap().startup.hide_menu_bar_icon);
 
     // 4. Initialize state
     ensure_icon_cache_dir();
