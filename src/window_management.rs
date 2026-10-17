@@ -894,22 +894,48 @@ enum SnapFollowUp {
     GiveUp,
 }
 
+/// Whether a write that did not reach its target may finish with the app's own zoom action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SnapFallback {
+    /// Press the native zoom button: the maximize-oriented fallback every arrange path uses.
+    Zoom,
+    /// Never press zoom. A shrink whose fallback maximized would invert the action's intent, so the
+    /// small-Finder path turns the rejected/unchanged write into a bounded settle that can only
+    /// give up.
+    None,
+}
+
 fn snap_follow_up(
     matched: bool,
     errored: bool,
     untouched: bool,
     settled_retry: bool,
+    fallback: SnapFallback,
 ) -> SnapFollowUp {
     if matched {
         return SnapFollowUp::Done;
     }
-    if errored || untouched {
+    if errored {
+        // frame writes already retried position-first and size-first; a real error is final.
+        return if fallback == SnapFallback::Zoom {
+            SnapFollowUp::ZoomFallback
+        } else {
+            SnapFollowUp::GiveUp
+        };
+    }
+    if untouched && fallback == SnapFallback::Zoom {
         return SnapFollowUp::ZoomFallback;
     }
     if settled_retry {
         return SnapFollowUp::GiveUp;
     }
     SnapFollowUp::RetryAfterSettle
+}
+
+/// The follow-up once the deferred settle runs out of waits. Split out so the timeout path's policy
+/// is the same one the first write used, and is asserted by a headless test (pure).
+fn snap_settle_timeout_follow_up(untouched: bool, fallback: SnapFallback) -> SnapFollowUp {
+    snap_follow_up(false, false, untouched, true, fallback)
 }
 
 /// Phases of the deferred settle. Measured order matters: a position write starts the app's
@@ -939,6 +965,8 @@ struct PendingSnap {
     /// The state being approached; answers state queries during the animation so a mid-animation
     /// frame cannot be misread.
     state: SnapState,
+    /// Whether the settled retry may still finish with the app's zoom (never for a shrink).
+    fallback: SnapFallback,
     /// The frame before the first attempt (the baseline for "did the window move at all").
     before: Option<AxRect>,
     /// The previously read frame.
@@ -1239,33 +1267,53 @@ pub(crate) fn on_restore_verify(arg: *mut c_void) {
     }
 }
 
-/// Arm a deferred finish: the position has already been re-sent (the animation overrides it, but
-/// the window starts heading for the target), then poll until the frame stops changing before
-/// writing the size.
-fn arm_pending_snap(
+/// Build the deferred settle job. Split from `arm_pending_snap` so a headless test can assert the
+/// write's no-zoom policy is carried into the job instead of being reset when it is armed.
+#[allow(clippy::too_many_arguments)] // mirrors `arm_pending_snap`'s parameter list.
+fn make_pending_snap(
     pid: i32,
     cgwid: u32,
     target: AxRect,
     maximized: bool,
     state: SnapState,
+    fallback: SnapFallback,
     before: Option<AxRect>,
     last: Option<AxRect>,
-) {
-    let token = NEXT_SNAP_TOKEN.fetch_add(1, Ordering::Relaxed);
-    *PENDING_SNAP.lock().unwrap() = Some(PendingSnap {
-        token,
+) -> PendingSnap {
+    PendingSnap {
+        token: NEXT_SNAP_TOKEN.fetch_add(1, Ordering::Relaxed),
         pid,
         cgwid,
         target,
         maximized,
         state,
+        fallback,
         before,
         last,
         stable_rounds: 0,
         phase: SnapPhase::Settle,
         waits: 0,
         created_at: Instant::now(),
-    });
+    }
+}
+
+/// Arm a deferred finish: the position has already been re-sent (the animation overrides it, but
+/// the window starts heading for the target), then poll until the frame stops changing before
+/// writing the size.
+#[allow(clippy::too_many_arguments)] // target + policy + baseline exceed the 7-arg limit.
+fn arm_pending_snap(
+    pid: i32,
+    cgwid: u32,
+    target: AxRect,
+    maximized: bool,
+    state: SnapState,
+    fallback: SnapFallback,
+    before: Option<AxRect>,
+    last: Option<AxRect>,
+) {
+    let job = make_pending_snap(pid, cgwid, target, maximized, state, fallback, before, last);
+    let token = job.token;
+    *PENDING_SNAP.lock().unwrap() = Some(job);
     schedule_snap_verify(token, SNAP_POLL_DELAY);
 }
 
@@ -1402,7 +1450,8 @@ pub(crate) fn on_snap_verify(arg: *mut c_void) {
                 (Some(b), Some(a)) => rect_close(b, a),
                 _ => false,
             };
-            if snap_follow_up(false, false, untouched, true) == SnapFollowUp::ZoomFallback {
+            if snap_settle_timeout_follow_up(untouched, job.fallback) == SnapFollowUp::ZoomFallback
+            {
                 log_debug!("[winctl] snap settle rejected; trying native zoom fallback");
                 if !press_native_zoom(win) {
                     log_info!("[winctl] native zoom fallback unavailable");
@@ -1722,18 +1771,117 @@ pub(crate) fn maximize_focused_window_of_pid(pid: i32) -> bool {
             let screens = screens_in_ax_space();
             if !screens.is_empty() {
                 let cur = screen_index_for(frame, &screens);
+                let target = snap_frames(screens[cur].visible).max;
+                crate::e2e_state::record_finder_quick_action(
+                    "maximized",
+                    ax_window_cgwid(win).unwrap_or(0),
+                    (
+                        screens[cur].visible.x,
+                        screens[cur].visible.y,
+                        screens[cur].visible.w,
+                        screens[cur].visible.h,
+                    ),
+                    (target.x, target.y, target.w, target.h),
+                );
                 if infer_state(frame, screens[cur].visible) != SnapState::Maximized {
-                    let target = snap_frames(screens[cur].visible).max;
                     finish_snap(
                         win,
                         pid,
                         target,
                         true,
                         SnapState::Maximized,
+                        SnapFallback::Zoom,
                         set_frame_with(win, target, snap_accepts(target, true)),
                         None,
                     );
                 }
+                handled = true;
+            }
+        }
+        CFRelease(win);
+        CFRelease(app);
+        handled
+    }
+}
+
+/// Quick actions: fraction of the visible area a small Finder window fills on each axis.
+const FINDER_SMALL_FRACTION: f64 = 0.6;
+/// The smallest the small Finder window is asked to become on each axis. This is the app's request,
+/// not a claim about Finder's own minimum: a dimension whose floor exceeds the visible extent
+/// degenerates to filling it.
+const FINDER_SMALL_MIN_W: f64 = 480.0;
+const FINDER_SMALL_MIN_H: f64 = 320.0;
+
+/// Quick actions: the small Finder window target for one visible area (pure; unit-tested). Both
+/// axes take `FINDER_SMALL_FRACTION` of the visible area, centered, with a floor so the window
+/// stays usable on a small display. Deliberately not 0.5/0.25, which would coincide with a snap
+/// target and make later arrow-key handling read the window as snapped.
+pub(crate) fn small_window_frame(visible: AxRect) -> AxRect {
+    let w = (visible.w * FINDER_SMALL_FRACTION)
+        .max(FINDER_SMALL_MIN_W)
+        .min(visible.w);
+    let h = (visible.h * FINDER_SMALL_FRACTION)
+        .max(FINDER_SMALL_MIN_H)
+        .min(visible.h);
+    AxRect {
+        x: visible.x + (visible.w - w) / 2.0,
+        y: visible.y + (visible.h - h) / 2.0,
+        w,
+        h,
+    }
+}
+
+/// Quick actions: shrink the process's focused window to `small_window_frame`. Bypasses the
+/// window-control master switch like the maximize helper; native-fullscreen windows are left alone.
+/// The write never falls back to the native zoom action: that fallback exists to maximize, and would
+/// invert a shrink. Returns whether a focused window was found and handled.
+pub(crate) fn shrink_focused_window_of_pid(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        AXUIElementSetMessagingTimeout(app, 0.3);
+        let Some(win) = copy_attribute(app, K_AX_FOCUSED_WINDOW) else {
+            CFRelease(app);
+            return false;
+        };
+        if let Some(subrole) = copy_string(win, K_AX_SUBROLE) {
+            if subrole == K_AX_SUBROLE_FULL_SCREEN {
+                CFRelease(win);
+                CFRelease(app);
+                return true;
+            }
+        }
+        let mut handled = false;
+        if let Some(frame) = read_frame(win) {
+            let screens = screens_in_ax_space();
+            if !screens.is_empty() {
+                let cur = screen_index_for(frame, &screens);
+                let visible = screens[cur].visible;
+                let target = small_window_frame(visible);
+                crate::e2e_state::record_finder_quick_action(
+                    "small",
+                    ax_window_cgwid(win).unwrap_or(0),
+                    (visible.x, visible.y, visible.w, visible.h),
+                    (target.x, target.y, target.w, target.h),
+                );
+                // A tiny visible area can make the floor fill the screen; derive the state from the
+                // frame that is actually written rather than assuming Normal.
+                let desired = infer_state(target, visible);
+                finish_snap(
+                    win,
+                    pid,
+                    target,
+                    false,
+                    desired,
+                    SnapFallback::None,
+                    set_frame_with(win, target, snap_accepts(target, false)),
+                    None,
+                );
                 handled = true;
             }
         }
@@ -1755,12 +1903,30 @@ unsafe fn execute(
     match plan {
         Plan::Move(r) => {
             let write = set_frame_with(win, r, snap_accepts(r, false));
-            let landed = finish_snap(win, pid, r, false, desired, write, pending);
+            let landed = finish_snap(
+                win,
+                pid,
+                r,
+                false,
+                desired,
+                SnapFallback::Zoom,
+                write,
+                pending,
+            );
             Some(landed)
         }
         Plan::Maximize(r) => {
             let write = set_frame_with(win, r, snap_accepts(r, true));
-            let landed = finish_snap(win, pid, r, true, desired, write, pending);
+            let landed = finish_snap(
+                win,
+                pid,
+                r,
+                true,
+                desired,
+                SnapFallback::Zoom,
+                write,
+                pending,
+            );
             Some(landed)
         }
         Plan::Minimize => {
@@ -1947,17 +2113,19 @@ unsafe fn set_frame(win: AXUIElementRef, r: AxRect) -> bool {
 
 /// Finish a snap write: a match is final; otherwise re-send the position and postpone the size
 /// write past the app's animation, or fall back to the app's own zoom action.
+#[allow(clippy::too_many_arguments)] // target rect + acceptance + policy + write + restore snapshot.
 unsafe fn finish_snap(
     win: AXUIElementRef,
     pid: i32,
     target: AxRect,
     maximized: bool,
     desired: SnapState,
+    fallback: SnapFallback,
     write: SnapWrite,
     pending: Option<PendingFrame>,
 ) -> bool {
     let matched = write.matched(snap_accepts(target, maximized));
-    match snap_follow_up(matched, write.errored, !write.moved(), false) {
+    match snap_follow_up(matched, write.errored, !write.moved(), false, fallback) {
         SnapFollowUp::Done => write.moved(),
         SnapFollowUp::RetryAfterSettle => {
             let Some(cgwid) = ax_window_cgwid(win) else {
@@ -1980,6 +2148,7 @@ unsafe fn finish_snap(
                 target,
                 maximized,
                 desired,
+                fallback,
                 write.before,
                 write.actual,
             );
@@ -2341,11 +2510,29 @@ pub(crate) fn apply_direct(target: DirectTarget) {
             let landed = match plan {
                 Plan::Move(r) => {
                     let write = set_frame_with(win, r, snap_accepts(r, false));
-                    Some(finish_snap(win, pid, r, false, desired, write, pending))
+                    Some(finish_snap(
+                        win,
+                        pid,
+                        r,
+                        false,
+                        desired,
+                        SnapFallback::Zoom,
+                        write,
+                        pending,
+                    ))
                 }
                 Plan::Maximize(r) => {
                     let write = set_frame_with(win, r, snap_accepts(r, true));
-                    Some(finish_snap(win, pid, r, true, desired, write, pending))
+                    Some(finish_snap(
+                        win,
+                        pid,
+                        r,
+                        true,
+                        desired,
+                        SnapFallback::Zoom,
+                        write,
+                        pending,
+                    ))
                 }
                 Plan::Minimize => Some(set_minimized(win, true)),
                 Plan::Nothing => None,
@@ -2374,11 +2561,11 @@ mod tests {
     use super::{
         arrange_landed, cancel_pending_restore, cancel_pending_zoom_observe, centered_frame,
         display_move_staging_frame, display_move_target, fills_visible, infer_state,
-        neighbor_screen, plan, rect_close, rect_close_with, snap_follow_up, snap_frames,
-        with_pending_restore, with_pending_zoom_observe, with_previous_frames, AxRect,
-        DirectTarget, Direction, PendingFrame, PendingRestore, PendingZoomObserve, Plan,
-        PreviousFrameStore, SavedFrame, ScreenGeometry, SnapFollowUp, SnapState, SnapWrite,
-        SNAP_EPSILON,
+        make_pending_snap, neighbor_screen, plan, rect_close_with, small_window_frame,
+        snap_follow_up, snap_frames, snap_settle_timeout_follow_up, with_pending_restore,
+        with_pending_zoom_observe, with_previous_frames, AxRect, DirectTarget, Direction,
+        PendingFrame, PendingRestore, PendingZoomObserve, Plan, PreviousFrameStore, SavedFrame,
+        ScreenGeometry, SnapFallback, SnapFollowUp, SnapState, SnapWrite, SNAP_EPSILON,
     };
 
     /// The restore snapshot is keyed by (pid, CGWindowID): a recycled window id must not answer
@@ -2759,34 +2946,163 @@ mod tests {
     fn snap_follow_up_covers_the_measured_app_classes() {
         // Apps that land in one frame (Telegram/Edge/ChatGPT/RustRover): a match is final.
         assert_eq!(
-            snap_follow_up(true, false, false, false),
+            snap_follow_up(true, false, false, false, SnapFallback::Zoom),
             SnapFollowUp::Done
         );
-        assert_eq!(snap_follow_up(true, true, true, true), SnapFollowUp::Done);
+        assert_eq!(
+            snap_follow_up(true, true, true, true, SnapFallback::Zoom),
+            SnapFollowUp::Done
+        );
         // Animating apps (Ghostty/Finder/PeachPic): it moved but has not arrived -> postpone the
         // size write past the animation.
         assert_eq!(
-            snap_follow_up(false, false, false, false),
+            snap_follow_up(false, false, false, false, SnapFallback::Zoom),
             SnapFollowUp::RetryAfterSettle
         );
         // Still short after the postponed write (a wide grid snap, say): accept the app's result and
         // never press the toggle.
         assert_eq!(
-            snap_follow_up(false, false, false, true),
+            snap_follow_up(false, false, false, true, SnapFallback::Zoom),
             SnapFollowUp::GiveUp
         );
         // An explicitly rejected write ("accepts AXPosition but rejects AXSize"): finish with the
         // app's own zoom.
         assert_eq!(
-            snap_follow_up(false, true, false, false),
+            snap_follow_up(false, true, false, false, SnapFallback::Zoom),
             SnapFollowUp::ZoomFallback
         );
         // The window did not move at all: it ignores frame writes, so the zoom action is the useful
         // one.
         assert_eq!(
-            snap_follow_up(false, false, true, false),
+            snap_follow_up(false, false, true, false, SnapFallback::Zoom),
             SnapFollowUp::ZoomFallback
         );
+    }
+
+    /// A shrink must never be turned into a maximize by the fallback: with `SnapFallback::None` no
+    /// input reaches `ZoomFallback`, and the first unchanged write still enters the bounded settle.
+    #[test]
+    fn snap_follow_up_never_zooms_when_the_fallback_is_disallowed() {
+        for matched in [false, true] {
+            for errored in [false, true] {
+                for untouched in [false, true] {
+                    for settled_retry in [false, true] {
+                        let follow_up = snap_follow_up(
+                            matched,
+                            errored,
+                            untouched,
+                            settled_retry,
+                            SnapFallback::None,
+                        );
+                        let context = format!(
+                            "matched={matched} errored={errored} untouched={untouched} settled_retry={settled_retry}"
+                        );
+                        assert_ne!(follow_up, SnapFollowUp::ZoomFallback, "{context}");
+                        if matched {
+                            assert_eq!(follow_up, SnapFollowUp::Done, "{context}");
+                        } else if errored || settled_retry {
+                            // An explicit write error, or the bounded settle running out of waits:
+                            // with no zoom available the write gives up on the frame it produced.
+                            assert_eq!(follow_up, SnapFollowUp::GiveUp, "{context}");
+                        } else {
+                            // touched or not, the first unchanged write still enters the bounded
+                            // settle when zoom is disallowed.
+                            assert_eq!(follow_up, SnapFollowUp::RetryAfterSettle, "{context}");
+                        }
+                    }
+                }
+            }
+        }
+        // The exact combination the settle-timeout path evaluates.
+        assert_eq!(
+            snap_settle_timeout_follow_up(true, SnapFallback::None),
+            SnapFollowUp::GiveUp
+        );
+        assert_eq!(
+            snap_settle_timeout_follow_up(false, SnapFallback::None),
+            SnapFollowUp::GiveUp
+        );
+        // Zoom is still offered exactly where the old behaviour put it.
+        assert_eq!(
+            snap_settle_timeout_follow_up(true, SnapFallback::Zoom),
+            SnapFollowUp::ZoomFallback
+        );
+        assert_eq!(
+            snap_settle_timeout_follow_up(false, SnapFallback::Zoom),
+            SnapFollowUp::GiveUp
+        );
+    }
+
+    /// The no-zoom policy must survive into the job the settle actually uses, or the timeout would
+    /// re-enable the maximize fallback.
+    #[test]
+    fn make_pending_snap_keeps_the_fallback_policy() {
+        let target = rect(10.0, 20.0, 300.0, 200.0);
+        let job = make_pending_snap(
+            42,
+            7,
+            target,
+            false,
+            SnapState::Normal,
+            SnapFallback::None,
+            None,
+            None,
+        );
+        assert_eq!(job.fallback, SnapFallback::None);
+        assert_eq!(job.pid, 42);
+        assert_eq!(job.cgwid, 7);
+        let zoom = make_pending_snap(
+            1,
+            2,
+            target,
+            true,
+            SnapState::Maximized,
+            SnapFallback::Zoom,
+            None,
+            None,
+        );
+        assert_eq!(zoom.fallback, SnapFallback::Zoom);
+    }
+
+    #[test]
+    fn small_window_frame_contract_holds() {
+        // A normal visible area: strictly smaller on both axes, centered, inside it.
+        let visible = rect(0.0, 25.0, 1920.0, 1055.0);
+        let target = small_window_frame(visible);
+        assert!(target.w < visible.w && target.h < visible.h);
+        assert!((target.x - (visible.x + (visible.w - target.w) / 2.0)).abs() < 1e-9);
+        assert!((target.y - (visible.y + (visible.h - target.h) / 2.0)).abs() < 1e-9);
+        assert!(target.x >= visible.x && target.y >= visible.y);
+        assert!(target.x + target.w <= visible.x + visible.w);
+        assert!(target.y + target.h <= visible.y + visible.h);
+        assert_eq!(infer_state(target, visible), SnapState::Normal);
+
+        // A dimension at or below its floor is allowed to fill the visible area.
+        let tiny = rect(0.0, 0.0, 480.0, 320.0);
+        assert_eq!(
+            (small_window_frame(tiny).w, small_window_frame(tiny).h),
+            (480.0, 320.0)
+        );
+
+        // The tolerance degeneracy the plan pins: both margins stay within 2*SNAP_EPSILON, so the
+        // frame reads as maximized although it is geometrically smaller.
+        let degenerate = rect(0.0, 0.0, 500.0, 350.0);
+        let target = small_window_frame(degenerate);
+        assert_eq!((target.w, target.h), (480.0, 320.0));
+        assert_eq!(infer_state(target, degenerate), SnapState::Maximized);
+
+        // A screen large enough that the margin exceeds the tolerance reads as normal.
+        let large = rect(0.0, 0.0, 1440.0, 900.0);
+        assert_eq!(
+            infer_state(small_window_frame(large), large),
+            SnapState::Normal
+        );
+
+        // The visible origin is preserved by the centering.
+        let offset = rect(100.0, 50.0, 1440.0, 900.0);
+        let target = small_window_frame(offset);
+        assert!((target.x - (100.0 + (1440.0 - target.w) / 2.0)).abs() < 1e-9);
+        assert!((target.y - (50.0 + (900.0 - target.h) / 2.0)).abs() < 1e-9);
     }
 
     #[test]

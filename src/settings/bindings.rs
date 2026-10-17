@@ -1408,7 +1408,23 @@ pub(crate) fn add_action_at(index: usize) -> Option<Action> {
 
 /// Every bindable action, in picker order (the registry order grouped for reading).
 pub(crate) fn picker_actions() -> Vec<Action> {
-    crate::key_bindings::ALL.to_vec()
+    let mut actions = crate::key_bindings::ALL.to_vec();
+    // Display order only: the two Finder variants read as one pair. The registry index (the bridge
+    // value) is frozen and must not move.
+    if let Some(small) = actions
+        .iter()
+        .position(|action| *action == Action::OpenFinderSmall)
+    {
+        let small = actions.remove(small);
+        match actions
+            .iter()
+            .position(|action| *action == Action::OpenFinder)
+        {
+            Some(finder) => actions.insert(finder + 1, small),
+            None => actions.push(small),
+        }
+    }
+    actions
 }
 
 /// The popup row a binding's action sits on, or the first row when there is nothing to prefill.
@@ -1971,6 +1987,26 @@ mod tests {
         assert_eq!(chord_text_for(Some(&binding("not-a-chord"))), "not-a-chord");
         // Add mode has nothing to show, so it says so.
         assert_eq!(chord_text_for(None), t("settings.binding_panel_no_chord"));
+    }
+
+    /// The two Finder variants are one pair in the picker even though their frozen registry indices
+    /// are far apart. The display order must stay a permutation of the registry and map back to the
+    /// same action through the popup index.
+    #[test]
+    fn the_picker_keeps_the_two_finder_variants_adjacent() {
+        let actions = picker_actions();
+        let mut by_index = actions.clone();
+        by_index.sort_by_key(|action| action.index());
+        assert_eq!(by_index, crate::key_bindings::ALL.to_vec());
+        let finder = actions
+            .iter()
+            .position(|action| *action == Action::OpenFinder)
+            .expect("OpenFinder is in the picker");
+        assert_eq!(actions[finder + 1], Action::OpenFinderSmall);
+        for action in [Action::OpenFinder, Action::OpenFinderSmall] {
+            let index = picker_index_for(Some(action));
+            assert_eq!(add_action_at(index), Some(action), "{action:?}");
+        }
     }
 
     /// The recorded sentence names an action, so it must be rebuilt when the action changes; leaving

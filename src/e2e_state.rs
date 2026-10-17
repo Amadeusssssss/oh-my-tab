@@ -38,6 +38,42 @@ static OTHER_DESKTOP_RAISE: std::sync::LazyLock<
 static LAST_COMMIT: std::sync::LazyLock<std::sync::Mutex<Option<(u64, CommitRecord)>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
+/// The last Finder quick-action target. The small-window binding's whole promise is a size the app
+/// computed from the screen's work area, and AX cannot express "the screen's visibleFrame"; the A2
+/// scenario reads the visible area and the requested frame here instead of inferring them from
+/// another window's frame.
+#[derive(Clone, Copy)]
+struct FinderQuickAction {
+    mode: &'static str,
+    /// The CGWindowID the action actually shaped. The scenario uses this as the window's identity
+    /// instead of diffing Finder's whole window set, so a window it cannot identify can never be
+    /// mistaken for the one the action created.
+    window_id: u32,
+    visible: (f64, f64, f64, f64),
+    target: (f64, f64, f64, f64),
+}
+static FINDER_QUICK_ACTION: std::sync::LazyLock<std::sync::Mutex<Option<FinderQuickAction>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Record the work area a Finder quick action used and the frame it asked for, then publish a frame.
+pub(crate) fn record_finder_quick_action(
+    mode: &'static str,
+    window_id: u32,
+    visible: (f64, f64, f64, f64),
+    target: (f64, f64, f64, f64),
+) {
+    if !is_enabled() {
+        return;
+    }
+    *FINDER_QUICK_ACTION.lock().unwrap() = Some(FinderQuickAction {
+        mode,
+        window_id,
+        visible,
+        target,
+    });
+    record("finder_quick_action");
+}
+
 #[derive(Clone, Copy)]
 struct CommitRecord {
     pid: i32,
@@ -872,6 +908,28 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         AX_ACTIONS.load(std::sync::atomic::Ordering::Relaxed)
     ));
     json.push_str(&format!("  \"visible\": {},\n", snapshot.visible));
+    let finder_quick_action = {
+        let slot = FINDER_QUICK_ACTION.lock().unwrap();
+        match slot.as_ref() {
+            Some(action) => format!(
+                "{{\"mode\": {}, \"window_id\": {}, \"visible\": {{\"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}}}, \"target\": {{\"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}}}}}",
+                json_string(action.mode),
+                action.window_id,
+                action.visible.0,
+                action.visible.1,
+                action.visible.2,
+                action.visible.3,
+                action.target.0,
+                action.target.1,
+                action.target.2,
+                action.target.3,
+            ),
+            None => "null".to_string(),
+        }
+    };
+    json.push_str(&format!(
+        "  \"finder_quick_action\": {finder_quick_action},\n"
+    ));
     json.push_str(&format!(
         "  \"settings_window_visible\": {},\n",
         crate::settings::settings_window_is_visible()

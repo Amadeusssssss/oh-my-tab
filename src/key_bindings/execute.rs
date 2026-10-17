@@ -108,7 +108,12 @@ pub(crate) fn execute(action: Action) {
             crate::window_management::DirectTarget::QuarterBottomRight,
         ),
         Action::OpenSettings => crate::quick_actions::open_system_settings(),
-        Action::OpenFinder => crate::quick_actions::open_new_finder_window(),
+        Action::OpenFinder => crate::quick_actions::open_new_finder_window(
+            crate::quick_actions::FinderWindowMode::Maximized,
+        ),
+        Action::OpenFinderSmall => crate::quick_actions::open_new_finder_window(
+            crate::quick_actions::FinderWindowMode::Small,
+        ),
         Action::LockScreen => crate::quick_actions::lock_screen(),
         Action::LocatePointer => crate::pointer_locator::show(),
         // The four Dock notifications the mouse mappings already fire; "show desktop" is the same

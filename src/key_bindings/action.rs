@@ -76,10 +76,13 @@ pub(crate) enum Action {
     /// window, so they belong to QuickActions and are not window-scoped.
     HideAllWindows = 33,
     ShowAllWindows = 34,
+    /// Open a new Finder window at a small fixed size instead of the maximized one
+    /// (`OpenFinder`); the two are separate bindings.
+    OpenFinderSmall = 35,
 }
 
 /// Every action, in the frozen index order. The settings picker walks this list.
-pub(crate) const ALL: [Action; 35] = [
+pub(crate) const ALL: [Action; 36] = [
     Action::SnapUp,
     Action::SnapDown,
     Action::SnapLeft,
@@ -115,6 +118,7 @@ pub(crate) const ALL: [Action; 35] = [
     Action::RestorePrevious,
     Action::HideAllWindows,
     Action::ShowAllWindows,
+    Action::OpenFinderSmall,
 ];
 
 impl Action {
@@ -167,6 +171,7 @@ impl Action {
             Self::RestorePrevious => "window.restore_previous",
             Self::HideAllWindows => "quick.hide_all_windows",
             Self::ShowAllWindows => "quick.show_all_windows",
+            Self::OpenFinderSmall => "quick.open_finder_small",
         }
     }
 
@@ -239,6 +244,7 @@ impl Action {
             Self::RestorePrevious => "settings.binding_action_restore_previous",
             Self::HideAllWindows => "settings.binding_action_hide_all_windows",
             Self::ShowAllWindows => "settings.binding_action_show_all_windows",
+            Self::OpenFinderSmall => "settings.binding_action_open_finder_small",
         }
     }
 
@@ -289,12 +295,13 @@ mod tests {
         assert_eq!(Action::RestorePrevious.index(), 32);
         assert_eq!(Action::HideAllWindows.index(), 33);
         assert_eq!(Action::ShowAllWindows.index(), 34);
-        assert_eq!(ALL.len(), 35);
+        assert_eq!(Action::OpenFinderSmall.index(), 35);
+        assert_eq!(ALL.len(), 36);
         for (index, action) in ALL.iter().enumerate() {
             assert_eq!(action.index() as usize, index, "{action:?}");
             assert_eq!(Action::from_index(index as u16), Some(*action));
         }
-        assert_eq!(Action::from_index(35), None);
+        assert_eq!(Action::from_index(36), None);
         assert_eq!(Action::from_index(u16::MAX), None);
     }
 

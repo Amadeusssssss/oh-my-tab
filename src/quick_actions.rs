@@ -17,6 +17,14 @@ use crate::ffi::{make_nsstring, CFRelease};
 use crate::log_debug;
 use std::ffi::c_void;
 
+/// Which window shape the Finder quick action asks for. The two are separate bindings: maximized is
+/// the historical behaviour, small opens a fixed-size centered window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinderWindowMode {
+    Maximized,
+    Small,
+}
+
 /// Open System Settings via the x-apple.systempreferences: URL scheme; LaunchServices launches or
 /// raises it. "Open Settings" means the system's settings, not this app's window.
 pub(crate) fn open_system_settings() {
@@ -72,16 +80,15 @@ pub(crate) fn lock_screen() {
 /// Cmd+N straight to Finder's process via CGEventPostToPid -- pid-targeted delivery does not depend
 /// on activation timing: Finder itself always dequeues it and creates the window. The new window is
 /// created asynchronously: remember the focused-window id before Cmd+N, poll until the focused
-/// window id changes (the new window has appeared), then maximize it right away (zoom, NOT
-/// fullscreen). AX calls need the main thread; this function already runs there. The app holds the
-/// Accessibility permission (its event taps require it), so synthesizing keystrokes and AX writes
-/// is legitimate.
-pub(crate) fn open_new_finder_window() {
+/// window id changes (the new window has appeared), then apply `mode`'s shape right away. AX calls
+/// need the main thread; this function already runs there. The app holds the Accessibility
+/// permission (its event taps require it), so synthesizing keystrokes and AX writes is legitimate.
+pub(crate) fn open_new_finder_window(mode: FinderWindowMode) {
     unsafe {
         let mut finder_app = find_finder_app();
         if finder_app.is_null() {
             // Finder not running: openURL: launches it via LaunchServices with the home folder;
-            // wait for the launch, then maximize the window the same way.
+            // wait for the launch, then shape the window the same way.
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
             let path = make_nsstring(&home);
             // fileURLWithPath: returns an autoreleased NSURL (+0) we do not own; never release.
@@ -103,12 +110,16 @@ pub(crate) fn open_new_finder_window() {
                 return;
             }
             let pid: i32 = msg_send![finder_app, processIdentifier];
-            // The launch-opened folder window IS the new window; maximize once it shows in AX.
+            // The launch-opened folder window IS the new window; shape once it shows in AX.
             for _ in 0..12 {
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 if crate::window_management::focused_cgwid_of_pid(pid).is_some() {
-                    let ok = crate::window_management::maximize_focused_window_of_pid(pid);
-                    log_debug!("[quick] launched Finder window maximized: {}", ok);
+                    let ok = apply_finder_window_mode(pid, mode);
+                    log_debug!(
+                        "[quick] launched Finder window shaped: {:?} ok={}",
+                        mode,
+                        ok
+                    );
                     return;
                 }
             }
@@ -128,13 +139,24 @@ pub(crate) fn open_new_finder_window() {
             let cur = crate::window_management::focused_cgwid_of_pid(pid);
             if let Some(cgwid) = cur {
                 if Some(cgwid) != prev_cgwid {
-                    let ok = crate::window_management::maximize_focused_window_of_pid(pid);
-                    log_debug!("[quick] new Finder window maximized: {}", ok);
+                    let ok = apply_finder_window_mode(pid, mode);
+                    log_debug!("[quick] new Finder window shaped: {:?} ok={}", mode, ok);
                     return;
                 }
             }
         }
         log_debug!("[quick] new Finder window did not appear in time");
+    }
+}
+
+/// Apply the requested shape to Finder's focused window. Both branches share this so a mode cannot
+/// be wired into one branch and forgotten in the other.
+fn apply_finder_window_mode(pid: i32, mode: FinderWindowMode) -> bool {
+    match mode {
+        FinderWindowMode::Maximized => {
+            crate::window_management::maximize_focused_window_of_pid(pid)
+        }
+        FinderWindowMode::Small => crate::window_management::shrink_focused_window_of_pid(pid),
     }
 }
 
