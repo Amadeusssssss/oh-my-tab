@@ -50,7 +50,7 @@ use crate::thumbnail;
 use crate::window_collector::{
     bump_window_mru, collect_windows_for_pid, collect_windows_with_frontmost_bump,
     forget_ax_identified_window, forget_non_normal_window, owner_pid_for_cgwid,
-    sort_windows_by_mru, window_server_candidates, MruMap, WindowInfo,
+    sort_windows_by_mru, CollectionPass, MruMap, WindowInfo,
 };
 use crate::window_server;
 use crate::{log_debug, with_tab_state, AppState, CONTROLLER, WINDOW_COUNT};
@@ -106,6 +106,12 @@ struct WindowRefreshResult {
     // Exact frontmost window resolved during a first-summon refresh.  This must be carried
     // alongside the snapshot so the first frame does not reuse a stale same-PID focus_key.
     summon_focus_key: Option<(i32, u32)>,
+    /// The WindowServer-observation set, taken from the collection pass's own CG snapshot.
+    ///
+    /// `None` means the pass produced no snapshot; the apply stage then keeps the current
+    /// subscriptions instead of clearing them. Carrying this is what removed a full
+    /// `CGWindowListCopyWindowInfo` from the main thread on every apply.
+    subscriptions: Option<Vec<(u32, i32)>>,
 }
 
 static WINDOW_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -460,35 +466,44 @@ fn start_window_refresh(
                 | WindowRefreshRequest::Focused { .. } => performance::ThreadQos::Utility,
             });
             let mut mru = mru;
-            let (windows, replace_pid, active_key, summon_focus_key) = match request {
+            let (pass, replace_pid, active_key, summon_focus_key) = match request {
                 WindowRefreshRequest::Full(reason) => {
                     let bump_frontmost = reason.bumps_frontmost() && allow_bump;
-                    let windows = collect_windows_with_frontmost_bump(&mut mru, bump_frontmost);
+                    let pass = collect_windows_with_frontmost_bump(&mut mru, bump_frontmost);
                     // collect_windows_with_frontmost_bump marks the exact frontmost window as
                     // the first active item after sorting. Preserve that key for first-summon
                     // selection; lifecycle refreshes intentionally do not provide this value.
                     let summon_focus_key = if bump_frontmost {
-                        windows
+                        pass.windows
                             .iter()
                             .find(|window| window.is_active)
                             .map(|window| (window.pid, window.window_id))
                     } else {
                         None
                     };
-                    (windows, None, None, summon_focus_key)
+                    (pass, None, None, summon_focus_key)
                 }
                 WindowRefreshRequest::Focused { pid, window_id } => {
                     match collect_windows_for_pid(&mut mru, pid, window_id) {
-                        Some(windows) => {
-                            let active_key = windows
+                        Some(collected) => {
+                            let active_key = collected
+                                .windows
                                 .iter()
                                 .any(|window| window.window_id == window_id)
                                 .then_some((pid, window_id));
-                            (windows, Some(pid), active_key, None)
+                            // A directed pass that took no snapshot carries None, which the apply
+                            // stage treats as "keep the current subscriptions"; it is not an
+                            // empty set and must not clear the registry.
+                            let pass = CollectionPass {
+                                windows: collected.windows,
+                                subscriptions: collected.subscriptions,
+                            };
+                            (pass, Some(pid), active_key, None)
                         }
                         None => {
                             // Fall back to a full snapshot when the directed AX query fails, so
-                            // a transient timeout cannot erase the target app's cards.
+                            // a transient timeout cannot erase the target app's cards. The full
+                            // pass supplies the subscription set in that case.
                             log_debug!(
                                 "[windows] focused refresh fallback: pid={} cgwid={}",
                                 pid,
@@ -504,6 +519,16 @@ fn start_window_refresh(
                     }
                 }
             };
+            // A pass that produced no subscription snapshot (a hidden app's early return is the
+            // normal case) tries the agreed fallback HERE, on the worker: one full enumeration
+            // for the subscription set only. Doing nothing instead would leave the observed set
+            // stale for as long as the directed refreshes keep returning no snapshot.
+            let subscriptions = match pass.subscriptions {
+                Some(snapshot) => Some(snapshot),
+                // The fallback keeps the failure/success distinction: a failed enumeration is
+                // None (keep the current registry), a successful empty one is Some(vec![]).
+                None => crate::window_collector::window_server_candidates_checked(),
+            };
             // The pass the collection just filled on this thread: carried in the result so only the
             // apply that accepts this result publishes its observations.
             let scope_pass = crate::thumbnail::take_current_scope_pass();
@@ -514,11 +539,12 @@ fn start_window_refresh(
                 space_transition_generation,
                 scope_pass,
                 ax_pid_evidence,
-                windows,
+                windows: pass.windows,
                 mru,
                 replace_pid,
                 active_key,
                 summon_focus_key,
+                subscriptions,
             });
             let controller = CONTROLLER.lock().unwrap().map(|ptr| ptr.0);
             if let Some(controller) = controller {
@@ -697,7 +723,12 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     // Read before the closure consumes the result: the evidence is published per pass kind.
     let applied_replace_pid = result.replace_pid;
     let summon_focus_key = result.summon_focus_key;
-    let subscriptions = window_server_candidates();
+    // Carried by the collection pass itself. This used to enumerate every window again here on
+    // the main thread, right after the worker had already enumerated them.
+    //
+    // None = the pass produced no snapshot. That keeps the current subscriptions rather than
+    // clearing them: an unavailable snapshot is not evidence that nothing should be watched.
+    let subscriptions = result.subscriptions;
 
     let applied =
         crate::space_transition::while_stable(result.space_transition_generation, || {
@@ -912,7 +943,11 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
         }
     }
     // WindowServer observes every CG candidate instead of only AX-confirmed display cards.
-    window_server::update_subscriptions(&subscriptions);
+    // A pass that produced no subscription snapshot leaves the registry untouched rather than
+    // emptying it -- including the hidden-app early return, which legitimately has no snapshot.
+    if let Some(subscriptions) = subscriptions.as_deref() {
+        window_server::update_subscriptions(subscriptions);
+    }
     if let Some(request) = pending_request {
         request_window_refresh_request(request);
     }
@@ -1185,6 +1220,7 @@ mod tests {
             replace_pid: None,
             active_key: None,
             summon_focus_key: None,
+            subscriptions: None,
         });
 
         assert!(recover_stalled_deferred_refresh(generation, token));
@@ -1203,6 +1239,7 @@ mod tests {
             replace_pid: None,
             active_key: None,
             summon_focus_key: None,
+            subscriptions: None,
         });
         assert!(!recover_stalled_deferred_refresh(generation, token + 1));
         assert!(WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));

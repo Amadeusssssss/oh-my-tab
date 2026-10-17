@@ -6,7 +6,7 @@
 //! module owns the state machine (R1–R6 in the plan) and the purge transaction.
 
 use super::*;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 
 /// The history CONTENT format version (bump on structural changes; a higher version is
@@ -218,16 +218,27 @@ struct PersistJob {
 
 /// One serial worker coalesces consecutive snapshots to the newest one, keeping copy events
 /// from blocking the main thread on TOML serialization, encryption and filesystem I/O.
-static PERSIST_SENDER: OnceLock<Sender<PersistJob>> = OnceLock::new();
+///
+/// The queue is a single slot plus a bounded wake channel, not an unbounded channel of full
+/// snapshots. The old shape kept every snapshot a burst produced: the worker only merged the
+/// backlog *after* taking a job, so a stalled writer (a slow keychain, a slow disk) let the
+/// producer pile up whole histories. Now the pending backlog is at most one snapshot, and the
+/// producer never waits for capacity or for disk I/O -- it overwrites the slot and leaves a wake
+/// token. The worker, the slot and the producer can still each hold a snapshot at the same
+/// instant, and the slot mutex can still be contended; only the backlog is bounded.
+static PERSIST_PENDING: Mutex<Option<PersistJob>> = Mutex::new(None);
+/// Capacity 1: a token already queued means the worker has not picked the slot up yet, so the
+/// producer's `try_send` may fail without losing anything.
+static PERSIST_SENDER: OnceLock<SyncSender<()>> = OnceLock::new();
 static PERSIST_GENERATION: AtomicU64 = AtomicU64::new(0);
 static PERSIST_IO_LOCK: Mutex<()> = Mutex::new(());
 /// The newest generation the worker has processed (coalesced-away jobs count as
 /// processed): tests wait on it so the async writeback settles deterministically.
 static PERSIST_DONE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn persist_sender() -> &'static Sender<PersistJob> {
+fn persist_sender() -> &'static SyncSender<()> {
     PERSIST_SENDER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("oh-my-tab-clipboard-persist".to_string())
             .spawn(|| persist_worker(receiver))
@@ -236,17 +247,73 @@ fn persist_sender() -> &'static Sender<PersistJob> {
     })
 }
 
-fn persist_worker(receiver: Receiver<PersistJob>) {
-    while let Ok(mut job) = receiver.recv() {
-        // A burst of copies can queue several full snapshots; keep only the newest to reduce
-        // serialization and filesystem work.
-        while let Ok(newer) = receiver.try_recv() {
-            job = newer;
-        }
-        let done_generation = job.generation;
-        write_history_snapshot(job);
-        PERSIST_DONE_GENERATION.store(done_generation, Ordering::Release);
+/// Whether an incoming snapshot may take the slot from a pending one.
+///
+/// A newer snapshot replaces an older pending one; an older snapshot never replaces a newer one,
+/// because a late job must not resurrect content a later one already dropped. Equal generations
+/// replace, which keeps a re-submission of the same state harmless.
+fn should_replace_pending(pending: Option<u64>, incoming: u64) -> bool {
+    match pending {
+        None => true,
+        Some(existing) => incoming >= existing,
     }
+}
+
+/// Test-only consumer pause. While the writer holds the inner lock, the worker blocks before
+/// taking the slot, so a queue test can assert what is pending without racing the consumer.
+/// Outside `cfg(test)` this does not exist and the worker has no such branch.
+#[cfg(test)]
+pub(super) fn pause_consumer_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    CONSUMER_PAUSE.lock().unwrap()
+}
+
+#[cfg(test)]
+static CONSUMER_PAUSE: Mutex<()> = Mutex::new(());
+
+/// Hand a snapshot to the worker without blocking. A newer snapshot replaces a pending older one;
+/// an older snapshot never replaces a newer one (a late job must not resurrect content a later
+/// one dropped).
+fn enqueue_persist_job(job: PersistJob) {
+    {
+        let mut pending = PERSIST_PENDING.lock().unwrap();
+        if !should_replace_pending(
+            pending.as_ref().map(|existing| existing.generation),
+            job.generation,
+        ) {
+            return;
+        }
+        *pending = Some(job);
+    }
+    // Full means a wake is already queued and the worker will drain the slot: nothing to add.
+    let _ = persist_sender().try_send(());
+}
+
+fn persist_worker(receiver: Receiver<()>) {
+    while receiver.recv().is_ok() {
+        // Drain the slot. A snapshot overwritten while the worker was writing is simply newer
+        // than the one it replaced, so the loop always ends on the newest pending snapshot.
+        loop {
+            // Test seam: the pause guard is held across the TAKE ITSELF, not merely checked before
+            // it. A check that is released first leaves the window the review found -- the guard
+            // could be acquired by a test after the check passed and before the slot was taken,
+            // and the consumer would then take the very snapshot the test is asserting on.
+            #[cfg(test)]
+            let _paused = pause_consumer_for_tests();
+            let taken = PERSIST_PENDING.lock().unwrap().take();
+            #[cfg(test)]
+            drop(_paused);
+            let Some(job) = taken else {
+                break;
+            };
+            let done_generation = job.generation;
+            write_history_snapshot(job);
+            // Advance by the generation actually written. Reporting the global latest here would
+            // let a waiter for a snapshot that is still in the slot observe completion before it
+            // is on disk -- a gate reporting PASS for work that has not happened.
+            PERSIST_DONE_GENERATION.fetch_max(done_generation, Ordering::AcqRel);
+        }
+    }
+    log_info!("Clipboard persistence worker stopped; further saves are dropped.");
 }
 
 /// Test helper: wait until the worker has drained every snapshot up to the current
@@ -399,9 +466,7 @@ pub(super) fn save_history() {
         path: history_file_path(),
         entries,
     };
-    if persist_sender().send(job).is_err() {
-        log_info!("Clipboard history save failed: persistence worker stopped.");
-    }
+    enqueue_persist_job(job);
 }
 
 /// One log line per session when saving is off (a per-copy log would flood).
@@ -1925,6 +1990,130 @@ mod encryption_tests {
             source_key: String::new(),
             copied_at: Some(now_secs()),
         }
+    }
+
+    /// A synthetic job for the queue tests.
+    fn queued_job(generation: u64, text: &str) -> PersistJob {
+        PersistJob {
+            generation,
+            storage_generation: storage::generation(),
+            path: history_file_path(),
+            entries: vec![text_entry(text)],
+        }
+    }
+
+    /// The seam's observable half: while a test holds the pause guard, the real consumer does not
+    /// take the slot, and releasing it lets the consumer drain and settle the watermark.
+    ///
+    /// What this does NOT prove: that the guard covers the take rather than merely preceding it.
+    /// Both forms leave the consumer blocked on lock acquisition, so no external test can tell
+    /// them apart -- the only difference is inside the window between releasing and taking, which
+    /// a test cannot deterministically hit. That half is a structural invariant: persist_worker
+    /// must hold the guard across PERSIST_PENDING.take() in one scope; dropping it earlier is the
+    /// regression to watch for.
+    #[test]
+    fn the_pause_guard_blocks_the_consumer_from_taking_the_slot() {
+        let _guard = guard();
+        PERSIST_PENDING.lock().unwrap().take();
+        let paused = pause_consumer_for_tests();
+        let generation = PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+        enqueue_persist_job(queued_job(generation, "blocked"));
+        // Park the consumer on the lock, then give it every chance to run: if the take were not
+        // covered by the guard, it would clear the slot here.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!(
+            PERSIST_PENDING
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|j| j.generation),
+            Some(generation),
+            "the consumer must not take the slot while the pause guard is held"
+        );
+        drop(paused);
+        flush_persist_worker_for_tests();
+        assert!(
+            PERSIST_PENDING.lock().unwrap().is_none(),
+            "releasing the guard lets the real consumer drain it"
+        );
+    }
+    /// The bound the unbounded queue did not have, asserted through the PRODUCTION enqueue path
+    /// while the REAL consumer is held stopped, so nothing can take the slot between the
+    /// submission and the assertion.
+    #[test]
+    fn a_burst_of_saves_leaves_at_most_one_pending_snapshot() {
+        let _guard = guard();
+        let paused = pause_consumer_for_tests();
+        PERSIST_PENDING.lock().unwrap().take();
+        let mut newest = 0;
+        for _ in 0..200 {
+            let generation = PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+            newest = generation;
+            enqueue_persist_job(queued_job(generation, "burst"));
+        }
+        let pending = PERSIST_PENDING.lock().unwrap();
+        assert_eq!(
+            pending.as_ref().map(|job| job.generation),
+            Some(newest),
+            "the slot holds the newest snapshot, not a queue of every one"
+        );
+        drop(pending);
+        // Let the consumer take the newest snapshot and write it: the coalesced-away generations
+        // count as processed when the newer one lands, which is the semantics the worker already
+        // had. Clearing the slot here instead would leave those generations unwritten forever.
+        drop(paused);
+        flush_persist_worker_for_tests();
+    }
+
+    /// A late, older snapshot must never replace a newer pending one: that would resurrect
+    /// content a later save had already dropped. Production enqueue path, consumer stopped.
+    #[test]
+    fn an_older_snapshot_never_replaces_a_newer_pending_one() {
+        let _guard = guard();
+        let paused = pause_consumer_for_tests();
+        PERSIST_PENDING.lock().unwrap().take();
+        let newer = PERSIST_GENERATION.fetch_add(10, Ordering::AcqRel) + 10;
+        enqueue_persist_job(queued_job(newer, "newer"));
+        enqueue_persist_job(queued_job(newer - 5, "older"));
+        let pending = PERSIST_PENDING.lock().unwrap();
+        assert_eq!(
+            pending.as_ref().map(|job| job.generation),
+            Some(newer),
+            "an older snapshot must not displace a newer one"
+        );
+        drop(pending);
+        drop(paused);
+        flush_persist_worker_for_tests();
+    }
+
+    /// The unbounded queue this replaced let a stalled writer accumulate whole histories.
+    /// With the consumer actually stopped, a thousand submissions must stay at one pending slot.
+    #[test]
+    fn enqueueing_never_blocks_on_a_stalled_worker_and_stays_bounded() {
+        let _guard = guard();
+        let paused = pause_consumer_for_tests();
+        PERSIST_PENDING.lock().unwrap().take();
+        let started = std::time::Instant::now();
+        let mut newest = 0;
+        for _ in 0..1000 {
+            let generation = PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+            newest = generation;
+            enqueue_persist_job(queued_job(generation, "stalled"));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "enqueueing must not wait on the worker or the disk"
+        );
+        assert_eq!(
+            PERSIST_PENDING
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|j| j.generation),
+            Some(newest)
+        );
+        drop(paused);
+        flush_persist_worker_for_tests();
     }
 
     /// The core promise: the disk never holds the history in the clear.

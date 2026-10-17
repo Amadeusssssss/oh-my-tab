@@ -1,6 +1,7 @@
 //! Exact per-window raising through the SLPS private APIs.
 
 use super::*;
+use crate::ffi::RetainedCf;
 
 // Private APIs (loaded via skylight.rs's shared dlopen/dlsym helpers).
 
@@ -311,6 +312,105 @@ pub(crate) fn cf_string_new(s: &str) -> *const c_void {
     unsafe { CFStringCreateWithCString(std::ptr::null(), c_str.as_ptr(), 0x08000100) }
 }
 
+/// The closed set of CG/WindowServer dictionary keys this crate reads.
+///
+/// A closed enum rather than a `&str` parameter: every caller passes one of these literals, and
+/// naming them once is what lets each key's CFString be created a single time. There is no table
+/// with a capacity to overflow and no per-call allocation -- the two failure modes a string-keyed
+/// cache had.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CgKey {
+    Layer,
+    OwnerPid,
+    Number,
+    Bounds,
+    Alpha,
+    IsOnscreen,
+    OwnerName,
+    Name,
+    X,
+    Y,
+    Width,
+    Height,
+}
+
+impl CgKey {
+    fn literal(self) -> &'static str {
+        match self {
+            CgKey::Layer => "kCGWindowLayer",
+            CgKey::OwnerPid => "kCGWindowOwnerPID",
+            CgKey::Number => "kCGWindowNumber",
+            CgKey::Bounds => "kCGWindowBounds",
+            CgKey::Alpha => "kCGWindowAlpha",
+            CgKey::IsOnscreen => "kCGWindowIsOnscreen",
+            CgKey::OwnerName => "kCGWindowOwnerName",
+            CgKey::Name => "kCGWindowName",
+            CgKey::X => "X",
+            CgKey::Y => "Y",
+            CgKey::Width => "Width",
+            CgKey::Height => "Height",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The key's CFString, created once and held for the lifetime of the process.
+    ///
+    /// `RetainedCf` owns the +1 and would release it on drop, but a `LazyLock` static is not
+    /// dropped at exit, so the process's own teardown reclaims it. That is deliberate: promising
+    /// an orderly release for a static the program cannot order is the same mistake as caching a
+    /// raw pointer behind an integer.
+    ///
+    /// `None` means the CFString could not be created (allocation failure); the caller then takes
+    /// the temporary path in `with`, so a failed static never becomes a null key passed to CF.
+    fn cf_static(self) -> Option<*const c_void> {
+        static KEYS: std::sync::LazyLock<[Option<RetainedCf<c_void>>; 12]> =
+            std::sync::LazyLock::new(|| {
+                [
+                    CgKey::Layer,
+                    CgKey::OwnerPid,
+                    CgKey::Number,
+                    CgKey::Bounds,
+                    CgKey::Alpha,
+                    CgKey::IsOnscreen,
+                    CgKey::OwnerName,
+                    CgKey::Name,
+                    CgKey::X,
+                    CgKey::Y,
+                    CgKey::Width,
+                    CgKey::Height,
+                ]
+                .map(|key| {
+                    let created = cf_string_new(key.literal());
+                    // A null pointer must never be wrapped: RetainedCf would then be a "held"
+                    // object holding nothing, and CFDictionaryGetValue would receive null.
+                    (!created.is_null()).then(|| unsafe { RetainedCf::from_retained(created) })
+                })
+            });
+        KEYS[self.index()].as_ref().map(|held| held.ptr)
+    }
+
+    /// Run `f` with this key's CFString.
+    ///
+    /// The static key is borrowed, never released here. When the static could not be created, a
+    /// temporary is made and released again -- the pre-existing per-call behaviour, which cannot
+    /// leak. `None` (and no call to `f`) is reserved for "no usable key at all".
+    fn with<R>(self, f: impl FnOnce(*const c_void) -> R) -> Option<R> {
+        if let Some(held) = self.cf_static() {
+            return Some(f(held));
+        }
+        let temporary = cf_string_new(self.literal());
+        if temporary.is_null() {
+            log_info!("[collect] CFString for a window key could not be created");
+            return None;
+        }
+        let out = f(temporary);
+        unsafe { CFRelease(temporary) };
+        Some(out)
+    }
+}
 pub(super) unsafe fn cache_ax_window_element(
     pid: i32,
     process_start_time_us: Option<u64>,
@@ -501,20 +601,16 @@ pub(super) fn cache_ax_snapshot(
     );
 }
 
-pub(super) fn cf_dict_get_string(dict: *const c_void, key: &str) -> Option<String> {
-    let cf_key = cf_string_new(key);
-    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
-    unsafe { CFRelease(cf_key) };
+pub(super) fn cf_dict_get_string(dict: *const c_void, key: CgKey) -> Option<String> {
+    let value = key.with(|cf_key| unsafe { CFDictionaryGetValue(dict, cf_key) })?;
     if value.is_null() {
         return None;
     }
     cf_to_rust_string(value)
 }
 
-pub(super) fn cf_dict_get_i32(dict: *const c_void, key: &str) -> Option<i32> {
-    let cf_key = cf_string_new(key);
-    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
-    unsafe { CFRelease(cf_key) };
+pub(super) fn cf_dict_get_i32(dict: *const c_void, key: CgKey) -> Option<i32> {
+    let value = key.with(|cf_key| unsafe { CFDictionaryGetValue(dict, cf_key) })?;
     if value.is_null() {
         return None;
     }
@@ -527,10 +623,8 @@ pub(super) fn cf_dict_get_i32(dict: *const c_void, key: &str) -> Option<i32> {
     }
 }
 
-pub(super) fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
-    let cf_key = cf_string_new(key);
-    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
-    unsafe { CFRelease(cf_key) };
+pub(super) fn cf_dict_get_u32(dict: *const c_void, key: CgKey) -> Option<u32> {
+    let value = key.with(|cf_key| unsafe { CFDictionaryGetValue(dict, cf_key) })?;
     if value.is_null() {
         return None;
     }
@@ -545,10 +639,8 @@ pub(super) fn cf_dict_get_u32(dict: *const c_void, key: &str) -> Option<u32> {
 
 /// Read a CFNumber double from a CG dict (e.g. kCGWindowAlpha). CFNumberGetValue type 13 =
 /// kCFNumberDoubleType.
-pub(super) fn cf_dict_get_f64(dict: *const c_void, key: &str) -> Option<f64> {
-    let cf_key = cf_string_new(key);
-    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
-    unsafe { CFRelease(cf_key) };
+pub(super) fn cf_dict_get_f64(dict: *const c_void, key: CgKey) -> Option<f64> {
+    let value = key.with(|cf_key| unsafe { CFDictionaryGetValue(dict, cf_key) })?;
     if value.is_null() {
         return None;
     }
@@ -562,10 +654,8 @@ pub(super) fn cf_dict_get_f64(dict: *const c_void, key: &str) -> Option<f64> {
 }
 
 // Read a CFBoolean from a CG dict (e.g. kCGWindowIsOnscreen).
-pub(super) fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
-    let cf_key = cf_string_new(key);
-    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
-    unsafe { CFRelease(cf_key) };
+pub(super) fn cf_dict_get_bool(dict: *const c_void, key: CgKey) -> Option<bool> {
+    let value = key.with(|cf_key| unsafe { CFDictionaryGetValue(dict, cf_key) })?;
     if value.is_null() {
         return None;
     }
@@ -574,20 +664,17 @@ pub(super) fn cf_dict_get_bool(dict: *const c_void, key: &str) -> Option<bool> {
 
 /// Read kCGWindowBounds (a nested dict: X/Y/Width/Height) from a CG dict, returning (x, y, w, h).
 /// Used to determine the active window's screen (the overlay's "follow active window" placement).
-pub(super) fn cf_dict_get_bounds(dict: *const c_void, key: &str) -> Option<(f64, f64, f64, f64)> {
-    let cf_key = cf_string_new(key);
-    let value = unsafe { CFDictionaryGetValue(dict, cf_key) };
-    unsafe { CFRelease(cf_key) };
+pub(super) fn cf_dict_get_bounds(dict: *const c_void, key: CgKey) -> Option<(f64, f64, f64, f64)> {
+    let value = key.with(|cf_key| unsafe { CFDictionaryGetValue(dict, cf_key) })?;
     if value.is_null() {
         return None;
     }
-    let x = cf_dict_get_f64(value, "X")?;
-    let y = cf_dict_get_f64(value, "Y")?;
-    let w = cf_dict_get_f64(value, "Width")?;
-    let h = cf_dict_get_f64(value, "Height")?;
+    let x = cf_dict_get_f64(value, CgKey::X)?;
+    let y = cf_dict_get_f64(value, CgKey::Y)?;
+    let w = cf_dict_get_f64(value, CgKey::Width)?;
+    let h = cf_dict_get_f64(value, CgKey::Height)?;
     Some((x, y, w, h))
 }
-
 // AppIdentity / resolve_app_identity now live in crate::app_identity (breaking the
 // module cycle with icon_cache); this module imports them above.
 
@@ -866,5 +953,107 @@ mod tests {
             dropped,
             vec![key(10, 1, 100), key(10, 1, 200), key(10, 2, 300)]
         );
+    }
+}
+
+#[cfg(test)]
+mod cg_key_tests {
+    use super::*;
+
+    /// Every key resolves through the static table exactly once: the pointer for a given key is
+    /// stable across calls, and two different keys never share one.
+    #[test]
+    fn each_key_resolves_to_one_stable_cfstring() {
+        let keys = [
+            CgKey::Layer,
+            CgKey::OwnerPid,
+            CgKey::Number,
+            CgKey::Bounds,
+            CgKey::Alpha,
+            CgKey::IsOnscreen,
+            CgKey::OwnerName,
+            CgKey::Name,
+            CgKey::X,
+            CgKey::Y,
+            CgKey::Width,
+            CgKey::Height,
+        ];
+        let mut seen: Vec<*const c_void> = Vec::new();
+        for key in keys {
+            let first = key.cf_static().expect("a key CFString is created");
+            let second = key.cf_static().expect("the second lookup finds it");
+            assert_eq!(first, second, "the same key yields the same pointer");
+            assert!(
+                !seen.contains(&first),
+                "two distinct keys must not share one CFString"
+            );
+            seen.push(first);
+        }
+        assert_eq!(seen.len(), 12);
+    }
+
+    /// Repeated lookups must not allocate: the static path returns the held pointer and the
+    /// temporary path is never taken. Asserted as pointer stability over many calls, which is the
+    /// observable consequence of not creating a new object each time.
+    #[test]
+    fn repeated_lookups_never_create_a_new_key() {
+        let baseline = CgKey::OwnerPid.cf_static().expect("created");
+        for _ in 0..1000 {
+            assert_eq!(CgKey::OwnerPid.cf_static(), Some(baseline));
+        }
+    }
+
+    /// The static table must hold, for each variant, the CFString of THAT variant's literal.
+    ///
+    /// The index test below only compares two Rust lists, so swapping two entries in the static
+    /// table would slip past it -- and a swapped entry is the failure that matters, because every
+    /// lookup would then silently read another key. This reads the strings back and compares
+    /// their contents.
+    #[test]
+    fn every_variant_holds_its_own_literal() {
+        for key in [
+            CgKey::Layer,
+            CgKey::OwnerPid,
+            CgKey::Number,
+            CgKey::Bounds,
+            CgKey::Alpha,
+            CgKey::IsOnscreen,
+            CgKey::OwnerName,
+            CgKey::Name,
+            CgKey::X,
+            CgKey::Y,
+            CgKey::Width,
+            CgKey::Height,
+        ] {
+            let held = key.cf_static().expect("created");
+            assert_eq!(
+                cf_to_rust_string(held),
+                Some(key.literal().to_string()),
+                "{key:?} must hold its own literal, not another key's"
+            );
+        }
+    }
+
+    /// The index mapping covers exactly the array the table builds: an off-by-one here would
+    /// silently hand back another key's CFString, which would make every lookup wrong.
+    #[test]
+    fn the_index_mapping_matches_the_table_order() {
+        let ordered = [
+            CgKey::Layer,
+            CgKey::OwnerPid,
+            CgKey::Number,
+            CgKey::Bounds,
+            CgKey::Alpha,
+            CgKey::IsOnscreen,
+            CgKey::OwnerName,
+            CgKey::Name,
+            CgKey::X,
+            CgKey::Y,
+            CgKey::Width,
+            CgKey::Height,
+        ];
+        for (index, key) in ordered.iter().enumerate() {
+            assert_eq!(key.index(), index, "{key:?} must index its own slot");
+        }
     }
 }
