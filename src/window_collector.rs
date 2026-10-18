@@ -47,7 +47,7 @@ pub(crate) use window_state::{ax_app_hidden_tag, StateSource, WindowStateEvidenc
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use collect::{
     collect_windows, collect_windows_for_pid, collect_windows_with_frontmost_bump,
-    switchable_capture_window_for_pid,
+    switchable_capture_window_for_pid, CollectionPass,
 };
 pub(crate) use raise::activate_pid_with_api;
 pub(crate) use raise::{
@@ -241,31 +241,83 @@ pub(crate) fn sort_windows_by_mru(windows: &mut [WindowInfo], mru: &MruMap, now:
     windows.sort_by_key(|a| age(a.pid, a.window_id));
 }
 
+/// The WindowServer-observation set, extracted from an already-enumerated CG window list.
+///
+/// This is the rule `window_server_candidates` applies, split out so a collection pass can reuse
+/// the snapshot it already enumerated instead of making the apply stage enumerate again on the
+/// main thread. It is deliberately NOT the display list: observation covers every layer-0 window
+/// of a live PID, including ones the admission rules would filter out of the switcher.
+///
+/// There is no containment relation with the display list in either direction.
+///
+/// The per-window rule. `layer` is the value the caller read (999 when absent, matching the
+/// readers' default). Notably this does NOT look at alpha: a fully transparent layer-0 window is
+/// still subscribed, because a window can become visible without being re-enumerated. The display
+/// list does filter alpha, so the two sets differ by exactly such windows -- a difference the
+/// tests pin, and the reason no containment relation between them may be assumed.
+fn admits_subscription(layer: i32, pid: i32, window_id: u32) -> bool {
+    layer == 0 && pid > 0 && window_id != 0
+}
+
+/// Fold the per-window fields of a CG enumeration into the subscription set.
+///
+/// Split out from the CFArray walk so the whole production rule -- predicate, dedup key, first-
+/// occurrence-wins -- is one function the tests can drive with plain tuples. The CF walk below
+/// only reads the fields and delegates here; there is no second copy of the rule to drift.
+fn fold_subscriptions<I>(rows: I) -> Vec<(u32, i32)>
+where
+    I: IntoIterator<Item = (i32, i32, u32)>,
+{
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for (layer, pid, window_id) in rows {
+        if admits_subscription(layer, pid, window_id) && seen.insert((window_id, pid)) {
+            candidates.push((window_id, pid));
+        }
+    }
+    candidates
+}
+
+/// Safety: `array` must be a live CFArray of CG window dictionaries.
+pub(crate) unsafe fn subscriptions_from_cg_list(array: *const c_void) -> Vec<(u32, i32)> {
+    let count = CFArrayGetCount(array);
+    let mut rows = Vec::with_capacity(count.max(0) as usize);
+    for i in 0..count {
+        let dict = CFArrayGetValueAtIndex(array, i);
+        if dict.is_null() {
+            continue;
+        }
+        rows.push((
+            cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999),
+            cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1),
+            cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0),
+        ));
+    }
+    fold_subscriptions(rows)
+}
+
 /// Enumerate every layer-0 CG window for WindowServer focus observation.
 /// This is not the display list: AX still decides what is shown, while observation conservatively
 /// covers every owner PID.
 pub(crate) fn window_server_candidates() -> Vec<(u32, i32)> {
+    window_server_candidates_checked().unwrap_or_default()
+}
+
+/// The subscription set, distinguishing "no candidates" from "could not enumerate".
+///
+/// `None` means the CG enumeration failed: the caller must keep whatever subscriptions it
+/// already had. `Some(vec![])` means the enumeration succeeded and found nothing, which is a
+/// legitimate instruction to clear them. The plain `window_server_candidates` cannot express
+/// that difference, so a caller that must not clear on failure uses this one.
+pub(crate) fn window_server_candidates_checked() -> Option<Vec<(u32, i32)>> {
     unsafe {
         let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
         if array.is_null() {
-            return Vec::new();
+            return None;
         }
-        let count = CFArrayGetCount(array);
-        let mut candidates = Vec::new();
-        let mut seen = HashSet::new();
-        for i in 0..count {
-            let dict = CFArrayGetValueAtIndex(array, i);
-            if dict.is_null() || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0 {
-                continue;
-            }
-            let pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-            let window_id = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
-            if pid > 0 && window_id != 0 && seen.insert((window_id, pid)) {
-                candidates.push((window_id, pid));
-            }
-        }
+        let candidates = subscriptions_from_cg_list(array);
         CFRelease(array);
-        candidates
+        Some(candidates)
     }
 }
 
@@ -286,15 +338,15 @@ pub(crate) fn ordinary_onscreen_window_bounds() -> Vec<(u32, (f64, f64, f64, f64
         for i in 0..count {
             let dict = CFArrayGetValueAtIndex(array, i);
             if dict.is_null()
-                || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0
-                || cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1) == own_pid
-                || cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(0.0) <= 0.0
-                || !cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false)
+                || cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999) != 0
+                || cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1) == own_pid
+                || cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(0.0) <= 0.0
+                || !cf_dict_get_bool(dict, CgKey::IsOnscreen).unwrap_or(false)
             {
                 continue;
             }
-            let window_id = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
-            let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default();
+            let window_id = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
+            let bounds = cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or_default();
             if window_id == 0 || bounds.2 < 160.0 || bounds.3 < 120.0 {
                 continue;
             }
@@ -396,19 +448,19 @@ pub fn seed_mru_from_system_order() -> MruMap {
             if dict.is_null() {
                 continue;
             }
-            let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
+            let layer = cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999);
             if layer != 0 {
                 continue;
             }
-            let onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false);
+            let onscreen = cf_dict_get_bool(dict, CgKey::IsOnscreen).unwrap_or(false);
             if !onscreen {
                 continue;
             }
-            let pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+            let pid = cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1);
             if pid <= 0 {
                 continue;
             }
-            let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+            let owner_name = cf_dict_get_string(dict, CgKey::OwnerName).unwrap_or_default();
             if owner_name.is_empty() || owner_name == "Dock" {
                 continue;
             }
@@ -416,7 +468,7 @@ pub fn seed_mru_from_system_order() -> MruMap {
                 app_order.push(pid);
                 app_names.insert(pid, owner_name);
             }
-            let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
             let list = app_windows.entry(pid).or_default();
             if cgwid != 0 && !list.contains(&cgwid) {
                 list.push(cgwid);
@@ -494,7 +546,7 @@ fn window_layer_now(cgwid: u32) -> Option<i32> {
             if dict.is_null() {
                 None
             } else {
-                cf_dict_get_i32(dict, "kCGWindowLayer")
+                cf_dict_get_i32(dict, CgKey::Layer)
             }
         }
     };
@@ -535,9 +587,9 @@ pub(crate) fn frontmost_onscreen_window_now() -> Option<u32> {
             if dict.is_null() {
                 continue;
             }
-            match cf_dict_get_u32(dict, "kCGWindowLayer") {
+            match cf_dict_get_u32(dict, CgKey::Layer) {
                 Some(0) => {
-                    found = cf_dict_get_u32(dict, "kCGWindowNumber");
+                    found = cf_dict_get_u32(dict, CgKey::Number);
                     break;
                 }
                 Some(_) => continue,
@@ -575,7 +627,7 @@ pub(crate) fn window_presence_now(cgwid: u32) -> Option<(bool, Option<bool>)> {
             if dict.is_null() {
                 (true, None)
             } else {
-                (true, cf_dict_get_bool(dict, "kCGWindowIsOnscreen"))
+                (true, cf_dict_get_bool(dict, CgKey::IsOnscreen))
             }
         }
     };
@@ -1021,6 +1073,77 @@ mod ax_identity_tests {
 mod tests {
     use super::*;
 
+    /// The subscription rule, and the counter-example that keeps it from being confused with the
+    /// display list: a fully transparent layer-0 window is subscribed (it can become visible
+    /// without a re-enumeration) but is filtered out of the switcher.
+    #[test]
+    fn the_subscription_rule_admits_layer_zero_and_ignores_alpha() {
+        // Ordinary layer-0 window of a live process: subscribed.
+        assert!(admits_subscription(0, 501, 42));
+        // Absent keys default to layer 999 / pid -1 / window 0: rejected.
+        assert!(!admits_subscription(999, 501, 42));
+        assert!(!admits_subscription(0, -1, 42));
+        assert!(!admits_subscription(0, 501, 0));
+        // Non-zero layers are rejected even with a valid pid and id; this is the rule the
+        // earlier wrong counter-example violated.
+        assert!(!admits_subscription(101, 501, 42));
+        // The rule takes no alpha argument at all: the CG-display filter that drops alpha<=0 is
+        // the *other* set's rule, which is what makes them differ.
+    }
+
+    /// The predicate `window_server_candidates` is now defined on: it admits exactly the
+    /// layer-0 rows with a live pid and a non-zero window id, and nothing else.
+    #[test]
+    fn the_extracted_rule_admits_exactly_the_layer_zero_rows() {
+        let rows = [
+            (0, 501, 42u32, true),
+            (0, 501, 43u32, true),
+            (999, 501, 44u32, false),
+            (101, 502, 45u32, false),
+            (0, -1, 46u32, false),
+            (0, 503, 0u32, false),
+        ];
+        for (layer, pid, window_id, expected) in rows {
+            assert_eq!(
+                admits_subscription(layer, pid, window_id),
+                expected,
+                "layer={layer} pid={pid} window={window_id}"
+            );
+        }
+    }
+
+    /// The whole production rule -- predicate, dedup key, first-occurrence-wins -- driven through
+    /// the same `fold_subscriptions` the CF walk calls. Deleting the dedup or changing its key
+    /// fails this, because the fold is the code under test, not a copy of it.
+    #[test]
+    fn the_production_fold_deduplicates_by_window_and_pid() {
+        // A repeated pair, a second window of the same pid, a same-window pair under a
+        // different pid, and rows the predicate must reject.
+        let rows = [
+            (0, 501, 42u32),
+            (0, 501, 42u32),
+            (0, 501, 43u32),
+            (0, 502, 42u32),
+            (999, 501, 44u32),
+            (0, -1, 45u32),
+            (0, 501, 0u32),
+        ];
+        assert_eq!(
+            fold_subscriptions(rows),
+            vec![(42, 501), (43, 501), (42, 502)],
+            "each surviving pair once, first occurrence wins, rejected rows absent"
+        );
+    }
+
+    /// A fully transparent layer-0 window is subscribed (it can become visible without a
+    /// re-enumeration) even though the display list filters it out. The rule takes no alpha
+    /// argument at all, which is exactly what makes the two sets differ.
+    #[test]
+    fn the_fold_has_no_alpha_notion() {
+        // The same row the display filter drops (alpha <= 0) still produces a subscription.
+        assert_eq!(fold_subscriptions([(0, 501, 42u32)]), vec![(42, 501)]);
+    }
+
     /// The "previous app" candidate: never this app, never the app already in front (the most
     /// recent activation is almost always that one), and only a regular application. A→B then the
     /// binding from B must reach A; triggering it again from A must reach B.
@@ -1048,8 +1171,6 @@ mod tests {
             Some(300)
         );
     }
-
-    use super::*;
 
     /// Smoke (GUI/ObjC runtime): verifies that objc2's exception boundary really contains an
     /// Objective-C exception. This is the crash backstop of the AX collection path: without it the

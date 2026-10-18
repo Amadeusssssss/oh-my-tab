@@ -177,11 +177,22 @@ unsafe fn ax_collect_chunk(
 
 /// Rediscover one PID's windows after WindowServer reports an undisplayed focused window.
 /// AX supplies window identity; SkyLight membership and CG geometry constrain the result.
+/// A directed collection: the target app's windows plus, when the pass reached the CG
+/// enumeration, the WindowServer-observation set from that same snapshot.
+///
+/// `subscriptions: None` means no snapshot was taken (the hidden-app early return, a failed
+/// enumeration, or an unanswered AX query). It is not an empty set and must not clear the
+/// registry; the caller falls back to a full pass.
+pub(crate) struct FocusedCollection {
+    pub(crate) windows: Vec<WindowInfo>,
+    pub(crate) subscriptions: Option<Vec<(u32, i32)>>,
+}
+
 pub(crate) fn collect_windows_for_pid(
     mru: &mut MruMap,
     pid: i32,
     focused_cgwid: u32,
-) -> Option<Vec<WindowInfo>> {
+) -> Option<FocusedCollection> {
     unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
         let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid);
@@ -233,15 +244,15 @@ pub(crate) fn switchable_capture_window_for_pid(
     // drop them on *every* path, including the failure return below, or an idle prewarm thread would
     // keep its last pass -- and with it the oldest destruction epoch -- alive forever.
     drop(crate::thumbnail::take_current_scope_pass());
-    let windows = collected?;
-    choose_switchable_capture_window(&windows, focused_cgwid, preferred_cgwid)
+    let collected = collected?;
+    choose_switchable_capture_window(&collected.windows, focused_cgwid, preferred_cgwid)
 }
 
 unsafe fn collect_windows_for_pid_inner(
     mru: &mut MruMap,
     pid: i32,
     focused_cgwid: u32,
-) -> Option<Vec<WindowInfo>> {
+) -> Option<FocusedCollection> {
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
     let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
     let show_other_desktops = CONFIG.read().unwrap().windows.show_other_desktops;
@@ -250,7 +261,13 @@ unsafe fn collect_windows_for_pid_inner(
     let _identity_pass = begin_ax_identity_pass();
     let app_hidden = unsafe { application_is_hidden(pid) } == Some(true);
     if should_filter_hidden_app(show_hidden_app_windows, app_hidden.then_some(true)) {
-        return Some(Vec::new());
+        // A successful, empty answer with NO snapshot: this returns before the CG enumeration, so
+        // there is no subscription set to publish. The caller must not read this as "subscribe to
+        // nothing".
+        return Some(FocusedCollection {
+            windows: Vec::new(),
+            subscriptions: None,
+        });
     }
     let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
     if array.is_null() {
@@ -306,8 +323,8 @@ unsafe fn collect_windows_for_pid_inner(
     for i in 0..count {
         let dict = CFArrayGetValueAtIndex(array, i);
         if !dict.is_null() {
-            let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-            let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            let owner_pid = cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1);
+            let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
             if owner_pid == pid && cgwid != 0 {
                 cg_window_ids.push(cgwid);
             }
@@ -356,12 +373,12 @@ unsafe fn collect_windows_for_pid_inner(
         if dict.is_null() {
             continue;
         }
-        let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
-        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        let layer = cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999);
+        let owner_pid = cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1);
         if owner_pid != pid {
             continue;
         }
-        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
         // Staged before the attached-surface, alpha and AX-pairing filters below, for the same
         // reason as the full pass: the observation is about the window, not about its card.
         let staged_scope = classify_window_space(
@@ -369,32 +386,32 @@ unsafe fn collect_windows_for_pid_inner(
             membership_snapshot.as_ref(),
             WindowPairingSource::PublishedAx,
             cgwid,
-            cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
+            cf_dict_get_bool(dict, CgKey::IsOnscreen),
         );
         if staged_scope != MembershipScope::Unknown {
             crate::thumbnail::stage_window_scope(pid, cgwid, is_off_current_space(staged_scope));
         }
         if cgwid != 0 {
             cg_window_layers.insert(cgwid, layer);
-            if let Some(bounds) = cf_dict_get_bounds(dict, "kCGWindowBounds") {
+            if let Some(bounds) = cf_dict_get_bounds(dict, CgKey::Bounds) {
                 cg_window_bounds.insert(cgwid, bounds);
             }
         }
         if is_attached_surface(parent_ids.get(&cgwid).copied()) {
             continue;
         }
-        if cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0 {
+        if cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(1.0) <= 0.0 {
             continue;
         }
-        let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+        let owner_name = cf_dict_get_string(dict, CgKey::OwnerName).unwrap_or_default();
         if owner_name.is_empty() || owner_name == "Dock" {
             continue;
         }
         if cgwid != 0 {
             current_cg_ids.insert(cgwid);
         }
-        let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or((0.0, 0.0, 0.0, 0.0));
-        let cg_is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen");
+        let bounds = cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let cg_is_onscreen = cf_dict_get_bool(dict, CgKey::IsOnscreen);
         // The directed refresh honours the kAXWindows answer... except for a window Space
         // membership places on another desktop, which that answer cannot contain (it is filtered
         // by the current Space). This is the same exception the full collection makes; without it
@@ -480,7 +497,7 @@ unsafe fn collect_windows_for_pid_inner(
         // exactly what makes a window with no accessibility element of its own presentable.
         let window_title = ax_info
             .map(|info| info.title.clone())
-            .unwrap_or_else(|| cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default());
+            .unwrap_or_else(|| cf_dict_get_string(dict, CgKey::Name).unwrap_or_default());
         let (minimized, minimized_source) = decode_minimized(row, ax_minimized_evidence(ax_info));
         let space_scope = classify_window_space(
             membership_source,
@@ -562,6 +579,9 @@ unsafe fn collect_windows_for_pid_inner(
         &fullscreen_cgwids,
         &parent_ids,
     );
+    // Taken from the snapshot this pass already enumerated, so a directed refresh needs no extra
+    // enumeration of its own.
+    let subscriptions = Some(unsafe { subscriptions_from_cg_list(array) });
     CFRelease(array);
 
     // AX-only windows remain valid, for example orderOut'd settings dialogs absent from CG.
@@ -715,11 +735,14 @@ unsafe fn collect_windows_for_pid_inner(
     for window in &mut windows {
         window.is_active = window.window_id == focused_cgwid;
     }
-    Some(windows)
+    Some(FocusedCollection {
+        windows,
+        subscriptions,
+    })
 }
 
 pub fn collect_windows(mru: &mut MruMap) -> Vec<WindowInfo> {
-    collect_windows_with_frontmost_bump(mru, true)
+    collect_windows_with_frontmost_bump(mru, true).windows
 }
 
 // Same 16pt edge tolerance used by window_management snap-state inference.
@@ -1439,10 +1462,22 @@ pub(super) fn fold_tab_group(windows: Vec<AxWindowInfo>) -> Vec<AxWindowInfo> {
 
 /// Collect a window snapshot, optionally recording the current frontmost window in MRU.
 /// Lifecycle-triggered refreshes only update the window set and must not act like a summon.
+/// A full collection pass: the display list plus the WindowServer-observation set, both taken
+/// from the SAME CG snapshot.
+///
+/// The subscription set rides along so the main-thread apply stage does not have to enumerate all
+/// windows a second time just to learn which windows to observe. `subscriptions` is `None` only
+/// when the pass had no usable snapshot (the CG enumeration failed), which the apply stage must
+/// treat as "no new information" -- not as an empty set, which would drop every subscription.
+pub(crate) struct CollectionPass {
+    pub(crate) windows: Vec<WindowInfo>,
+    pub(crate) subscriptions: Option<Vec<(u32, i32)>>,
+}
+
 pub(crate) fn collect_windows_with_frontmost_bump(
     mru: &mut MruMap,
     bump_frontmost: bool,
-) -> Vec<WindowInfo> {
+) -> CollectionPass {
     // This pass owns its rejection records; the caller publishes them only if it applies the result
     // (see `publish_staged_rejections`).
     crate::e2e_state::begin_collection_pass();
@@ -1460,7 +1495,11 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     let cg_option = K_C_G_WINDOW_LIST_OPTION_ALL;
     let array = unsafe { CGWindowListCopyWindowInfo(cg_option, 0) };
     if array.is_null() {
-        return vec![];
+        // No snapshot: the caller keeps its existing subscriptions rather than clearing them.
+        return CollectionPass {
+            windows: Vec::new(),
+            subscriptions: None,
+        };
     }
 
     // Own-PID windows are no longer excluded by PID: the settings window is own-PID too, and
@@ -1501,22 +1540,22 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         if dict.is_null() {
             continue;
         }
-        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        let owner_pid = cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1);
         if owner_pid <= 0 {
             continue;
         }
-        let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
-        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        let layer = cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999);
+        let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
         if cgwid != 0 {
             cg_window_layers.insert((owner_pid, cgwid), layer);
             cg_window_bounds.insert(
                 (owner_pid, cgwid),
-                cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default(),
+                cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or_default(),
             );
             cg_window_ids.push(cgwid);
             cg_window_owners.insert(cgwid, owner_pid);
         }
-        let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+        let owner_name = cf_dict_get_string(dict, CgKey::OwnerName).unwrap_or_default();
         if owner_name.is_empty() || owner_name == "Dock" {
             continue;
         }
@@ -1691,13 +1730,13 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
         if dict.is_null()
-            || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0
-            || cf_dict_get_bool(dict, "kCGWindowIsOnscreen") != Some(true)
-            || cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0
+            || cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999) != 0
+            || cf_dict_get_bool(dict, CgKey::IsOnscreen) != Some(true)
+            || cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(1.0) <= 0.0
         {
             continue;
         }
-        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
         if cgwid != 0 && !is_attached_surface(parent_ids.get(&cgwid).copied()) {
             onscreen_ids.insert(cgwid);
         }
@@ -1736,9 +1775,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             continue;
         }
 
-        let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
+        let layer = cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999);
 
-        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        let owner_pid = cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1);
         if owner_pid <= 0 {
             continue;
         }
@@ -1747,13 +1786,13 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // window lives, not whether it is a card, and the capture pipeline needs it precisely for the
         // windows that are not cards. `Unknown` is not staged, so publishing leaves the previous
         // observation alone.
-        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
         let staged_scope = classify_window_space(
             membership_source,
             membership_snapshot.as_ref(),
             WindowPairingSource::PublishedAx,
             cgwid,
-            cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
+            cf_dict_get_bool(dict, CgKey::IsOnscreen),
         );
         if staged_scope != MembershipScope::Unknown {
             crate::thumbnail::stage_window_scope(
@@ -1763,7 +1802,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             );
         }
         // Fully transparent windows (alpha=0) are invisible; Mission Control doesn't show them.
-        let alpha = cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0);
+        let alpha = cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(1.0);
         if alpha <= 0.0 {
             continue;
         }
@@ -1771,17 +1810,17 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             continue;
         }
 
-        let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
+        let owner_name = cf_dict_get_string(dict, CgKey::OwnerName).unwrap_or_default();
         if owner_name.is_empty() || owner_name == "Dock" {
             continue;
         }
 
-        let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
+        let cg_title = cf_dict_get_string(dict, CgKey::Name).unwrap_or_default();
         if is_attached_surface(parent_ids.get(&cgwid).copied()) {
             continue;
         }
         // bounds (x, y, w, h); all zeros on parse failure, caller falls back to the main screen.
-        let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let bounds = cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or((0.0, 0.0, 0.0, 0.0));
 
         // Pair the AX title by CGWindowID (no more order/string guessing).
         // AX is authoritative: a CG window is kept only if AX has a window with
@@ -1790,7 +1829,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // published through the same normal-window filters and exact membership gate.
         // Read before pairing: the CG-only fallback for a failed AX read covers only a window we
         // can see, and `classify_window_space` below needs the same fact.
-        let cg_is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen");
+        let cg_is_onscreen = cf_dict_get_bool(dict, CgKey::IsOnscreen);
         let published_map = ax_wid_to_info.get(&owner_pid);
         let recovered_map = ax_recovered_wid_to_info.get(&owner_pid);
         let owner_process_start_time_us = icon_ids
@@ -2213,14 +2252,15 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // the dead window's timestamp (inheritance pollution). The live set uses only the most
     // conservative filters (layer 0, or an AX-confirmed main/fullscreen window, + valid pid)
     // -- better to keep than to drop; display
-    // filters (AX pairing / Dock / alpha) don't apply here. Cost: one extra All-mode
-    // enumeration per summon when show_minimized is off (sub-millisecond).
+    // filters (AX pairing / Dock / alpha) don't apply here.
+    //
+    // It reads the SAME CFArray the rest of this pass reads. The previous form re-enumerated in
+    // All mode whenever show_minimized was off -- which is the default -- costing a second full
+    // WindowServer enumeration on every summon. The main query is already All mode, so the two
+    // sources were the same list; the only difference is that this one is the snapshot the pass
+    // has been working from, i.e. slightly older than a fresh one would be.
     let mut live_set: HashSet<(i32, u32)> = {
-        let src = if show_minimized {
-            array // main query is already All mode
-        } else {
-            unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0) }
-        };
+        let src = array;
         let mut s: HashSet<(i32, u32)> = HashSet::new();
         if !src.is_null() {
             let n = unsafe { CFArrayGetCount(src) };
@@ -2229,12 +2269,12 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 if dict.is_null() {
                     continue;
                 }
-                let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
-                let pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+                let layer = cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999);
+                let pid = cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1);
                 if pid <= 0 {
                     continue;
                 }
-                let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+                let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
                 if is_attached_surface(parent_ids.get(&cgwid).copied()) {
                     continue;
                 }
@@ -2249,9 +2289,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 s.insert((pid, cgwid));
             }
         }
-        if !show_minimized && !src.is_null() {
-            unsafe { CFRelease(src) };
-        }
+        // No release here: src IS the pass's array, released once at the end of the function.
+        // Releasing it here would be a double release.
         s
     };
     // AX-reported windows missing from the CG enumeration (orderOut'd but legitimate)
@@ -2292,18 +2331,18 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         let mut cg_rows = Vec::new();
         for i in 0..count {
             let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
-            if dict.is_null() || cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1) != pid {
+            if dict.is_null() || cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1) != pid {
                 continue;
             }
-            let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+            let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
             cg_rows.push(format!(
                 "id={} layer={} alpha={:.2} onscreen={} title={:?} bounds={:?} parent={:?}",
                 cgwid,
-                cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999),
-                cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0),
-                cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false),
-                cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default(),
-                cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default(),
+                cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999),
+                cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(1.0),
+                cf_dict_get_bool(dict, CgKey::IsOnscreen).unwrap_or(false),
+                cf_dict_get_string(dict, CgKey::Name).unwrap_or_default(),
+                cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or_default(),
                 parent_ids.get(&cgwid).copied()
             ));
         }
@@ -2359,6 +2398,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         );
     }
 
+    // Extracted before the release, from the same snapshot the display list came from: this is
+    // what lets the main thread stop enumerating all windows on its own.
+    let subscriptions = Some(unsafe { subscriptions_from_cg_list(array) });
     unsafe { CFRelease(array) };
 
     let (front_pid, frontmost, fm_ms): (Option<i32>, Option<(i32, u32)>, u128) = if bump_frontmost {
@@ -2420,7 +2462,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         ax_total_ms,
         fm_ms
     );
-    windows
+    CollectionPass {
+        windows,
+        subscriptions,
+    }
 }
 
 #[cfg(test)]

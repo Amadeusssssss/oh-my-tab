@@ -822,6 +822,7 @@ pub(super) fn render(
                         &extents,
                         size,
                         orientation,
+                        &palette,
                     );
                     state.last_badges = badges.to_vec();
                     state.last_palette = Some(palette);
@@ -3360,6 +3361,10 @@ unsafe fn rebuild_badges(
     extents: &[BadgeExtent],
     panel_size: NSSize,
     orientation: Orientation,
+    // The caller already resolved the palette to decide whether a rebuild was needed; resolving
+    // it again here doubled the CONFIG read (and, under theme=auto, the NSUserDefaults query) on
+    // every render tick that rebuilt.
+    palette: &crate::theme::UiPalette,
 ) {
     let old: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![old, count];
@@ -3369,7 +3374,6 @@ unsafe fn rebuild_badges(
     }
 
     let total = estimated_stream_width(extents.iter().map(|extent| extent.length));
-    let palette = crate::theme::ui_palette();
     // `total` includes nominal outer padding; center the actual keycap-and-gap stream so
     // any extra room in the panel is split evenly instead of being added to only one end.
     let panel_length = if orientation.is_vertical() {
@@ -3418,12 +3422,12 @@ unsafe fn rebuild_badges(
 
         let (background, border, text_color) = if uses_accent_fill(badge.kind) {
             (
-                accent_keycap_surface(&palette),
+                accent_keycap_surface(palette),
                 palette.keycap_accent_border,
                 palette.keycap_accent_text,
             )
         } else {
-            let (fill, border) = neutral_keycap_surface(&palette);
+            let (fill, border) = neutral_keycap_surface(palette);
             (fill, border, palette.primary_text)
         };
         // The chip is an opaque surface: the panel behind it is the user's material, so the text

@@ -41,15 +41,32 @@ impl Default for ResolvedMouse {
     }
 }
 
+/// One cached resolution, tagged with the cache epoch it was computed under.
+struct CacheEntry {
+    epoch: u64,
+    value: std::sync::Arc<ResolvedMouse>,
+}
+
 /// Resolve cache: key = (VID, PID); the None key = "no device / All Mice". Invalidated on
 /// reload_config and device changes.
-static CACHE: std::sync::LazyLock<
-    Mutex<std::collections::HashMap<Option<DeviceKey>, ResolvedMouse>>,
-> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+///
+/// The epoch is what keeps an invalidation from being undone. A resolve reads the epoch before it
+/// snapshots CONFIG and publishes only while that epoch is unchanged, so a computation that raced
+/// with an invalidation is returned to its one caller but never stored -- storing it was the bug:
+/// every later resolve then kept reading the pre-invalidation config.
+static CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<Option<DeviceKey>, CacheEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Bumped under the CACHE lock by `invalidate_cache`, so "check the epoch and publish" and "bump
+/// the epoch and clear" are serialized by the same mutex and cannot interleave.
+static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Invalidate the cache (called on config reload or device changes).
 pub(crate) fn invalidate_cache() {
+    // The fetch_add happens while the lock is held: a resolver that is between its epoch read and
+    // its publish either drops its entry or publishes before the clear.
     if let Ok(mut c) = CACHE.lock() {
+        CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         c.clear();
     }
 }
@@ -76,24 +93,67 @@ pub(crate) fn matches(profile: &MouseProfile, device: Option<DeviceKey>) -> bool
     vid_ok && pid_ok
 }
 
+/// Test-only seam between the CONFIG snapshot and the cache publish.
+///
+/// A test arms it with a closure that runs `invalidate_cache`, which reproduces the interleaving
+/// the epoch guards. Tests that arm it must serialize on TEST_HOOK_LOCK, or a parallel test would
+/// run the hook too.
+#[cfg(test)]
+fn run_test_hook_after_config_read() {
+    if let Some(hook) = TEST_HOOK.lock().unwrap().take() {
+        hook();
+    }
+}
+
+#[cfg(test)]
+static TEST_HOOK: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Resolve the effective config for a device. device = None means attribution failed; only the
 /// "All Mice" profile applies.
-pub(crate) fn resolve(device: Option<DeviceKey>) -> ResolvedMouse {
-    // Check the cache.
+///
+/// The result is shared, so a caller on the event-tap hot path does not copy the button-mapping
+/// map on every wheel event. It is intentionally NOT kept by any caller: a retained handle would
+/// survive an invalidation and keep reading the config it was resolved from.
+pub(crate) fn resolve(device: Option<DeviceKey>) -> std::sync::Arc<ResolvedMouse> {
+    // The epoch is read before CONFIG is snapshotted: an invalidation that lands in between must
+    // stop this result from being published, or the pre-invalidation value would outlive it.
+    let epoch_at_read = CACHE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     if let Ok(c) = CACHE.lock() {
-        if let Some(r) = c.get(&device) {
-            return r.clone();
+        if let Some(entry) = c.get(&device) {
+            if entry.epoch == epoch_at_read {
+                return std::sync::Arc::clone(&entry.value);
+            }
         }
     }
 
     let cfg = CONFIG.read().unwrap().clone();
     let mut r = resolve_from(&cfg, device);
     apply_smooth_dev_flags(&mut r.scroll_mode, &mut r.smooth_scrolling);
+    let resolved = std::sync::Arc::new(r);
 
+    // Test seam: lets a test invalidate exactly between the CONFIG snapshot and the publish,
+    // which is the interleaving the epoch exists for.
+    #[cfg(test)]
+    run_test_hook_after_config_read();
+
+    // Publish only while the epoch still matches. Returning the value computed above is correct
+    // either way -- it is a consistent snapshot of the config this call read -- but storing it
+    // after an invalidation would hand the stale value to every later call.
     if let Ok(mut c) = CACHE.lock() {
-        c.insert(device, r.clone());
+        if CACHE_EPOCH.load(std::sync::atomic::Ordering::Acquire) == epoch_at_read {
+            c.insert(
+                device,
+                CacheEntry {
+                    epoch: epoch_at_read,
+                    value: std::sync::Arc::clone(&resolved),
+                },
+            );
+        }
     }
-    r
+    resolved
 }
 
 /// Resolve a device's effective config from a given Config (for non-CONFIG contexts like the
@@ -535,5 +595,58 @@ disable_acceleration = true
         // Legacy fields should be cleared (avoid serializing cruft).
         assert!(parsed.mouse.reverse_scroll.is_none());
         assert!(parsed.mouse.scroll_mode.is_none());
+    }
+
+    /// Replace the whole mouse profile list with a single wildcard profile carrying the given
+    /// reverse_scroll, and return what was there so the caller can restore it.
+    ///
+    /// The test must not assume anything about `profiles[0]`: a user's config may start with a
+    /// per-device profile, which would not match the test device at all.
+    fn install_wildcard_profile(reverse_scroll: bool) -> Vec<crate::config::MouseProfile> {
+        let mut cfg = CONFIG.write().unwrap();
+        let saved = cfg.mouse.profiles.clone();
+        cfg.mouse.profiles = vec![crate::config::MouseProfile {
+            device: crate::config::DeviceMatcher::default(),
+            reverse_scroll: Some(reverse_scroll),
+            ..Default::default()
+        }];
+        saved
+    }
+
+    fn restore_profiles(saved: Vec<crate::config::MouseProfile>) {
+        CONFIG.write().unwrap().mouse.profiles = saved;
+        invalidate_cache();
+    }
+
+    /// The regression the epoch exists for: an invalidation landing between the CONFIG snapshot and
+    /// the publish used to be undone, so every later resolve read the pre-invalidation config.
+    #[test]
+    fn an_invalidation_during_resolve_is_not_undone_by_the_publish() {
+        let _serial = TEST_HOOK_LOCK.lock().unwrap();
+        let device = Some((0x0BAD, 0x0FEE));
+        let saved = install_wildcard_profile(true);
+        invalidate_cache();
+        *TEST_HOOK.lock().unwrap() = Some(Box::new(|| {
+            // Flip the whole profile list rather than one slot: the value the second resolve
+            // must see is then independent of how the user's profiles happen to be ordered.
+            install_wildcard_profile(false);
+            invalidate_cache();
+        }));
+        let first = resolve(device);
+        // This call's own answer reflects the snapshot it read: allowed, and not the bug.
+        assert!(
+            first.reverse_scroll,
+            "the in-flight call returns the snapshot it read"
+        );
+        // The bug was the publish: the stale entry must not have been stored.
+        assert!(
+            CACHE.lock().unwrap().get(&device).is_none(),
+            "a computation that raced an invalidation must not be published"
+        );
+        assert!(
+            !resolve(device).reverse_scroll,
+            "a later resolve must not read the pre-invalidation config"
+        );
+        restore_profiles(saved);
     }
 }
