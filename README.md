@@ -26,21 +26,23 @@
 
 <br />
 
-oh-my-tab is a macOS menu-bar utility centered on window switching. It uses **Command+Tab** by default (or Option+Tab), shows open windows in a floating **Liquid Glass** overlay, and raises the selected window when the modifier is released. Window activation uses a private SkyLight API together with Accessibility APIs.
+oh-my-tab is a macOS menu-bar utility centered on window switching. It uses **Command+Tab** by default (or Option+Tab), shows open windows in a floating overlay, and raises the selected window when the modifier is released. Window activation uses a private SkyLight API together with Accessibility APIs.
 
 The app is written in Rust and calls AppKit, CoreGraphics, and ApplicationServices directly through `objc2` FFI, without a Swift bridge or Rust UI framework.
 
-**Every optional feature is opt-in and off by default**: clipboard history, mouse control, window control, quick actions, the keystroke display, and filters such as hidden/minimized windows all have to be turned on in Settings. Windows on other macOS desktops are the one exception — they are shown by default, and the "Always show windows from other desktops" switch turns them off.
+**Every optional feature is opt-in and off by default**: clipboard history, mouse control, window control, quick actions, key bindings, the keystroke display, and filters such as hidden/minimized windows all have to be turned on in Settings. Windows on other macOS desktops are the one exception — they are shown by default, and the "Always show windows from other desktops" switch turns them off.
 
 - <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names and window titles, one card per window, multiple displays; switching keeps that app's other windows in order.
 - <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: a preview that follows each window's own aspect ratio (extremely wide or tall windows are narrowed to stay readable); needs **Screen Recording** permission, otherwise icon-only cards.
-- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab / Shift+Tab / arrow keys / mouse; the shortcut can be Option+Tab.
-- <img height="14" src="docs/icons/tools.svg"> **Window control** (optional): Option+arrow keys maximize, snap or minimize; add Shift to move a window to the next display.
-- <img height="14" src="docs/icons/zap.svg"> **Quick actions** (optional): Option+I/E/D/L open Settings, Finder (maximized or small window, two separate bindings), the desktop and the lock screen; double-tap Control to locate the pointer.
-- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images and files — search, pin, delete, expiry and encrypted storage.
+- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab / Shift+Tab / arrow keys / mouse; the shortcut can be Option+Tab. While the panel is open, Command+W / M / H / Q can optionally close the highlighted window, minimize or restore it, hide its app, or ask that app to quit.
+- <img height="14" src="docs/icons/tools.svg"> **Window control** (optional): Option+arrow keys maximize, snap or minimize; add Shift to move a window to the next display. "Restore previous size", "Hide all windows" and "Show all windows" are bindable too.
+- <img height="14" src="docs/icons/zap.svg"> **Quick actions** (optional): Option+I/E/D/L open macOS System Settings, a new Finder window, the desktop and the lock screen; a second, unbound-by-default action opens a small Finder window instead, and double-tap Control locates the pointer.
+- <img height="14" src="docs/icons/gear.svg"> **Key bindings** (optional): one editable list — add a shortcut, change its chord, switch it off or delete it, without a separate window-control page.
+- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images and files — search, filters, pin, delete and undo, expiry, and encrypted storage.
 - <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration and side-button → shortcut mapping.
-- <img height="14" src="docs/icons/star.svg"> **Appearance and settings**: light / dark / system, liquid glass, tint, radius and font size, all managed in Settings.
-- <img height="14" src="docs/icons/globe.svg"> **Languages and logs**: English / Simplified / Traditional Chinese following the system; rotating logs cleaned up after 30 days.
+- <img height="14" src="docs/icons/star.svg"> **Appearance and settings**: light / dark / system, panel material (Liquid Glass, frosted glass or opaque), glass transparency (Liquid Glass only), corner radius, and card/footer text size.
+- <img height="14" src="docs/icons/eye.svg"> **Keystroke display** (optional): a draggable panel that shows the keys you press as separate keycaps, with a maximum length and an optional hardware-level input source; it stays quiet while secure input is active.
+- <img height="14" src="docs/icons/globe.svg"> **Languages, logs and backup**: English / Simplified / Traditional Chinese following the system; rotating logs cleaned up after 30 days; export and import the whole configuration as one TOML file.
 
 <br />
 
@@ -66,12 +68,14 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 ## Quick start
 
 - **Window switching**: hold Command (or Option, if configured), press Tab / Shift+Tab or the arrow keys to pick a window, then release the modifier to switch.
+- **Panel actions**: while the panel is open, Command+W / M / H / Q close the highlighted window, minimize it (or restore it when it is already minimized), hide its app, or ask that app to quit. Each is a separate switch, all off by default.
 - **Clipboard history**: once enabled, press **Option+V** to summon it; it supports both keyboard and mouse, and closes when you click outside.
-- **Permissions**: window switching needs Accessibility permission; thumbnails need Screen Recording. Without Screen Recording, switching still works and cards simply fall back to icons.
+- **Key bindings**: open **Settings → Key Bindings** to edit the shortcut list. Every row can be changed, switched off or deleted; the picker offers actions that are not bound by default.
+- **Permissions**: window switching needs Accessibility permission; thumbnails need Screen Recording; clipboard history needs the keychain key it creates on first use. Without Screen Recording, switching still works and cards simply fall back to icons.
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;Clipboard history
 
-Clipboard history is optional and off by default. Press **Option+V** to open it, then use the arrow keys, Enter, Esc, Backspace, or the mouse; clicking outside closes the picker. **← pins or unpins** the selected entry. **→ opens a detail panel** with the full text or a larger image preview; the panel follows ↑/↓ selection changes and closes with Esc, ←, →, or a click. The history records **three kinds of entries**:
+Clipboard history is optional and off by default. Press **Option+V** to open it, then use the arrow keys, Enter, Esc, Backspace, or the mouse; clicking outside closes the picker. **← pins or unpins** the selected entry. **→ opens a detail panel** with the full text or a larger image preview; the panel follows ↑/↓ selection changes and closes with Esc, ←, →, or a click. **Tab cycles the filters** (All / Text / Image / Link / Code), **Cmd+F focuses the search field**, and **Cmd+Z undoes a deletion**. The history records **three kinds of entries**:
 
 | Kind | What is stored | Paste behavior |
 |---|---|---|
@@ -81,11 +85,13 @@ Clipboard history is optional and off by default. Press **Option+V** to open it,
 
 > **Known v1 tradeoffs** — each entry records one kind of content. A copy containing **both text and an image** (for example, an image copied from a web page) records the text. **Multiple-file copies and single non-image file copies are omitted from history.** The same picture copied as image data and as a file remains as two entries because the paste behavior differs. Deduplication is per kind: exact content for text and a content hash for images.
 
+The detail panel's **save button** writes the entry to a text file or to an image file (original bytes when available, otherwise the cached preview). The share button next to it is a reserved entry point: it currently provides hover feedback only. The history keeps up to 100 entries (50 by default); unpinned entries expire after 3 days by default, and pinned entries never expire.
+
 **Using an entry reorders the history by default** (like Maccy). Pressing Enter writes the selected entry back to the pasteboard, and the recorder treats it as a new copy and moves it to the top. The **"Move used entries to the top"** switch turns this behavior off (like Windows Win+V).
 
 With **"Delete entry after paste"** enabled, Option+Enter or Option+click pastes the entry and removes it from history. The dependent **"Also delete the corresponding system clipboard item"** option clears the matching clipboard content after a short delay, unless a newer copy has replaced it. The two clear actions beside the filter row clear the entries you are looking at — the selected category, or the search results while a query is active — and keep pinned entries unless you pick the "clear all" one. **"Clear history on quit or shutdown"** (off by default) deletes the history file and the cached image data on an orderly exit — Command+Q, the menu's Quit, logout or shutdown — so the session leaves nothing behind.
 
-> **Clipboard history is written to disk while the feature is on, encrypted.** Copied text, filenames, and image data are sealed with AES-256-GCM under a random key that lives in this Mac's login keychain, so the files are unreadable without it. What that does **not** cover: the history is in memory while the app runs, the metadata (file names, sizes and timestamps) is visible, copies that were already synced or backed up before you turned the feature off stay where they are, and a keychain item deleted by other tools makes the saved history unreadable for good. Without keychain access the feature is unavailable and nothing is recorded (no in-memory fallback); the settings page, the history panel and a system notification all say so, with a **Grant Keychain Access** action on the two in-app surfaces that asks for the keychain password once. Leave the feature off if you copy passwords or tokens, or turn on **"Clear history on quit or shutdown"**. A crash or a force quit cannot run that cleanup. See the [official website](https://oh-my-tab.app/) for details.
+> **Clipboard history is written to disk while the feature is on, encrypted.** Copied text, filenames, and image data are sealed with AES-256-GCM under a random key that lives in this Mac's login keychain, so the files are unreadable without it. The encrypted history index is `~/.config/oh-my-tab/clipboard-history.enc`; sealed image bytes and previews live under `~/Library/Caches/oh-my-tab-clip-images/`. What that does **not** cover: the history is in memory while the app runs, the metadata (file names, sizes and timestamps) is visible, copies that were already synced or backed up before you turned the feature off stay where they are, and a keychain item deleted by other tools makes the saved history unreadable for good. Without keychain access the feature is unavailable and nothing is recorded (no in-memory fallback); the settings page, the history panel and a system notification all say so, with a **Grant Keychain Access** action on the two in-app surfaces that asks for the keychain password once. Leave the feature off if you copy passwords or tokens, or turn on **"Clear history on quit or shutdown"**. A crash or a force quit cannot run that cleanup. See the [official website](https://oh-my-tab.app/) for details.
 
 ## <img height="16" src="docs/icons/alert.svg">&nbsp;&nbsp;Known Issues
 
@@ -101,13 +107,14 @@ With **"Delete entry after paste"** enabled, Option+Enter or Option+click pastes
 
 If windows are already open when the app starts, their initial ordering is seeded from WindowServer's front-to-back order. This provides an initial approximation; live activation events refine the window-level MRU after launch.
 
-
 Development-only issues and raw-binary debugging notes are collected in [docs/developer-notes-en.md](docs/developer-notes-en.md).
 
 ## <img height="16" src="docs/icons/tools.svg">&nbsp;&nbsp;Requirements
 
 - macOS 13+ on Apple Silicon.
-- **Accessibility** permission granted to the app.
+- **Accessibility** permission granted to the app (required for switching).
+- **Screen Recording** permission for window thumbnails (optional; cards fall back to icons).
+- **Keychain access** for clipboard history (required while that feature is on).
 
 ## <img height="16" src="docs/icons/terminal.svg">&nbsp;&nbsp;Build & run
 
@@ -119,11 +126,13 @@ Development-only issues and raw-binary debugging notes are collected in [docs/de
 > cargo fmt
 > cargo check       # fast type-check
 > cargo clippy
-> cargo test        # unit tests; add -- --ignored for the CG/AX smoke tests
+> ./scripts/cargo-test.sh   # unit tests; refuses a run that executed no test
 > ./scripts/dev-restart.sh  # build, sign, and launch the development .app
 > ```
 
-`scripts/dev-restart.sh` builds the development `.app` and re-assembles and re-signs it only when its inputs changed, then launches it through the per-user `launchd` domain. It signs with an Apple-issued identity when one is installed (the self-signed certificate is the only accepted fallback, and ad-hoc signing is refused; a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` asks for the self-signed one). A stable identity is what keeps Accessibility, Screen Recording and keychain grants alive across rebuilds, so a restart without changes reuses the existing bundle; layout QA fixtures, debug-only layout assertions and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md). Layout QA fixtures, debug-only layout assertions, and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md).
+`scripts/cargo-test.sh` wraps `cargo test`: a filter that matches nothing exits 0 and prints `running 0 tests ... ok`, so the wrapper turns a run that executed no test into a failure. Pass a filter as its argument and the guard stays. The normal suite is headless-safe; the CG/AX smoke tests are marked `#[ignore]` and need a GUI session plus Accessibility (`cargo test -- --ignored`). On a macOS graphical session, `scripts/e2e/run-all.sh` runs the A2 scenarios against the real event stream; scenarios that steal focus are skipped unless `--include-focus` is passed.
+
+`scripts/dev-restart.sh` builds the development `.app` and re-assembles and re-signs it only when its inputs changed, then launches it through the per-user `launchd` domain. It signs with an Apple-issued identity when one is installed (the self-signed certificate is the only accepted fallback, and ad-hoc signing is refused; a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` asks for the self-signed one). A stable identity is what keeps Accessibility, Screen Recording and keychain grants alive across rebuilds, so a restart without changes reuses the existing bundle. The launch is verified from the running process itself (pid, executable, version and bundle) rather than from the plist on disk; `--check` verifies the launch and then stops it, leaving nothing running. The script claims one build/test/launch transaction across worktrees before it stops anything, so two worktrees cannot fight over the single development instance; `--lock-wait=<sec>` bounds the wait, and the claim does not protect the app the run leaves behind. `--opt` uses the `dev-opt` profile (optimized, debug assertions kept) for feel and performance checks. Any `--flag[=value]` the script does not own is forwarded to the app, e.g. `--open-settings=key-bindings` or `--no-onboarding`. Layout QA fixtures, debug-only layout assertions and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md).
 
 ### Release
 
@@ -134,6 +143,8 @@ Development-only issues and raw-binary debugging notes are collected in [docs/de
 
 `bundle.sh` assembles `dist/Oh-My-Tab.app` (release binary, `Info.plist`, and app icon resources), signs it, then packages `dist/Oh-My-Tab.dmg` (with an `Applications` symlink for drag-to-install) and the Sparkle archive `dist/Oh-My-Tab.zip`. The outputs live in `dist/` (gitignored), outside `target/`, so the logger treats them as production builds (file logging, not stdout); running the `.app` is what enables launch-at-login (SMAppService) and file logging. Re-run the script after code changes — it copies the release binary at build time and self-locates the repo root.
 
+Both channels read their release notes from a file named after the `Cargo.toml` version: `release_doc_dev/<version>.md` for the development channel (`scripts/dev-restart.sh` aborts before building when it is missing or empty) and `release_doc/<version>.md` for the production pipeline. The file may carry several language blocks (`<!-- locale: en -->` … `<!-- /locale -->`), and the app shows the block matching the current UI language.
+
 The full release pipeline (`release.sh` / `release-dev.sh`, including `--push`), the isolated development channel (bundle ID `com.eacryo.oh-my-tab.dev`), the R2 upload flow, Sparkle automatic updates, and code signing are documented in [docs/releasing-en.md](docs/releasing-en.md).
 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
@@ -142,12 +153,16 @@ The full release pipeline (`release.sh` / `release-dev.sh`, including `--push`),
 
 - The app requires **Accessibility** permission (`AXIsProcessTrusted`) for both the global key event tap and the AX window queries. Grant it under *System Settings → Privacy & Security → Accessibility*. A freshly built binary must be re-granted — unless you sign with a stable identity (see [Code signing](docs/releasing-en.md#code-signing-why-a-self-signed-certificate-stabilizes-permissions)), in which case the grant persists across rebuilds.
 - **Window thumbnails** additionally require the **Screen Recording** permission (System Settings → Privacy & Security → Screen Recording). A private WindowServer capture API is used, as in DockDoor. Without permission, the switcher falls back to icon-only cards; granting it later resumes thumbnail capture without restarting. Window frames are kept in memory rather than written to disk.
+- **Clipboard history** requires the login-keychain key it creates on first use. If that key cannot be read, the feature is unavailable and records nothing; turning the feature off deletes the stored records instead of deleting the key.
 - If the event tap fails to start, the shortcut does not respond. This usually indicates that Accessibility permission has not been granted.
-- Icon cache: `~/Library/Caches/oh-my-tab-icons/{bundle-id}.png` (keyed by bundle id, with a `.meta` mtime sidecar; clearable from the menu).
+- Icon cache: `~/Library/Caches/oh-my-tab-icons/`, keyed by bundle id, with a `.small.png` variant and a `.meta` mtime sidecar; clearable from the menu.
+- The menu-bar icon can be hidden from **Settings → General Settings**. Settings remains reachable from the switcher's footer gear, the clipboard panel's gear, or by opening the app again from Finder or Spotlight, which reopens Settings.
 
 ## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Settings
 
-Options are managed from the in-app Settings window, and most changes take effect immediately. The window covers appearance, window switching, key bindings (window control and quick actions in one editable list), clipboard history, mouse control, startup, and updates.
+Options are managed from the in-app Settings window, and most changes take effect immediately. The sidebar has seven pages: **General Settings** (launch at login, menu-bar icon, appearance, language, logging, and settings backup/restore), **App Switcher**, **Mouse**, **Clipboard History**, **Key Bindings** (window control and quick actions in one editable list), **Keystroke Display**, and **About** (version, guide, permission and keychain state, updates).
+
+**Backup**: "Export settings" writes the whole configuration as one portable TOML file; "Import settings" replaces the current configuration from such a file. This Mac's login item, log path and clipboard-history storage settings are preserved rather than imported, and a file from a newer version still imports what this version understands.
 
 ## <img height="16" src="docs/icons/note.svg">&nbsp;&nbsp;Logging
 

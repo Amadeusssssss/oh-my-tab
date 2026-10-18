@@ -45,7 +45,7 @@ glass 的各个变体会把边缘画在 glass bounds 之外，因此按键显示
 
 ## 开发模式下图标可能不正确
 
-用 `cargo run` 跑裸二进制进行诊断时，浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标，而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引，以可执行文件的 **mtime** 作为失效指纹；开发模式下每次构建都会重新链接二进制、改变 mtime，导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响（安装后二进制 mtime 稳定）。正常开发运行请使用 `scripts/dev-restart.sh`；如果诊断用裸二进制出现此问题，可从菜单 *Clear Icon Cache* 清空，或删除 `~/Library/Caches/oh-my-tab-icons/`。
+用 `cargo run` 跑裸二进制进行诊断时，浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标，而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引，以可执行文件的 **mtime** 作为失效指纹；开发模式下每次构建都会重新链接二进制、改变 mtime，导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响（安装后二进制 mtime 稳定）。正常开发运行请使用 `scripts/dev-restart.sh`；如果诊断用裸二进制出现此问题，可从菜单 *Clear Icon and Thumbnail Cache* 清空，或删除 `~/Library/Caches/oh-my-tab-icons/`。
 
 ## 调试器启动时鼠标控制可能失效
 
@@ -302,11 +302,64 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
   `key_bindings_enabled`,场景因此可以断言迁移结果,以及「总开关关闭时没有任何绑定生效」。它还会
   继续输出 `key_bindings_selected`,现在恒为 `null`,因为 A2 的契约要求该字段存在且带类型。
 
+## 切换浮窗的面板动作键（Cmd+W / M / H / Q）
+
+这四个面板动作键各有一个开关，都在应用切换页（`windows.panel_close_enabled` / `_minimize_enabled` /
+`_hide_enabled` / `_quit_enabled`），默认全关：退出应用是破坏性动作，隐藏应用也会改变用户眼前的画面。
+
+- **路由。** 带 Command 的按键等价物不会走到 `keyDown:`，AppKit 会先交给 `performKeyEquivalent:`，
+  所以浮窗在自己的窗口上覆盖它（`src/overlay/panel_keys.rs`）——与设置窗口处理自己的 Cmd+Q 是同一套
+  机制。
+- **决定是否吞键的是归属，不是结果。** 一旦 `panel_actions` 把某次按下记为已认领，即使动作已经无法
+  执行（tap 放行之后、主线程回调之前浮窗已隐藏），处理函数仍然吞掉它。此处返回 false 会把已被面板
+  认领的 Cmd+Q 交给本应用自己的「退出」菜单项、把 oh-my-tab 退掉——设计评审点名过的失败——所以这里
+  只取消动作。
+- **本次召唤变为粘滞。** 按下动作键后浮窗保持打开，之后再松开触发修饰键也不会提交卡片；用户用
+  Return 或点击提交、用 Esc 关闭。其余每一条退出路径都会清掉粘滞状态，因此没有状态会活过本次召唤。
+- **隐藏或退出会换掉最前应用**，让这个非激活面板失去 key；常规的 resign 路径会把它当成「用户点了
+  别处」而关掉面板。一个有 750ms 时限、只能消费一次的守卫（`ACTION_FOCUS_WINDOW`）只压制该动作
+  自己造成的那次 resign。
+- **按键跟随当前布局。** 每个动作对应的物理键在主线程上按当前输入源解析（`keycode_for_character`），
+  解析不到时按**每个动作各自**回退到 ANSI 位置，因此一个键解析失败不会连累另外三个。
+
+## 设置备份（导出与导入）
+
+「导出设置」把当前配置按普通 TOML 写出，前面带一小段注释头（`# oh-my-tab settings export`、
+`# format = N`），所以文件正文本身也是一份合法的 `config.toml`。「导入设置」用应用**自己的加载器**
+解析它，而不是直接反序列化，两个方向因此都能跨版本工作：本版本不认识的字段被忽略，认识但拒收的
+字段按字段回退，旧文件里的 `[quick_actions]` / `[window_control]` 仍会播种出绑定列表。注释头里的
+格式版本只约束**文件协议**——只有当文件本身的含义变了才递增，应用新增设置项不递增。
+
+两条规则防止导入造成破坏：没有标记行的文件一律拒绝，否则一个碰巧是合法 TOML 的文件会被当成「全部
+默认值」导入、把用户的设置洗掉；`restore_local_fields` 会保留本机的登录项、绝对日志路径、按键面板
+的保存位置，以及剪贴板历史的存储决定（`enabled`、`max_entries`、`auto_expire_days`、
+`clear_on_quit`）——否则把 `clipboard.enabled = false` 导入到开着该功能的机器上，会走功能的关闭
+路径并删掉已存历史。再次导出对本版本理解的字段是无损的，对字节不是：未知字段在运行中的 `Config`
+里没有存放之处。
+
+## 菜单栏图标与重新打开
+
+「隐藏菜单栏图标」（`startup.hide_menu_bar_icon`）是在**活着的**状态项上设置
+`NSStatusItem.isVisible = NO`，而不是销毁它，因此菜单标题刷新、剪贴板置顶项的勾选状态和主菜单
+的快捷键在图标隐藏期间都照常工作。这个开关会随导出/导入一起走（它是显示偏好，不像开机自启那样属于
+本机注册）。
+
+图标隐藏后应用不能变得不可达：切换浮窗底栏的齿轮与剪贴板面板的齿轮会打开对应的设置页；再次激活
+应用（访达、聚焦、`open -a`）由 `applicationShouldHandleReopen:hasVisibleWindows:` 处理，它会打开
+设置窗口，且该回调返回 NO，避免 AppKit 再执行一次通用的 reopen。直接再启动二进制路径不是这条路径：
+第二个进程会被单实例锁拒绝并退出，运行中的实例根本看不到它。
+
 ## 构建与测试
 
 开发期间常规的启动方式是 `scripts/dev-restart.sh`。它构建开发版 `.app`，**只在输入（构建产物、拷入包的内容、签名身份）变化时**重新组装并用 **Apple 签发**的身份签名（`CODESIGN_IDENTITY` 可覆盖；签名不带安全时间戳，所以本地构建不依赖 Apple 的时间戳服务），随后交给用户级 `launchd` 启动。**只接受 Apple 签发与自签名两种身份，ad-hoc 一律拒绝**；Apple 身份签名失败时**构建失败**（除非显式 `--allow-signing-fallback` 要求退回自签名）。签名身份稳定，辅助功能/屏幕录制授权与钥匙串项的授权才能跨重建保留；输入没变就复用现有包，重启不会重置这些授权。
 
-单元测试默认无 GUI 依赖；剪贴板图片/历史测试夹具使用按进程、按线程隔离的系统临时目录。CG/AX **冒烟测试**标记为 `#[ignore]`，需要 GUI 会话和辅助功能权限：
+**启动是否成功由运行中的进程自己证明，而不是读磁盘上的 plist。** 脚本等待应用自己写出的 `[launch] pid=… executable=… version=… bundle=…` 记录——这行由进程自己写，因此只可能描述写下它的那个进程——并在 pid、可执行路径或版本对不上、或进程写完就退出时判定失败。日志窗口不可用时（已轮转、被截断、读不到），本次运行报告 `build timestamp: unverified` 而不是通过：那是报告，不是通过。汇报时用脚本打印的 `build-version`，它取自进程自己的报告。`--check` 会验证这样一次启动、随后把它停掉，既不留下进程也不留下 launchd 任务。
+
+**跨 worktree 同一时刻只允许一次构建/测试/启动事务。** 所有 worktree 共用一个 bundle id、一个 launchd label 和一份应用日志——正是这一点让 TCC 授权与钥匙串 ACL 跨重建保持有效——所以两个并发运行会争抢同一个实例。脚本在停任何东西之前，先在 git common 目录里取得 `lockf` 声明，最多等待 `--lock-wait=<秒>`（默认 900），超时以退出码 75 失败。该声明只覆盖这次事务：脚本留下的应用**不受保护**，下一次运行可能把它换掉。`scripts/dev-lock-selftest.sh` 会离线检查这份声明，包括跨 worktree 的情形。
+
+单元测试默认无 GUI 依赖；剪贴板图片/历史测试夹具使用按进程、按线程隔离的系统临时目录。请通过 `scripts/cargo-test.sh` 运行：过滤器匹配不到任何测试时 `cargo test` 仍以 0 退出并打印 `running 0 tests ... ok`，过滤器写错也会被当成通过——这个包装会统计实际执行的测试数，一个都没跑就判为失败。它把参数原样转给 `cargo test`，所以带过滤器时保护依然生效。
+
+CG/AX **冒烟测试**标记为 `#[ignore]`，需要 GUI 会话和辅助功能权限：
 
 ```sh
 cargo test -- --ignored
@@ -322,6 +375,8 @@ cargo test settings_layout_smoke -- --ignored
 它会以 `--smoke-settings-layout` 启动 debug 二进制，在主线程打开真实设置窗口，遍历全部七个页面，校验其子视图 frame 后退出。
 
 浮窗运行路径也有一个被忽略的子进程冒烟测试。先运行 `cargo build`，再执行 `cargo test overlay_runtime_smoke -- --ignored`；`--smoke-overlay` 会跳过单实例锁，避免已有开发版实例导致测试未执行却误判通过。
+
+**A2 场景**放在 `scripts/e2e/*.sh`，统一通过 `scripts/e2e/run-all.sh` 运行：它会自动发现该目录下所有可执行脚本，按顺序跑选中的那些。场景在头部用 `# E2E_STEALS_FOCUS=1` 声明自己会经系统事件流注入真实全局热键，这类场景默认跳过，需要显式加 `--include-focus`；声明 `# E2E_CHANGES_PREFS=1`（会改系统偏好）的场景同样默认跳过，需要 `--include-prefs`。`--list` 只打印本次会跑哪些场景。应用通过 `--e2e-state=<path>` 写出 JSON 快照，把脚本无法从辅助功能读到的内部事实自己讲出来；脚本对这些快照加真实 WindowServer 状态做断言；断言「已加密」的场景仍必须自己读磁盘文件，因为应用自述不算证据。
 
 ### 本地化与布局 QA
 

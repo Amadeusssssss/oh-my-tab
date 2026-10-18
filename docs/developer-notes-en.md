@@ -60,7 +60,7 @@ checks the running process for all of them, alongside `--panel-backdrop` and `--
 
 ## Icons may be incorrect in development mode
 
-When running the bare binary with `cargo run` for diagnostics, the overlay may occasionally show oh-my-tab's own card as an initial-letter placeholder instead of its application icon, and the problem may persist until the icon cache is cleared manually. The icon cache is keyed by bundle ID and uses the executable **mtime** as its invalidation fingerprint. Each development build relinks the binary and changes its mtime, invalidating the running instance's cache entry. Packaged `.app` builds are unaffected because the installed binary's mtime remains stable. For normal development runs, use `scripts/dev-restart.sh`; if the diagnostic binary shows this issue, use the *Clear Icon Cache* menu item or delete `~/Library/Caches/oh-my-tab-icons/`.
+When running the bare binary with `cargo run` for diagnostics, the overlay may occasionally show oh-my-tab's own card as an initial-letter placeholder instead of its application icon, and the problem may persist until the icon cache is cleared manually. The icon cache is keyed by bundle ID and uses the executable **mtime** as its invalidation fingerprint. Each development build relinks the binary and changes its mtime, invalidating the running instance's cache entry. Packaged `.app` builds are unaffected because the installed binary's mtime remains stable. For normal development runs, use `scripts/dev-restart.sh`; if the diagnostic binary shows this issue, use the *Clear Icon and Thumbnail Cache* menu item or delete `~/Library/Caches/oh-my-tab-icons/`.
 
 ## Mouse control may fail when launched from a debugger
 
@@ -401,11 +401,74 @@ holds `action` / `trigger` / `enabled`.
   master switch is off. It also still publishes `key_bindings_selected`, always `null` now, because
   the A2 schema requires the field to be present and typed.
 
+## Switcher panel action keys (Cmd+W / M / H / Q)
+
+Each of the four in-panel action keys is gated by its own switch under the App Switcher page
+(`windows.panel_close_enabled` / `_minimize_enabled` / `_hide_enabled` / `_quit_enabled`, all off by
+default: quitting an app is destructive and hiding one changes what the user is looking at).
+
+- **Routing.** Command-modified key equivalents never reach `keyDown:`; AppKit offers them to
+  `performKeyEquivalent:` first, so the overlay overrides it on its window (`src/overlay/panel_keys.rs`),
+  the same mechanism the settings window uses for its own Cmd+Q.
+- **Ownership, not outcome, decides consumption.** Once `panel_actions` has recorded a press as
+  claimed, the handler consumes it even when the action can no longer run (the panel went invisible
+  between the tap's pass-through and the main-thread call). Returning false there would hand a
+  panel-claimed Cmd+Q to the app's own Quit menu item and quit oh-my-tab -- the failure the design
+  round named -- so the action is cancelled instead.
+- **The summon becomes sticky.** Pressing an action key keeps the panel open and stops a later release
+  of the trigger modifier from committing a card; the user commits with Return or a click and dismisses
+  with Esc. Every other exit clears the sticky state, so nothing outlives its summon.
+- **Hiding or quitting moves the frontmost app**, which makes the non-activating panel resign key; the
+  ordinary resign path would treat that as a click-away and close the panel. A time-boxed,
+  consume-once guard (`ACTION_FOCUS_WINDOW`, 750 ms) suppresses only the resign the action caused.
+- **Keys follow the layout.** The physical key for each action is resolved from the live input source
+  on the main thread (`keycode_for_character`), with that action's ANSI position as a per-action
+  fallback, so one unresolvable key never disables the other three.
+
+## Settings backup (export and import)
+
+"Export settings" writes the live config as ordinary TOML under a small comment header
+(`# oh-my-tab settings export`, `# format = N`); the body is therefore also a valid `config.toml`.
+"Import settings" parses it with the app's own loader rather than deserializing it directly, which is
+what makes both directions survive a version difference: a field this build does not know is ignored,
+one it knows but rejects falls back on its own, and an older file's legacy `[quick_actions]` /
+`[window_control]` sections still seed the binding list. The header's format version guards the *file
+protocol* only -- it rises when the meaning of the file changes, not when the app gains settings.
+
+Two rules keep an import from doing damage. A file without the marker is refused, so a file that merely
+happens to be valid TOML cannot import as "everything at its default" and wipe the user's settings; and
+`restore_local_fields` keeps this machine's own values for the login item, the absolute log path, the
+keystroke panel's saved position, and the clipboard storage decisions (`enabled`, `max_entries`,
+`auto_expire_days`, `clear_on_quit`) -- importing `clipboard.enabled = false` over a machine that has it
+on would otherwise run the feature's disable path and delete the stored history. A re-export is
+lossless for what this build understands, not for the bytes: unknown fields have nowhere to live in the
+live `Config`.
+
+## Menu-bar icon and reopening
+
+"Hide menu bar icon" (`startup.hide_menu_bar_icon`) calls `NSStatusItem.isVisible = NO` on the live
+item instead of destroying it, so menu-title refreshes, the clipboard pin's check state and the main
+menu's key equivalents keep working while the icon is hidden. The switch travels with export/import
+(it is a display preference, not a per-machine registration, unlike launch-at-login).
+
+With the icon hidden the app must not become unreachable: the switcher's footer gear and the clipboard
+panel's gear open the relevant settings page, and activating the app again (Finder, Spotlight,
+`open -a`) is handled by `applicationShouldHandleReopen:hasVisibleWindows:`, which opens Settings
+with that callback returning NO so AppKit does not also perform its generic reopen. Launching the
+binary path directly is not that path: a second process is refused by the single-instance lock and
+exits, so the running instance never sees it.
+
 ## Building and testing
 
 `scripts/dev-restart.sh` is the normal way to run the app during development. It builds the development `.app` and re-assembles and re-signs it only when its inputs change (the built binary, the bundled resources, the signing identity), using the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery; signing is done without a secure timestamp so a local build never depends on Apple's timestamp service), then launches it through the per-user `launchd` domain. **Only two identities are accepted -- the Apple-issued one and the self-signed one; ad-hoc is refused**, and a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` asks for the self-signed identity on purpose. A stable signing identity is what keeps the Accessibility, Screen Recording and keychain grants alive across rebuilds; when nothing changed the existing bundle is reused, so a restart does not reset them.
 
-The unit-test suite is headless-safe by default; clipboard image and history fixtures use isolated temporary directories per process and thread. The CG/AX **smoke tests** are marked `#[ignore]` and need a GUI session plus an Accessibility grant:
+**A launch is verified from the running process, never from the plist on disk.** The script waits for the app's own `[launch] pid=… executable=… version=… bundle=…` record -- written by the process itself, so it can only describe the process that wrote it -- and fails when the pid, the executable path or the version disagree, or when the process exited right after writing it. When the log window is unusable (rotated, truncated, unreadable) the run reports `build timestamp: unverified` instead of passing; that is a report, not a pass. Report the `build-version` the script prints, which is the one the process reported. `--check` verifies such a launch and then stops it, leaving neither the process nor its launchd job behind.
+
+**One build/test/launch transaction at a time, across worktrees.** Every worktree shares one bundle id, one launchd label and one app log -- that is what keeps the TCC grants and the keychain ACL valid across rebuilds -- so two concurrent runs fight over one instance. The script takes a `lockf` claim in the git common directory before it stops anything and waits up to `--lock-wait=<sec>` (default 900) before failing with exit 75. The claim covers the transaction only: the app the script leaves running is not protected, and the next run may replace it. `scripts/dev-lock-selftest.sh` checks the claim offline, including the cross-worktree case.
+
+The unit-test suite is headless-safe by default; clipboard image and history fixtures use isolated temporary directories per process and thread. Run it through `scripts/cargo-test.sh`: a `cargo test` filter that matches nothing exits 0 while printing `running 0 tests ... ok`, so a typo in a filter reads as a pass — the wrapper counts the executed tests and fails the run when the count is zero. It forwards every argument to `cargo test`, so a filter keeps the guard.
+
+The CG/AX **smoke tests** are marked `#[ignore]` and need a GUI session plus an Accessibility grant:
 
 ```sh
 cargo test -- --ignored
@@ -421,6 +484,8 @@ cargo test settings_layout_smoke -- --ignored
 It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits all seven pages, validates their descendant view frames, and exits.
 
 The overlay runtime path also has an ignored child-process smoke test. Run `cargo build` first, then `cargo test overlay_runtime_smoke -- --ignored`; its `--smoke-overlay` switch bypasses the single-instance guard so an already-running development app cannot turn the test into a false pass.
+
+The **A2 scenarios** live in `scripts/e2e/*.sh` and run through `scripts/e2e/run-all.sh`, which discovers every executable script in that directory and runs the selected ones in order. A scenario declares `# E2E_STEALS_FOCUS=1` when it injects a real global hotkey through the system event stream; those are skipped unless `--include-focus` is passed, and one declaring `# E2E_CHANGES_PREFS=1` (it touches a system preference) is skipped unless `--include-prefs` is passed. `--list` prints what this run would execute. The app writes the facts a scenario cannot read back through Accessibility — `--e2e-state=<path>` JSON snapshots — and the scripts assert on those plus real WindowServer state; a scenario that asserts encryption must still read the stored file itself, because a self-report is not evidence.
 
 ### Localization and layout QA
 

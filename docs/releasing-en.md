@@ -4,7 +4,7 @@ This document covers maintainer-only release and packaging details: the Homebrew
 
 ## Homebrew cask release
 
-`scripts/release.sh` is the production release pipeline. Without an action flag, it builds local artifacts and generates `dist/oh-my-tab.rb`. The cask contains the DMG `sha256`, the version from `Cargo.toml`, and a `zap trash:` block for removing the icon cache, logs, and application data on uninstall.
+`scripts/release.sh` is the production release pipeline. Without an action flag, it builds local artifacts and generates `dist/oh-my-tab.rb`. The cask contains the DMG `sha256`, the version from `Cargo.toml`, and a `zap trash:` block for removing the icon cache, logs, and application data on uninstall. That block removes `~/Library/Caches/oh-my-tab-icons`, `~/Library/Logs/oh-my-tab`, and `~/.config/oh-my-tab` — the last one holds the encrypted clipboard history index, so `brew uninstall --zap` covers it — but it does **not** remove the sealed clipboard image cache under `~/Library/Caches/oh-my-tab-clip-images` or the clipboard purge marker under `~/Library/Application Support/oh-my-tab`; delete those by hand if a machine must be left without them.
 
 Production publishing uses a separate notarization flow. R2 publishing starts after Apple accepts the notarization submission and `--push` is supplied; `--staple` attaches the accepted ticket to the staged app as its own step when you want to verify it before publishing.
 
