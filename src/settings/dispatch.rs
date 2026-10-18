@@ -1869,27 +1869,28 @@ fn local_timestamp_stamp() -> String {
     crate::ffi::format_local_timestamp(secs)
 }
 
-/// Suggested export filename: the app's own name plus the local timestamp, e.g.
-/// `Oh-My-Tab 2026-10-14 11.54.20.toml`.
+/// Suggested export filename: the fixed prefix plus the local timestamp, e.g.
+/// `oh-my-tab_backup_2026-10-14 11.54.20.toml`.
 ///
-/// The name comes from the bundle so a dev build names its files after itself, and the stamp is the
-/// shared local-time format the clipboard's save-as uses, so a saved file reads correctly next to
-/// Finder's own clock.
+/// The stamp is the shared local-time format the clipboard's save-as uses, so a saved file reads
+/// correctly next to Finder's own clock.
 fn suggested_export_config_name() -> String {
-    export_file_name(EXPORT_FILE_APP_NAME, &local_timestamp_stamp())
+    export_file_name(EXPORT_FILE_PREFIX, &local_timestamp_stamp())
 }
 
-/// The name the export file is named after.
+/// The prefix the export file is named after.
 ///
 /// A fixed string rather than the bundle's own name: the file is meant to be recognized and shared,
 /// and a bundle-derived name would rename it in the development bundle ("Oh-My-Tab Dev") and in any
-/// localized build, so the same user would get differently named backups from different builds.
-const EXPORT_FILE_APP_NAME: &str = "Oh-My-Tab";
+/// localized build, so the same user would get differently named backups from different builds. It is
+/// lowercase and underscore-separated so a backup sorts and reads like the other files this app
+/// writes (`oh-my-tab.log`), and so it never looks like the app bundle itself.
+const EXPORT_FILE_PREFIX: &str = "oh-my-tab_backup";
 
-/// The export filename for an app name and stamp. Pure, so the shape is asserted without FFI; the
-/// live path only supplies the two inputs.
-fn export_file_name(app_name: &str, stamp: &str) -> String {
-    format!("{app_name} {stamp}.toml")
+/// The export filename for a prefix and stamp. Pure, so the shape is asserted without FFI; the live
+/// path only supplies the two inputs.
+fn export_file_name(prefix: &str, stamp: &str) -> String {
+    format!("{prefix}_{stamp}.toml")
 }
 
 /// The settings "Export settings" button: write the whole live configuration to a user-chosen
@@ -2261,14 +2262,14 @@ mod portability_ui_tests {
         );
     }
 
-    /// The filename is the app's name plus the local timestamp, and the extension is what the save
+    /// The filename is the fixed prefix plus the local timestamp, and the extension is what the save
     /// panel shows and what a user later recognizes.
     #[test]
-    fn the_export_name_is_the_app_name_plus_a_local_stamp() {
-        // A pure example pins the shape and the separator...
+    fn the_export_name_is_the_prefix_plus_a_local_stamp() {
+        // A pure example pins the shape, the underscore separator and the lowercase prefix...
         assert_eq!(
-            super::export_file_name("Oh-My-Tab", "2026-10-14 11.54.20"),
-            "Oh-My-Tab 2026-10-14 11.54.20.toml"
+            super::export_file_name("oh-my-tab_backup", "2026-10-14 11.54.20"),
+            "oh-my-tab_backup_2026-10-14 11.54.20.toml"
         );
         // ...and the stamp itself is the shared local-time format, never a bare epoch or a UTC
         // rendering: `YYYY-MM-DD HH.MM.SS` (dots, because colons are reserved in Finder names).
@@ -2281,22 +2282,22 @@ mod portability_ui_tests {
         assert_eq!(stamp.as_bytes()[16], b'.', "got {stamp}");
     }
 
-    /// The live filename really goes through the app name and the stamp, so a caller cannot
-    /// regress to a hardcoded slug without this failing.
+    /// The live filename really goes through the prefix and the stamp, so a caller cannot regress to
+    /// a hardcoded slug without this failing.
     #[test]
-    fn the_live_export_name_carries_the_app_name_and_a_stamp() {
+    fn the_live_export_name_carries_the_prefix_and_a_stamp() {
         let name = super::suggested_export_config_name();
-        // The stamp is the tail of the name, so stripping it leaves exactly the app name. This
-        // fails on the hardcoded slug the feature started with, which had neither.
-        let suffix = format!(" {}.toml", super::local_timestamp_stamp());
-        let app = name
+        // The stamp is the tail of the name, so stripping it leaves exactly the prefix. This fails on
+        // the hardcoded slug the feature started with, which had neither.
+        let suffix = format!("_{}.toml", super::local_timestamp_stamp());
+        let prefix = name
             .strip_suffix(&suffix)
             .unwrap_or_else(|| panic!("{name} must end with the local stamp {suffix}"));
-        assert!(!app.is_empty(), "the app name must name the file: {name}");
+        assert!(!prefix.is_empty(), "the prefix must name the file: {name}");
         assert_eq!(
-            app,
-            super::EXPORT_FILE_APP_NAME,
-            "the app name must name the file"
+            prefix,
+            super::EXPORT_FILE_PREFIX,
+            "the prefix must name the file"
         );
     }
 
