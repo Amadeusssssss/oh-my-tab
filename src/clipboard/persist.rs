@@ -2581,17 +2581,26 @@ mod encryption_tests {
         // The whole set still exists aside: nothing was deleted. In a test build the history
         // directory lives INSIDE the cache directory, so moving the cache aside carries the
         // history with it (production moves the index file and the cache separately).
+        //
+        // The copy must be THIS one. The test cache name is process- and thread-scoped, and the temp
+        // directory is shared with every earlier run, so matching any name containing `.failed-`
+        // accepted a stranger leftover: the read_dir order then decided the verdict, and a stale copy
+        // holding an empty `history/` failed the assertion (measured on this machine: 979 such copies,
+        // 124 of 200 sampled without a history file).
         let parent = cache_dir.parent().unwrap();
+        let cache_name = cache_dir
+            .file_name()
+            .expect("the test cache directory has a name")
+            .to_string_lossy();
         let aside_cache = std::fs::read_dir(parent)
             .unwrap()
             .flatten()
             .map(|e| e.path())
             .find(|p| {
                 p.file_name()
-                    .map(|n| n.to_string_lossy().contains(".failed-"))
-                    .unwrap_or(false)
+                    .is_some_and(|n| is_kept_aside_name(&cache_name, &n.to_string_lossy()))
             })
-            .expect("the cache directory must be kept aside");
+            .expect("this run's cache directory must be kept aside");
         fn holds_history(dir: &std::path::Path) -> bool {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return false;
@@ -3487,6 +3496,39 @@ mod encryption_tests {
         assert!(resume_isolation(storage::generation()));
         assert!(!history_file_path().exists());
         clean_disk();
+    }
+
+    /// A kept-aside copy belongs to exactly one storage set. The cache directory's name is
+    /// process- and thread-scoped and `$TMPDIR` is shared with every earlier run, so a lookup that
+    /// accepted any name containing `.failed-` read whichever copy `read_dir` happened to return and
+    /// let iteration order decide a test's verdict (the isolation test failed roughly 4 runs in 10
+    /// on a machine holding 979 stale copies).
+    #[test]
+    fn a_kept_aside_copy_is_scoped_to_its_own_storage_set() {
+        let ours = "oh-my-tab-clip-images-test-4242-ThreadId(7)";
+        // The copy this app writes for that set, with and without the collision suffix.
+        assert!(is_kept_aside_name(
+            ours,
+            &format!("{ours}.failed-1792242803")
+        ));
+        assert!(is_kept_aside_name(
+            ours,
+            &format!("{ours}.failed-1792242803-3")
+        ));
+        // A DIFFERENT set's copy, which is what the old substring match accepted.
+        for stranger in [
+            "oh-my-tab-clip-images-test-9299-ThreadId(7).failed-1792242803",
+            "oh-my-tab-clip-images-test-4242-ThreadId(77).failed-1792242803",
+            "oh-my-tab-clip-images-test-4242-ThreadId(7)-other.failed-1792242803",
+        ] {
+            assert!(
+                !is_kept_aside_name(ours, stranger),
+                "{stranger} is not this set's copy"
+            );
+        }
+        // The active directory itself and a hand-made lookalike are not copies either.
+        assert!(!is_kept_aside_name(ours, ours));
+        assert!(!is_kept_aside_name(ours, &format!("{ours}.failed-backup")));
     }
 
     #[test]
