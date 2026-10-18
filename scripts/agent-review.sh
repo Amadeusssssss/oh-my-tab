@@ -55,13 +55,13 @@
 #                                    and interruptions
 #   .agent-review/session-backend    which backend issued that session id, so a switch drops it
 #   .agent-review/last-review.txt    the newest readable review (also printed)
-#   .agent-review/last-review.jsonl  the newest raw event stream
 #   .agent-review/last-message.txt   the CLI's own final-message file for the newest run
 #   .agent-review/last-stderr.txt    the CLI's stderr for the newest run
 #   .agent-review/last-status.txt    what the classification pass made of the newest run
 #   .agent-review/round-counter      the round number the archive names carry
 #   .agent-review/session-log.tsv    every session's beginning, resumption, loss and deliberate end
-#   .agent-review/rounds/            every attempt's events, message, stderr and outcome
+#   .agent-review/rounds/            every attempt's summary events, message, stderr and outcome
+#   .agent-review/notes/             design briefs and --note-file drafts, kept out of the root
 #
 # Each round's outcome names the reviewer and the settings that round ran under, with each setting's
 # origin, so the configuration of an old round survives the next round overwriting last-status.txt.
@@ -125,6 +125,9 @@ CONFIG_FILE="$ROOT/agent-review.toml"
 
 BASE_DIR="$ROOT/.agent-review"
 TASKS_DIR="$BASE_DIR/tasks"
+# Drafts that --note-file reads belong to the task they describe, not to the root of this directory:
+# a reader that lists the root shallowly should see the state, not every brief of every past task.
+NOTES_DIR="$BASE_DIR/notes"
 
 # The conclusion is one authoritative value, so it is replaced, not appended: a signal that arrives while the
 # round is being archived must be able to turn this round's `concluded=yes` into `concluded=no`.
@@ -442,7 +445,9 @@ SESSION_FILE="$STATE_DIR/codex-session-id"
 # issued it, so a reviewer switch has to drop the pointer rather than hand it to the other backend.
 SESSION_BACKEND_FILE="$STATE_DIR/session-backend"
 OUTPUT_FILE="$STATE_DIR/last-review.txt"
-JSON_FILE="$STATE_DIR/last-review.jsonl"
+# The round's own capture file, not a `last-*` pointer: nothing is meant to read a finished round's
+# stream from here, so it is named for the round and removed with it.
+JSON_FILE="$STATE_DIR/round-events.jsonl"
 MESSAGE_FILE="$STATE_DIR/last-message.txt"
 STDERR_FILE="$STATE_DIR/last-stderr.txt"
 STATUS_FILE="$STATE_DIR/last-status.txt"
@@ -501,7 +506,8 @@ if [[ "$finish" == 1 ]]; then
             "$(cat "$STATE_DIR/round-counter" 2>/dev/null || echo -)" "$(cat "$KIND_FILE" 2>/dev/null || echo -)"
     fi
     rm -f "$SESSION_FILE" "$SESSION_BACKEND_FILE" "$OUTPUT_FILE" "$STATE_DIR/last-plan.txt" "$KIND_FILE" \
-        "$JSON_FILE" "$MESSAGE_FILE" "$STATUS_FILE" "$TIMEOUT_MARKER" "$JSON_FILE.stream-message"
+        "$JSON_FILE" "$JSON_FILE.final-message" "$MESSAGE_FILE" "$STATUS_FILE" "$TIMEOUT_MARKER" \
+        "$JSON_FILE.stream-message"
     if [[ -n "$TASK_SOURCE" ]]; then
         echo "Reviewer session cleared (task: $TASK_KEY)."
     else
@@ -975,11 +981,50 @@ if [[ "$changes" -eq 1 && "$retry" != 1 && "$design" != 1 ]]; then
     exit 65
 fi
 
+# Briefs and note drafts typed straight into .agent-review/ belong to the task they describe, not to the
+# root, which otherwise keeps one file per round of every past task. Moved rather than deleted: they are
+# the author's own words, and --note-file still reads them from their new place. Only *.md files are
+# touched, so no name the script writes (the last-* pointers, the counter, the session log) can move, and
+# an existing notes/ file is never overwritten. bash 3.2 is why the listing is a heredoc and not a
+# mapfile: macOS ships that shell, and an empty file list has to come out as an empty list, not as one
+# entry named "".
+move_root_drafts() {
+    [[ -d "$BASE_DIR" ]] || return 0
+    local -a drafts=()
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && drafts+=("$f")
+    done <<list
+$(cd "$BASE_DIR" && find . -maxdepth 1 -type f -name '*.md' 2>/dev/null | sed 's|^\./||' | sort)
+list
+    [[ "${#drafts[@]}" -gt 0 ]] || return 0
+    mkdir -p "$NOTES_DIR"
+    for f in "${drafts[@]}"; do
+        [[ -e "$NOTES_DIR/$f" ]] && continue
+        mv "$BASE_DIR/$f" "$NOTES_DIR/$f" 2>/dev/null || true
+    done
+}
+move_root_drafts
+
 if [[ -n "$note_file" ]]; then
-    if [[ ! -f "$note_file" ]]; then
-        echo "--note-file: not a file: $note_file" >&2
+    # A draft named at the root that the move above just put under notes/ is read from there: the caller
+    # typed the path from habit. Its 66 names the path as typed, so the message still makes sense to
+    # the caller. Compared after resolving both sides, because git reports the repository through any
+    # symlinked directory (/private/var vs /var on macOS) and a plain prefix test would then miss the
+    # file it had just moved.
+    note_typed="$note_file"
+    note_resolved="$note_file"
+    base_real="$(cd "$BASE_DIR" 2>/dev/null && pwd -P || printf '%s' "$BASE_DIR")"
+    note_real_dir="$(cd "$(dirname "$note_resolved")" 2>/dev/null && pwd -P || true)"
+    if [[ -n "$note_real_dir" && "$note_real_dir" == "$base_real" && ! -e "$note_resolved" ]]; then
+        moved="$NOTES_DIR/$(basename "$note_resolved")"
+        [[ -f "$moved" ]] && note_resolved="$moved"
+    fi
+    if [[ ! -f "$note_resolved" ]]; then
+        echo "--note-file: not a file: $note_typed" >&2
         exit 66
     fi
+    note_file="$note_resolved"
     from_file="$(<"$note_file")"
     if [[ -n "$note" ]]; then
         note="$note"$'\n\n'"$from_file"
@@ -993,6 +1038,9 @@ WATCHDOG_PID=""
 REASON=""
 CODE=0
 ARCHIVED=0
+# Set when archive_round could not archive this round: the failure report must then point at the capture
+# files it left in $STATE_DIR rather than at evidence that does not exist.
+ARCHIVE_FAILED=0
 
 # Whether the process group still has any member. Asking about the group rather than about the
 # process that led it is what makes the sweep below complete: the CLI can exit on TERM while a
@@ -1061,6 +1109,10 @@ keep_session() {
         if [[ -n "$found" ]]; then
             printf '%s\n' "$found" > "$SESSION_FILE"
             printf '%s\n' "$REVIEWER" > "$SESSION_BACKEND_FILE"
+            # The round created this session, so its event goes with the pointer, not after the CLI
+            # returns: the capture file is removed once the round is archived, and a later read of it
+            # would find nothing. Still idempotent -- log_round_session reads the log, not a flag.
+            log_round_session
         fi
     fi
 }
@@ -1098,22 +1150,123 @@ log_round_session() {
     ROUND_SESSION_LOGGED=1
 }
 
-# Every attempt's evidence is kept — events, the final message, the CLI's stderr and the outcome — so
-# that a failed round cannot take the previous round's review with it, and a failure can be explained
-# later from what it actually printed.
+# What in a round's capture file is worth keeping. The stream is mostly the reviewer's own work -- the
+# output of every command it ran, once the tool ran it and once it reported the result -- and none of
+# that is evidence about the review: measured over this repository's own archive it was about 97% of
+# the bytes. The round boundaries, the session, the errors and the final message are what explains a
+# round after the fact, so those are what the summary keeps. A line that will not parse is kept as it
+# is, because an unreadable event may be exactly the thing that went wrong.
+summarize_events() {
+    local src="$1" dst="$2"
+    python3 - "$src" "$dst" <<'PY'
+import json
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+# codex's turn boundaries and pi's run boundaries. pi has no -o file, so its answer exists only in the
+# stream: dropping message_end would leave an empty summary, which then falls back to the raw file --
+# and a single unparsable line next to it would make the summary non-empty and take the answer with it.
+KEEP_TYPES = {
+    "thread.started", "thread.completed", "turn.started", "turn.completed", "turn.failed",
+    "item.started", "item.updated", "error",
+    "session", "agent_start", "agent_end", "turn_start", "turn_end", "agent_settled",
+    "message_start", "message_end", "auto_retry_end",
+}
+
+with open(src, "r", encoding="utf-8", errors="replace") as r, open(dst, "w", encoding="utf-8") as w:
+    for line in r:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            w.write(line)
+            continue
+        keep = False
+        if not isinstance(event, dict):
+            keep = True
+        else:
+            kind = event.get("type") or ""
+            if kind in KEEP_TYPES or "error" in kind or "failed" in kind:
+                keep = True
+            else:
+                item = event.get("item")
+                # The tool call without what the tool printed: the command names what the reviewer
+                # did, its output can be hundreds of kilobytes, and the same output appears again in
+                # item.completed.
+                if kind == "item.completed" and isinstance(item, dict):
+                    if item.get("type") == "agent_message":
+                        keep = True
+                    elif item.get("type") == "error":
+                        keep = True
+                    elif item.get("type") == "command_execution":
+                        # The command and how it ended. The result is what tells a reviewer's failed
+                        # test run from a passing one after the fact: without exit_code the archive
+                        # cannot explain the failure the round was diagnosing.
+                        event["item"] = {
+                            k: item[k]
+                            for k in ("type", "command", "status", "exit_code")
+                            if k in item
+                        }
+                        keep = True
+                        if item.get("exit_code") not in (None, 0) and isinstance(item.get("aggregated_output"), str):
+                            # A bounded head of what it printed, kept only for a failed command. The head,
+                            # not the tail: a failure is reported where it starts (the first failing test,
+                            # the error line), and repeated progress output is exactly what a tail would keep.
+                            event["item"]["output_tail"] = item["aggregated_output"][:2000]
+        if keep:
+            w.write(json.dumps(event, ensure_ascii=False) + "\n")
+PY
+}
+
+# Never archives an empty summary: a capture file the summary left with nothing in it is copied as it
+# is, so "no events" cannot be mistaken for "the summary dropped them". A summary that could not be
+# written at all is a failed copy, not an empty one: that reports failure, so the raw capture file is
+# kept rather than quietly replaced by a copy that may also have failed.
+archive_events() {
+    local dst="$1"
+    if ! summarize_events "$JSON_FILE" "$JSON_FILE.summary" 2>/dev/null; then
+        rm -f "$JSON_FILE.summary"
+        return 1
+    fi
+    if [[ -s "$JSON_FILE.summary" ]]; then
+        mv "$JSON_FILE.summary" "$dst"
+    else
+        rm -f "$JSON_FILE.summary"
+        cp "$JSON_FILE" "$dst"
+    fi
+}
+
+# Every attempt's evidence is kept — a summary of its events, the final message, the CLI's stderr and
+# the outcome — so that a failed round cannot take the previous round's review with it, and a failure
+# can be explained later from what it actually printed. The round's own capture files are removed once
+# they have been archived: a capture file that outlived its round would be read by the next one as if
+# it were new output (this repository's empty stderr files were exactly that).
 archive_round() {
     [[ "$ARCHIVED" == 0 ]] || return 0
     ARCHIVED=1
-    local reason="$1" code="$2" stamp
+    local reason="$1" code="$2" stamp status=0
     # The number this round was already logged under, so the archive and the session log name the same
     # attempt. Recomputed only if a caller ever archives without one, which keeps the counter honest
     # rather than writing a stamp with an empty number.
     local round_number="${ROUND_NUMBER:-$(next_round_number)}"
     printf '%s\n' "$round_number" > "$STATE_DIR/round-counter"
     stamp="$(date -u +%Y%m%dT%H%M%SZ)-$(printf '%03d' "$round_number")"
-    [[ -s "$JSON_FILE" ]] && cp "$JSON_FILE" "$ROUNDS_DIR/$stamp-events.jsonl"
-    [[ -s "$MESSAGE_FILE" ]] && cp "$MESSAGE_FILE" "$ROUNDS_DIR/$stamp-$ROUND_KIND.txt"
-    [[ -s "$STDERR_FILE" ]] && cp "$STDERR_FILE" "$ROUNDS_DIR/$stamp-stderr.txt"
+    # Each copy is checked, not assumed. A failed copy used to be invisible -- the caller reads the
+    # stamp from a command substitution, which does not inherit errexit -- so the capture files were
+    # removed and the round reported success with nothing archived. Nothing is removed below unless
+    # every copy succeeded.
+    if [[ -s "$JSON_FILE" ]] && ! archive_events "$ROUNDS_DIR/$stamp-events.jsonl"; then
+        status=1
+    fi
+    # The round's own final message, not the durable copy: last-message.txt holds the newest message of
+    # any round, so copying it would archive another round's message under this round's stamp.
+    if [[ -s "$JSON_FILE.final-message" ]] && ! cp "$JSON_FILE.final-message" "$ROUNDS_DIR/$stamp-$ROUND_KIND.txt"; then
+        status=1
+    fi
+    # Copied only when it has content: the CLI writes its "reading additional input from stdin"
+    # notice on every run, and an archive of that notice, once per round, explains nothing.
+    if [[ -s "$STDERR_FILE" ]] && ! cp "$STDERR_FILE" "$ROUNDS_DIR/$stamp-stderr.txt"; then
+        status=1
+    fi
     {
         echo "reason=$reason"
         echo "exit=$code"
@@ -1142,8 +1295,22 @@ archive_round() {
             echo "reasoning_effort_rejected=${REASONING_EFFORT_REJECTED:-no}"
             echo "service_tier_rejected=${SERVICE_TIER_REJECTED:-no}"
         fi
-    } > "$ROUNDS_DIR/$stamp-outcome.txt"
+    } > "$ROUNDS_DIR/$stamp-outcome.txt" || status=1
+    # The stream fallback is the one capture file that survives its round: the failure report reads it
+    # *after* the round is archived, and it describes a message the round did not confirm as final,
+    # which is never archived. The next round's start removes it, so it cannot outlive its purpose.
+    # last-message.txt stays too: the durable copy of the newest review, which --finish clears.
+    if [[ "$status" -eq 0 ]]; then
+        rm -f "$JSON_FILE" "$JSON_FILE.summary" "$JSON_FILE.final-message"
+    fi
     echo "$stamp"
+    if [[ "$status" -ne 0 ]]; then
+        # Said on stderr, named by the stamp, so the round is not reported as archived when it is not.
+        echo "The archive of round $stamp could not be written in full; the round's capture files are" >&2
+        echo "kept at $STATE_DIR so nothing is lost. Check that $ROUNDS_DIR is writable." >&2
+        return 1
+    fi
+    return 0
 }
 
 # Ctrl+C and TERM: stop the watchdog, stop the CLI and everything it started, keep the session,
@@ -1168,7 +1335,12 @@ on_signal() {
     # earlier round that did conclude.
     set_concluded no
     rm -f "$OUTPUT_FILE"
-    archive_round "$REASON" "$CODE" >/dev/null || true
+    # Whatever the round's -o file holds was not counted as a completed message, but it is the last thing
+    # the reader has of this round: promote it so the failure report and the retry can show it. This is
+    # the one place outside the classification pass that writes last-message.txt, and it is the one place
+    # where "unverified" is the point.
+    [[ -s "$JSON_FILE.final-message" ]] && cp "$JSON_FILE.final-message" "$MESSAGE_FILE"
+    archive_round "$REASON" "$CODE" >/dev/null || ARCHIVE_FAILED=1
     exit "$signal"
 }
 
@@ -1204,7 +1376,38 @@ fi
 # A new round starts clean: a stale review must never be read as this round's, and the status record belongs to
 # this round from here on. Without that, an interrupted round would leave the previous round's `concluded=yes`
 # behind, and a retry would refuse to resume a round that in fact never concluded.
-rm -f "$OUTPUT_FILE" "$MESSAGE_FILE" "$TIMEOUT_MARKER" "$JSON_FILE.stream-message"
+# last-message.txt is not among them: the CLI writes to its capture file, and only the classification
+# pass copies a final message into last-message.txt, so a failed round cannot leave this round's
+# message there before that pass has read one.
+#
+# A capture file still here belongs to a round whose archive failed (a successful archive removes it).
+# Overwriting it would destroy the only copy of that round's evidence, so it is set aside in a
+# directory of its own and the round refuses to start if even that is impossible. Only then are this
+# round's names cleared.
+#
+# mkdir, not mv, makes the name unique: a second-resolution stamp is not unique (two failures within
+# one second are easy to produce with --retry), and mv overwrites its destination silently. A directory
+# mkdir refuses to create if it exists, so three quick failures leave three sets of evidence.
+for stale in "$JSON_FILE" "$JSON_FILE.final-message" "$JSON_FILE.stream-message"; do
+    [[ -e "$stale" ]] || continue
+    dir="$STATE_DIR/unarchived/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$stale")"
+    mkdir -p "$STATE_DIR/unarchived" 2>/dev/null || true
+    n=0
+    while [[ -e "$dir" ]]; do
+        n=$((n + 1))
+        [[ "$n" -gt 100 ]] && break
+        dir="$STATE_DIR/unarchived/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$stale").$n"
+    done
+    keep="$dir/$(basename "$stale")"
+    if ! mkdir "$dir" 2>/dev/null || ! mv "$stale" "$keep"; then
+        echo "A previous round's capture file could not be set aside, and starting this round would" >&2
+        echo "overwrite it: $stale" >&2
+        echo "Copy or remove that file, or fix $dir, then run again. Nothing was reviewed." >&2
+        exit 74
+    fi
+    echo "Kept an unarchived capture file from an earlier round: $keep" >&2
+done
+rm -f "$OUTPUT_FILE" "$TIMEOUT_MARKER"
 : > "$STDERR_FILE"
 {
     echo "concluded=no"
@@ -1562,7 +1765,11 @@ if [[ ! -f "$SESSION_FILE" ]]; then
         if [[ -n "$REASONING_EFFORT" ]]; then
             set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
         fi
-        set -- "$@" --json -o "$MESSAGE_FILE" "$FIRST_PROMPT"
+        # The turn's final message goes to a private file rather than the durable last-message.txt: only
+        # the classification pass may make a message from this round official, so a round that never
+        # completed leaves the previous round's last-message.txt alone. The capture files are removed
+        # once the round has been archived.
+        set -- "$@" --json -o "$JSON_FILE.final-message" "$FIRST_PROMPT"
         run_cli codex "$@" || status=$?
     fi
     # Logged after the CLI ran, because only then does the new session have an id: the record has to
@@ -1599,7 +1806,7 @@ else
         if [[ -n "$REASONING_EFFORT" ]]; then
             set -- "$@" -c "model_reasoning_effort=$REASONING_EFFORT"
         fi
-        set -- "$@" --json -o "$MESSAGE_FILE" "$PROMPT"
+        set -- "$@" --json -o "$JSON_FILE.final-message" "$PROMPT"
         run_cli codex "$@" || status=$?
     fi
     # A resume can silently lose the memory it promised: codex fails the run when it no longer holds the
@@ -1624,13 +1831,21 @@ fi
 # authoritative message for that backend; pi has no -o file, so its last assistant message_end is, per
 # its JSON-mode documentation, the authoritative final message and is written to the same file. A
 # message that exists only in codex's event stream stays evidence rather than being promoted to a verdict.
-python3 - "$REVIEWER" "$JSON_FILE" "$MESSAGE_FILE" "$STATUS_FILE" "$MARKER_NAME" "$ROUND_KIND" <<'PY'
+#
+# The last two arguments are the round's capture file for -o and the durable last-message.txt. The
+# backend writes only the first; the second is written here, from whatever the round itself produced,
+# so the failure report and a retry show this round's message rather than the previous round's. Keeping
+# the backend off the durable path is what stops a round that never reached the CLI from erasing the
+# last review, and it stops a stale last-message.txt being read back as this round's -o result.
+python3 - "$REVIEWER" "$JSON_FILE" "$JSON_FILE.final-message" "$MESSAGE_FILE" "$STATUS_FILE" \
+    "$MARKER_NAME" "$ROUND_KIND" <<'PY'
 import json
+import os
 import re
 import sys
 
-reviewer, events_path, message_path, status_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-marker_name, round_kind = sys.argv[5], sys.argv[6]
+reviewer, events_path, message_path, durable_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+status_path, marker_name, round_kind = sys.argv[5], sys.argv[6], sys.argv[7]
 
 thread_id = ""
 completed = False
@@ -1640,6 +1855,9 @@ tier_rejected = False
 reasoning_rejected = False
 message = ""
 incomplete = ""
+# What the backend put in its -o file. "none" when there is no file at all: pi has none by design, so
+# the stream's message is the round's; codex having none is the ordinary missing-message case.
+final_message = "none"
 
 
 def one_line(value):
@@ -1659,7 +1877,8 @@ if reviewer == "pi":
     last_stop = ""
     saw_assistant = False
     try:
-        with open(events_path, "r", encoding="utf-8") as f:
+        # errors="replace": one malformed byte must cost that byte, not the whole round's classification.
+        with open(events_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     event = json.loads(line)
@@ -1704,14 +1923,12 @@ if reviewer == "pi":
         incomplete = "the pi turn did not finish (the last assistant message stopped with '%s')" % (last_stop or "no stop reason")
     completed = settled and not aborted and saw_assistant and last_stop == "stop"
     message = stream_message.strip()
-    if message:
-        with open(message_path, "w", encoding="utf-8") as f:
-            f.write(message)
 else:
     # codex reports a completed turn as an event, keeps a declined tier or effort as an error item, and
     # writes the final message to its own -o file, which is the authoritative source for one.
     try:
-        with open(events_path, "r", encoding="utf-8") as f:
+        # The same tolerance as the pi branch: undecodable bytes are replaced, never fatal.
+        with open(events_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     event = json.loads(line)
@@ -1746,6 +1963,23 @@ else:
     try:
         with open(message_path, "r", encoding="utf-8") as f:
             message = f.read().strip()
+    except FileNotFoundError:
+        pass
+    if message:
+        final_message = message
+
+# What the round's own -o file holds becomes the durable last-message.txt, so the failure report and a
+# retry show this round's message rather than the previous round's. Writing it here, and not by pointing
+# the CLI at the durable path, is what keeps a round that never reached the CLI from erasing the last
+# review; what the message is *worth* is the verdict check below, not this copy.
+if message:
+    with open(durable_path, "w", encoding="utf-8") as f:
+        f.write(message + "\n")
+else:
+    # No message of its own: the previous round's copy is not this round's evidence. Without this, a
+    # round that produced nothing would have the last review printed as the message that arrived.
+    try:
+        os.remove(durable_path)
     except FileNotFoundError:
         pass
 
@@ -1804,7 +2038,22 @@ with open(status_path, "w", encoding="utf-8") as f:
     f.write("marker_name=%s\n" % marker_name)
     f.write("last_line=%s\n" % (last_line[:120] if last_line else ""))
 
-if stream_message and not message:
+# What the round's answer is, and therefore what may be archived as it. codex: the -o file and nothing
+# else -- its event stream is evidence, never the verdict. pi has no -o file, so its last assistant
+# message is the answer by the backend's own documentation.
+if reviewer == "pi":
+    if message:
+        final_message = message
+else:
+    message = final_message.strip()
+
+# A transcript-only message is shown, never archived as the answer. An empty -o file is the
+# 'no final message' case whatever the stream says: treating the stream as the -o result turned a
+# refused round into a passing one, which is the verdict check's whole job.
+if stream_message.strip() and stream_message.strip() != final_message:
+    # Read by the failure report below, and removed with the round's capture files once it is archived:
+    # this was a durable last-review.jsonl.stream-message, which the next round had to clear to avoid
+    # showing the previous round's message as this round's evidence.
     with open(events_path + ".stream-message", "w", encoding="utf-8") as f:
         f.write(stream_message + "\n")
 PY
@@ -1859,7 +2108,7 @@ fi
 
 set_concluded "$([[ "$CODE" -eq 0 ]] && echo yes || echo no)"
 
-stamp="$(archive_round "${REASON:-none}" "$CODE")"
+stamp="$(archive_round "${REASON:-none}" "$CODE")" || ARCHIVE_FAILED=1
 
 # The speed was requested, not delivered. The review is still valid -- codex answered at its default
 # speed -- so the round keeps its verdict and its exit code, but the mismatch is never left silent.
@@ -1885,6 +2134,9 @@ if [[ "$REASONING_EFFORT_REJECTED" == "yes" ]]; then
 fi
 
 if [[ "$CODE" -eq 0 ]]; then
+    # The classification pass has already written this round's completed message to last-message.txt, so
+    # the readable copy is named from there: last-plan.txt for a design round, last-review.txt for a
+    # review. One copy, under the name a reader expects.
     cp "$MESSAGE_FILE" "$OUTPUT_FILE"
     echo
     cat "$OUTPUT_FILE"
@@ -1893,7 +2145,12 @@ fi
 
 echo >&2
 echo "This round produced no review: $REASON." >&2
-echo "Exit $CODE ($REVIEWER itself exited $status). Evidence: $ROUNDS_DIR/$stamp-*" >&2
+if [[ "$ARCHIVE_FAILED" == 1 ]]; then
+    echo "Exit $CODE ($REVIEWER itself exited $status). The archive is incomplete; the round's capture" >&2
+    echo "files are in $STATE_DIR and last-message.txt is unchanged." >&2
+else
+    echo "Exit $CODE ($REVIEWER itself exited $status). Evidence: $ROUNDS_DIR/$stamp-*" >&2
+fi
 if [[ -n "$cli_error" ]]; then
     echo "$REVIEWER reported: $cli_error" >&2
 fi
@@ -1902,7 +2159,11 @@ if [[ -s "$STDERR_FILE" ]]; then
     tail -5 "$STDERR_FILE" >&2
 fi
 if [[ -s "$MESSAGE_FILE" ]]; then
-    echo "--- the final message, as it arrived (unverified) ---" >&2
+    if [[ -s "$JSON_FILE.final-message" && "$(cat "$MESSAGE_FILE")" != "$(cat "$JSON_FILE.final-message")" ]]; then
+        echo "--- a message in the event stream, not the CLI's final message (unverified) ---" >&2
+    else
+        echo "--- the final message, as it arrived (unverified) ---" >&2
+    fi
     cat "$MESSAGE_FILE" >&2
 elif [[ -s "$JSON_FILE.stream-message" ]]; then
     echo "--- a message in the event stream, not the CLI's final message (unverified) ---" >&2

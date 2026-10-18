@@ -166,6 +166,18 @@ case "$mode" in
     # The sharper counter-example: the same generic phrase about a *different* setting, which must not be
     # archived as a service-tier rejection.
     other-setting) start; other_setting_rejected_item; msg "$(passing)"; turn_done ;;
+    # The shape that made the archive grow without bound: a completed turn whose transcript carries the
+    # output of a large command, reported once when the tool ran it and once when it finished.
+    big-output)   start
+                  python3 -c 'import json; chunk="x"*200000; print(json.dumps({"type":"item.completed","item":{"type":"command_execution","id":"c1","command":"cat big.txt","aggregated_output":chunk,"exit_code":0}}))'
+                  msg "$(passing)"; turn_done ;;
+    # A failed command: the archive has to say it failed, and keep a bounded tail of what it printed.
+    failed-command) start
+                  python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"command_execution","id":"c2","command":"cargo test","status":"failed","exit_code":101,"aggregated_output":"test result: FAILED. 3 passed; 1 failed\n" + "y"*50000}}))'
+                  msg "$(passing)"; turn_done ;;
+    # The round's answer exists only in its stream and the -o file it was given is empty: the message is
+    # still this round's and must be archived, not silently replaced by codex's empty -o result.
+    empty-output) start; msg "$(passing)"; turn_done; : > "$out" ;;
 esac
 exit 0
 STUB
@@ -350,11 +362,39 @@ echo "a message that merely mentions review"
 run unclear
 check "it is refused" 1 "REVIEW-STATUS" "$tmp/err.txt"
 
+echo "a message in the stream must not pass for the -o result"
+# An empty -o file is the 'no final message' refusal, whatever the stream says. Promoting the streamed
+# text to the round's message turned this refusal into a passing round -- a regression that only a
+# counter-example catches, because both halves look like a review.
+run empty-output
+check "it is refused" 1 "no final message" "$tmp/err.txt"
+expect "the streamed text is still shown as evidence" "审查结论" "$tmp/err.txt"
+expect "labelled as not the CLI's final message" "not the CLI's final message" "$tmp/err.txt"
+if [[ -e .agent-review/rounds/$(basename "$(ls -t .agent-review/rounds/*-outcome.txt | head -1)" -outcome.txt)-review.txt ]]; then
+    echo "  FAIL the streamed text was archived as the round's review"
+    failures=$((failures + 1))
+else
+    echo "  ok   and no review file was archived for it"
+fi
+
 echo "a message only in the event stream, with no final-message file"
 run events-only
 check "it is refused" 1 "no final message" "$tmp/err.txt"
 expect "the stream message is shown as evidence" "not the CLI's final message" "$tmp/err.txt"
 expect "the stream message itself is shown" "审查结论" "$tmp/err.txt"
+# A capture file that outlived its round is what let a later round show it as its own evidence. The
+# round is archived and its capture files go with it, so this is the regression the archive cleanup
+# has to keep: the next row below asserts the reuse itself, this one asserts the reason is gone.
+# The stream fallback (round-events.jsonl.stream-message) is deliberately not in this list: the failure
+# report reads it after the archive removes the rest, and the next round's start clears it.
+for leftover in round-events.jsonl round-events.jsonl.final-message; do
+    if [[ -e ".agent-review/$leftover" ]]; then
+        echo "  FAIL $leftover survived the round it belonged to"
+        failures=$((failures + 1))
+    else
+        echo "  ok   $leftover is removed once the round is archived"
+    fi
+done
 
 echo "messages that say the review has not finished"
 counter=0
@@ -467,21 +507,14 @@ run hang --timeout 08
 check "the watchdog still ends it" 124 "did not finish within 8s" "$tmp/err.txt"
 
 echo "an older round's streamed message is not this round's evidence"
-# The stream fallback file was not cleared, so a failed round could print the previous round's message as its
-# own evidence.
-run events-only
-check "the stream-only round is refused" 1 "no final message" "$tmp/err.txt"
-if [[ -f .agent-review/last-review.jsonl.stream-message ]]; then
-    run fail
-    if grep -q "not the CLI's final message" "$tmp/err.txt"; then
-        echo "  FAIL a stale streamed message was shown as this round's evidence"
-        failures=$((failures + 1))
-    else
-        echo "  ok   the previous round's streamed message is not reused"
-    fi
-else
-    echo "  FAIL no streamed message was written, so the reuse check could not run"
+# The case above proved the stream fallback is written. This is the reuse it must never allow: a failed
+# round must not print the previous round's message as its own evidence.
+run fail
+if grep -q "not the CLI's final message" "$tmp/err.txt"; then
+    echo "  FAIL a stale streamed message was shown as this round's evidence"
     failures=$((failures + 1))
+else
+    echo "  ok   the previous round's streamed message is not reused"
 fi
 
 echo "a timeout too large for bash arithmetic"
@@ -866,7 +899,7 @@ int_task="interrupted-start"
 rm -rf ".agent-review/tasks/$int_task"
 STUB_MODE=hang PATH="$tmp/bin:$PATH" ./scripts/agent-review.sh --task "$int_task" >/dev/null 2>&1 &
 int_pid=$!
-for _ in $(seq 1 100); do [[ -s ".agent-review/tasks/$int_task/last-review.jsonl" ]] && break; sleep 0.1; done
+for _ in $(seq 1 100); do [[ -s ".agent-review/tasks/$int_task/round-events.jsonl" ]] && break; sleep 0.1; done
 for _ in $(seq 1 100); do [[ -s ".agent-review/tasks/$int_task/codex-session-id" ]] && break; sleep 0.1; done
 kill -TERM "$int_pid" 2>/dev/null
 set +e
@@ -1174,6 +1207,39 @@ run error-then-ok
 check "a pi run that recovered on a later message passes" 0 - "$tmp/out.txt"
 expect "and the recovered final answer is the one used" "本轮通过" "$tmp/out.txt"
 
+echo "a pi round's answer survives the archive"
+# pi has no -o file, so its answer exists only in the event stream, and the archive keeps the stream's
+# summary rather than the stream. Dropping pi's own event names would leave the answer outside the
+# summary; a broken line beside it then makes the summary non-empty, so the raw-file fallback no longer
+# applies and the answer is lost with the capture file. This fixture is exactly that case.
+pi_events="$(ls -t .agent-review/rounds/*-events.jsonl | head -1)"
+expect "the pi answer is archived" "REVIEW-STATUS: PASS" "$pi_events"
+expect "the summary keeps pi's session header" "\"type\": \"session\"" "$pi_events"
+expect "and its settled boundary" "agent_settled" "$pi_events"
+expect "and its final message" "message_end" "$pi_events"
+
+echo "a pi stream with an unparsable line still summarises to its answer"
+# The same fixture with one line the summariser cannot read: the answer must still be in the summary,
+# which is all the archive keeps once the capture file is removed.
+printf '%s\n' '{"type":"session","version":3,"id":"pi-broken"}' 'not json at all' \
+    '{"type":"agent_settled","aborted":false}' > "$tmp/pi-broken.jsonl"
+# Cut by line numbers rather than by a pattern: the function's body is a heredoc, whose closing PY is
+# not an end of function, so a /^}$/ match would slice through the middle of the python.
+sum_start="$(grep -n '^summarize_events() {' ./scripts/agent-review.sh | head -1 | cut -d: -f1)"
+sum_py="$(awk -v s="$sum_start" 'NR > s && /^PY$/ { print NR; exit }' ./scripts/agent-review.sh)"
+# Two lines past the heredoc's closing PY: the command substitution's own `}` is the first.
+sum_end="$(awk -v s="$sum_py" 'NR > s && /^}$/ { n++; if (n == 2) { print NR; exit } }' ./scripts/agent-review.sh)"
+sed -n "${sum_start},${sum_end}p" ./scripts/agent-review.sh > "$tmp/summarize.sh"
+if bash -c "source '$tmp/summarize.sh' && summarize_events '$tmp/pi-broken.jsonl' '$tmp/pi-broken-summary.jsonl'" \
+        2>/dev/null \
+    && grep -q 'not json at all' "$tmp/pi-broken-summary.jsonl" \
+    && grep -q 'agent_settled' "$tmp/pi-broken-summary.jsonl"; then
+    echo "  ok   the unparsable line and the boundary both survive the summary"
+else
+    echo "  FAIL the summary lost the broken line or the boundary"
+    failures=$((failures + 1))
+fi
+
 echo "the reviewer is required and has no default"
 rm -f agent-review.toml
 run ok
@@ -1372,8 +1438,10 @@ expect_absent "and it is not misreported as a tier rejection" "did not accept th
 STUB_MODE=error-item run error-item
 check "an unrelated error item does not fail the round" 0 - "$tmp/out.txt"
 # The fixture is asserted to have emitted its error: without this, a call that silently ran the happy
-# path would satisfy every "no tier rejection" assertion below it.
-expect "the fixture really emitted an error item" "stream disconnected before completion" .agent-review/last-review.jsonl
+# path would satisfy every "no tier rejection" assertion below it. Read from the round's archive, because
+# the raw capture file is removed with the round it belonged to.
+last_events="$(ls -t .agent-review/rounds/*-events.jsonl | head -1)"
+expect "the fixture really emitted an error item" "stream disconnected before completion" "$last_events"
 expect_absent "and it is not reported as a tier rejection" "did not accept the requested service tier" "$tmp/err.txt"
 last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
 expect "with no rejection in the archive" "service_tier_rejected=no" "$last_outcome"
@@ -1384,8 +1452,9 @@ expect "and not as an effort rejection either" "reasoning_effort_rejected=no" "$
 # mode that the call then overrides runs the happy path, and the counter-example proves nothing.
 STUB_MODE=other-setting run other-setting
 check "a rejection of another setting is not a failed round" 0 - "$tmp/out.txt"
-expect "the fixture really emitted the other setting's rejection" "verbosity" .agent-review/last-review.jsonl
-expect "and the generic phrase really was in it" "not advertised as supported for model" .agent-review/last-review.jsonl
+last_events="$(ls -t .agent-review/rounds/*-events.jsonl | head -1)"
+expect "the fixture really emitted the other setting's rejection" "verbosity" "$last_events"
+expect "and the generic phrase really was in it" "not advertised as supported for model" "$last_events"
 expect_absent "and it is not reported as a tier rejection either" "did not accept the requested service tier" "$tmp/err.txt"
 expect_absent "and not as an effort rejection either" "did not accept the requested reasoning effort" "$tmp/err.txt"
 last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
@@ -1480,6 +1549,159 @@ else
     echo "  FAIL the interruption was not recorded"
     failures=$((failures + 1))
 fi
+
+echo "a round's capture files do not outlive the round"
+# The raw stream is a work file: it is archived as a summary and removed, so the next round cannot read
+# it as its own output. The stream fallback is the one that stays, because the failure report reads it
+# after the archive; it is cleared when the next round starts.
+run ok
+for leftover in round-events.jsonl round-events.jsonl.final-message round-events.jsonl.summary; do
+    if [[ -e ".agent-review/$leftover" ]]; then
+        echo "  FAIL $leftover outlived its round"
+        failures=$((failures + 1))
+    else
+        echo "  ok   $leftover is removed with its round"
+    fi
+done
+expect "the durable copy of the review is kept" "REVIEW-STATUS: PASS" .agent-review/last-message.txt
+
+echo "the archive keeps the evidence and not the transcript"
+# Measured on this repository's own archive: the reviewer's command output was ~97% of the bytes and
+# none of it explains the round. The summary keeps the boundaries, the message and the command itself.
+run big-output
+check "a round with a large transcript still passes" 0 - "$tmp/out.txt"
+big_events="$(ls -t .agent-review/rounds/*-events.jsonl | head -1)"
+big_size="$(wc -c < "$big_events" | tr -d ' ')"
+if [[ "$big_size" -lt 20000 ]]; then
+    echo "  ok   the archived summary is $big_size bytes, not the 200 KB the command printed"
+else
+    echo "  FAIL the command output was archived in full ($big_size bytes)"
+    failures=$((failures + 1))
+fi
+expect "the summary names the command the reviewer ran" "cat big.txt" "$big_events"
+expect "and keeps the turn boundary" "turn.completed" "$big_events"
+expect "and keeps the final message" "REVIEW-STATUS: PASS" "$big_events"
+
+echo "a failed command's result survives the summary"
+# The one thing the summary must not drop about a command is how it ended: a reviewer diagnosing a
+# failed test run has nothing to explain it with if exit_code and the tail are cut as 'output'.
+run failed-command
+check "the round still passes" 0 - "$tmp/out.txt"
+failed_events="$(ls -t .agent-review/rounds/*-events.jsonl | head -1)"
+expect "the exit code is archived" "\"exit_code\": 101" "$failed_events"
+expect "the failure status is archived" "\"status\": \"failed\"" "$failed_events"
+expect "and a bounded excerpt of what it printed" "test result: FAILED" "$failed_events"
+failed_size="$(wc -c < "$failed_events" | tr -d ' ')"
+if [[ "$failed_size" -lt 20000 ]]; then
+    echo "  ok   and the tail is bounded ($failed_size bytes, not the 50 KB printed)"
+else
+    echo "  FAIL the failed command's output was archived in full ($failed_size bytes)"
+    failures=$((failures + 1))
+fi
+
+echo "an archive that cannot be written does not delete the round's evidence"
+# The caller reads the stamp from a command substitution, so a failed copy under errexit is invisible
+# inside it. With the archive unwritable the round must still keep its capture file and say so.
+mkdir -p .agent-review/rounds && chmod 500 .agent-review/rounds
+run fail
+chmod 700 .agent-review/rounds
+check "the round is reported as failed" 1 "exited 1" "$tmp/err.txt"
+expect "and the report says the archive is incomplete" "archive is incomplete" "$tmp/err.txt"
+if [[ -s .agent-review/round-events.jsonl ]]; then
+    echo "  ok   the capture file was kept"
+else
+    echo "  FAIL the capture file was deleted although it was not archived"
+    failures=$((failures + 1))
+fi
+kept_copy="$(ls .agent-review/round-events.jsonl 2>/dev/null)"
+
+echo "the next round sets an unarchived capture file aside instead of overwriting it"
+# Survival of the file above is only half the promise: the round after it used to delete whatever it
+# found. It is moved to unarchived/ under a stamp, the round proceeds, and nothing says it was archived.
+run ok
+check "the next round still runs after an incomplete archive" 0 - "$tmp/out.txt"
+expect "and says it kept the earlier evidence" "Kept an unarchived capture file" "$tmp/err.txt"
+kept_stamp="$(ls .agent-review/unarchived/*/round-events.jsonl 2>/dev/null | head -1)"
+if [[ -n "$kept_stamp" && -s "$kept_stamp" ]]; then
+    echo "  ok   the earlier round's capture file survives under its own stamp"
+else
+    echo "  FAIL the earlier round's capture file was not set aside ($kept_copy)"
+    failures=$((failures + 1))
+fi
+
+echo "two sets of evidence preserved in the same second both survive"
+# A second-resolution stamp is not unique, and mv overwrites silently: two failures inside one second
+# and the second 'kept' call destroyed the first. mkdir serves as the reservation and fails on an
+# existing name, so the second set gets a fresh directory.
+#
+# The collision is made certain rather than hoped for: a date(1) earlier on PATH returns the same
+# instant for every call, so both runs land on one stamp whatever the wall clock does. Without that,
+# two runs a second apart would never take the suffix branch and this case could pass on a broken
+# implementation.
+mkdir -p "$tmp/datebin"
+# BSD date answers -j/-f, GNU date answers -d; whichever this machine has, the stamp must come out the
+# same on every call, so both spellings are tried before giving up on the fixture.
+cat > "$tmp/datebin/date" <<'FAKEDATE'
+#!/bin/sh
+if /bin/date -j -f '%Y-%m-%d %H:%M:%S' '2026-01-01 00:00:00' -u +%Y%m%dT%H%M%SZ 2>/dev/null; then
+    exit 0
+fi
+exec /bin/date -u -d '2026-01-01 00:00:00' +%Y%m%dT%H%M%SZ
+FAKEDATE
+chmod +x "$tmp/datebin/date"
+rm -rf .agent-review/unarchived
+printf 'first round\n' > .agent-review/round-events.jsonl
+PATH="$tmp/datebin:$tmp/bin:$PATH" STUB_MODE=ok ./scripts/agent-review.sh >"$tmp/out.txt" 2>"$tmp/err.txt"
+echo $? > "$tmp/exit.txt"
+check "the first preserve runs" 0 - "$tmp/exit.txt"
+printf 'second round\n' > .agent-review/round-events.jsonl
+PATH="$tmp/datebin:$tmp/bin:$PATH" STUB_MODE=ok ./scripts/agent-review.sh >"$tmp/out.txt" 2>"$tmp/err.txt"
+echo $? > "$tmp/exit.txt"
+check "the second preserve runs" 0 - "$tmp/exit.txt"
+if grep -q 'fakedate\|exec /bin/date' "$tmp/err.txt"; then
+    echo "  FAIL the stub date did not run ($(cat "$tmp/err.txt" | head -2))"
+    failures=$((failures + 1))
+fi
+kept_count="$(ls .agent-review/unarchived/*/round-events.jsonl 2>/dev/null | wc -l | tr -d ' ')"
+if [[ "$kept_count" -ge 2 ]] \
+    && grep -q 'first round' .agent-review/unarchived/*/round-events.jsonl \
+    && grep -q 'second round' .agent-review/unarchived/*/round-events.jsonl; then
+    echo "  ok   both sets are kept, with their own contents ($kept_count files)"
+else
+    echo "  FAIL the second preserved set overwrote the first ($kept_count files)"
+    failures=$((failures + 1))
+fi
+if [[ -e .agent-review/round-events.jsonl ]]; then
+    echo "  FAIL this round's capture file was not cleared"
+    failures=$((failures + 1))
+else
+    echo "  ok   and this round starts from a clean capture file"
+fi
+# Refusing beats destroying: when the file cannot be moved, the round does not start at all.
+printf 'x\n' > .agent-review/round-events.jsonl
+rm -rf .agent-review/unarchived && : > .agent-review/unarchived
+run ok
+check "a round that cannot preserve the old evidence refuses to start" 74 "could not be set aside" "$tmp/err.txt"
+expect_absent "and does not report a review" "REVIEW-STATUS: PASS" "$tmp/out.txt"
+rm -f .agent-review/unarchived .agent-review/round-events.jsonl
+
+echo "a draft left in the root belongs to the notes, not the state"
+# A brief or a --note-file draft typed straight into .agent-review/ used to sit next to the state files
+# for ever. It is moved, never deleted, and a --note-file naming its old path still reads it.
+printf '# 方案草稿\n' > .agent-review/brief-selftest.md
+run ok
+expect_value "the draft was moved under notes/" "# 方案草稿" .agent-review/notes/brief-selftest.md
+if [[ -e .agent-review/brief-selftest.md ]]; then
+    echo "  FAIL the draft is still in the root"
+    failures=$((failures + 1))
+else
+    echo "  ok   and is no longer in the root"
+fi
+rm -f .agent-review/notes/brief-selftest.md
+printf '# 旧路径\n' > .agent-review/note-old-path.md
+run ok --note-file .agent-review/note-old-path.md
+check "a --note-file naming the old root path still reads it" 0 - "$tmp/out.txt"
+expect "the note reaches the prompt from notes/" "旧路径" "$tmp/last-prompt.txt"
 
 echo "a relative --note-file"
 echo "备注内容：只审脚本。" > scripts/note.txt
