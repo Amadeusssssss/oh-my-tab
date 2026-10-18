@@ -4,7 +4,7 @@
 
 <br />
 
-<div align="center"><b>——&nbsp;&nbsp;&nbsp;Native macOS window switching, clipboard history, mouse controls, and quick actions&nbsp;&nbsp;&nbsp;——</b></div>
+<div align="center"><b>——&nbsp;&nbsp;&nbsp;A Rust-built macOS toolkit for window switching, clipboard history, mouse control and more&nbsp;&nbsp;&nbsp;——</b></div>
 
 <br />
 
@@ -26,23 +26,15 @@
 
 <br />
 
-oh-my-tab is a macOS menu-bar utility centered on window switching. It uses **Command+Tab** by default (or Option+Tab), shows open windows in a floating overlay, and raises the selected window when the modifier is released. Window activation uses a private SkyLight API together with Accessibility APIs.
+oh-my-tab is a macOS menu-bar tool written in native Rust. It centers on window switching and integrates mouse control, clipboard history, window control, the keystroke display and key bindings. It does not depend on an Electron or Tauri runtime, and every interface is drawn natively.
 
-The app is written in Rust and calls AppKit, CoreGraphics, and ApplicationServices directly through `objc2` FFI, without a Swift bridge or Rust UI framework.
+**Every optional feature can be turned on as needed and toggled at runtime**: the following features are included
 
-**Every optional feature is opt-in and off by default**: clipboard history, mouse control, window control, quick actions, key bindings, the keystroke display, and filters such as hidden/minimized windows all have to be turned on in Settings. Windows on other macOS desktops are the one exception — they are shown by default, and the "Always show windows from other desktops" switch turns them off.
-
-- <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names and window titles, one card per window, multiple displays; switching keeps that app's other windows in order.
-- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: a preview that follows each window's own aspect ratio (extremely wide or tall windows are narrowed to stay readable); needs **Screen Recording** permission, otherwise icon-only cards.
-- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab / Shift+Tab / arrow keys / mouse; the shortcut can be Option+Tab. While the panel is open, Command+W / M / H / Q can optionally close the highlighted window, minimize or restore it, hide its app, or ask that app to quit.
-- <img height="14" src="docs/icons/tools.svg"> **Window control** (optional): Option+arrow keys maximize, snap or minimize; add Shift to move a window to the next display. "Restore previous size", "Hide all windows" and "Show all windows" are bindable too.
-- <img height="14" src="docs/icons/zap.svg"> **Quick actions** (optional): Option+I/E/D/L open macOS System Settings, a new Finder window, the desktop and the lock screen; a second, unbound-by-default action opens a small Finder window instead, and double-tap Control locates the pointer.
-- <img height="14" src="docs/icons/gear.svg"> **Key bindings** (optional): one editable list — add a shortcut, change its chord, switch it off or delete it, without a separate window-control page.
-- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images and files — search, filters, pin, delete and undo, expiry, and encrypted storage.
-- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration and side-button → shortcut mapping.
-- <img height="14" src="docs/icons/star.svg"> **Appearance and settings**: light / dark / system, panel material (Liquid Glass, frosted glass or opaque), glass transparency (Liquid Glass only), corner radius, and card/footer text size.
-- <img height="14" src="docs/icons/eye.svg"> **Keystroke display** (optional): a draggable panel that shows the keys you press as separate keycaps, with a maximum length and an optional hardware-level input source; it stays quiet while secure input is active.
-- <img height="14" src="docs/icons/globe.svg"> **Languages, logs and backup**: English / Simplified / Traditional Chinese following the system; rotating logs cleaned up after 30 days; export and import the whole configuration as one TOML file.
+- <img height="14" src="docs/icons/stack.svg"> **Window switcher**: an optional Windows-style or macOS-style window switcher.
+- <img height="14" src="docs/icons/copy.svg"> **Clipboard history**: a clipboard history for images and text, encrypted and persisted with the macOS keychain, so it survives a restart.
+- <img height="14" src="docs/icons/sliders.svg"> **Mouse control**: adjust scroll speed, acceleration and similar parameters without affecting the trackpad.
+- <img height="14" src="docs/icons/zap.svg"> **Key bindings**: bind keys to quick actions, or remap keys (key remapping is in development)
+- <img height="14" src="docs/icons/eye.svg"> **Keystroke display**: shows the key being pressed right now; nothing is shown while you type a password.
 
 <br />
 

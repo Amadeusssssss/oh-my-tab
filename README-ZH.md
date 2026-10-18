@@ -4,7 +4,7 @@
 
 <br />
 
-<div align="center"><b>——&nbsp;&nbsp;&nbsp;原生 macOS 窗口切换、历史剪贴板、鼠标控制与快捷操作&nbsp;&nbsp;&nbsp;——</b></div>
+<div align="center"><b>——&nbsp;&nbsp;&nbsp;rust开发的 macOS 窗口切换、历史剪贴板、鼠标控制等工具箱套件&nbsp;&nbsp;&nbsp;——</b></div>
 
 <br />
 
@@ -26,21 +26,15 @@
 
 <br />
 
-oh-my-tab 是一款使用 Rust 原生开发的 macOS 菜单栏工具，以窗口切换为核心，集成了鼠标控制、历史剪贴板、窗口控制和快捷操作，不依赖 Electron 或 Tauri 运行时。
+oh-my-tab 是一款使用 Rust 原生开发的 macOS 菜单栏工具，以窗口切换为核心，集成了鼠标控制、历史剪贴板、窗口控制、按键显示和按键绑定，不依赖 Electron 或 Tauri 运行时，所有界面都使用原生绘制。
 
-**所有可选功能都按需启用、默认关闭**：历史剪贴板、鼠标控制、窗口控制、快捷操作、按键绑定、按键显示，以及“隐藏与最小化窗口”这类筛选，都要在设置里手动打开。唯一的例外是其他 macOS 桌面的窗口：它们默认显示，可在设置里用「始终显示其他桌面的窗口」关闭。
+**所有可选功能都可按需启用并热插拔**：包含以下功能
 
-- <img height="14" src="docs/icons/stack.svg"> **窗口切换器**：应用名与窗口标题、每窗口一张卡片、多显示器；切换时该应用其他窗口保持原顺序。
-- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**：预览按窗口自身的宽高比显示（比例极端时收窄到合理范围）；需要**屏幕录制**权限，未授权时退化为纯图标卡片。
-- <img height="14" src="docs/icons/key.svg"> **灵活导航**：Tab / Shift+Tab / 方向键 / 鼠标；快捷键可改为 Option+Tab。浮窗打开期间，还可以选用 Command+W / M / H / Q 关闭当前高亮窗口、最小化或还原它、隐藏它所属的应用，或请求该应用退出。
-- <img height="14" src="docs/icons/tools.svg"> **窗口控制**（可选）：Option+方向键最大化、分屏、最小化；加 Shift 移到相邻显示器。「恢复之前的窗口尺寸」「隐藏所有窗口」「显示所有窗口」也可以自行绑定。
-- <img height="14" src="docs/icons/zap.svg"> **快捷操作**（可选）：Option+I/E/D/L 打开 macOS 系统设置、新建访达窗口、桌面与锁屏；另有一个默认未绑定的小窗口访达动作，双击 Control 定位鼠标。
-- <img height="14" src="docs/icons/gear.svg"> **按键绑定**（可选）：一份可编辑列表——自行添加快捷键、修改组合键、单独关闭或删除，不再分成两个页面。
-- <img height="14" src="docs/icons/copy.svg"> **历史剪贴板**（可选）：文本、图片与文件条目，可搜索、按类型筛选、置顶、删除与撤销、过期，并加密持久化。
-- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**（可选）：滚动模式、反向滚动、按设备指针加速、侧键 → 快捷键映射。
-- <img height="14" src="docs/icons/star.svg"> **外观与设置**：浅色 / 深色 / 跟随系统、面板材质（液态玻璃 / 磨砂玻璃 / 不透明）、玻璃透明度（仅液态玻璃）、圆角，以及卡片与页脚字号。
-- <img height="14" src="docs/icons/eye.svg"> **按键显示**（可选）：可拖动的浮窗，把按下的键拆成独立键帽显示，可限制最大长度、可选用硬件层输入源；安全输入生效时保持安静。
-- <img height="14" src="docs/icons/globe.svg"> **语言、日志与备份**：简繁英跟随系统；日志滚动，旧备份 30 天后清理；可把整份配置导出为一个 TOML 文件，并在本机或另一台 Mac 上导入。
+- <img height="14" src="docs/icons/stack.svg"> **窗口切换器**：可选的Windows风格或MacOS风格的窗口切换器。
+- <img height="14" src="docs/icons/copy.svg"> **历史剪贴板**：支持图片和文本的历史剪贴板，使用MacOS钥匙串加密持久化，重启不丢失。
+- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**：可在不影响触摸板的前提下调整滚动速度、加速度等参数。
+- <img height="14" src="docs/icons/zap.svg"> **按键绑定**: 将按键绑定到快捷操作上，或改键（改键功能开发中）
+- <img height="14" src="docs/icons/eye.svg"> **按键显示**：显示当下按下的按键，在输入密码的时候不显示。
 
 ## 通过 Homebrew 安装
 
