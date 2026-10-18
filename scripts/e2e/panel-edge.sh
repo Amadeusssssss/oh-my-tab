@@ -15,7 +15,17 @@
 # `clipboard_picker` vs `clipboard_picker_window` rather than assumed: with `--panel-shadow=off` the window
 # carries no padding at all, so capturing the window rect would lose the margin every shadow cut is taken
 # in. `--panel-backdrop` pins a known surface behind the panel, because a translucent material's tone
-# follows what is behind it. No global hotkey is injected, so this scenario does not steal focus.
+# follows what is behind it.
+#
+# 本场景**会占用用户的屏幕**: `--panel-backdrop` 是一个覆盖整屏、置于最前的普通层窗口,所以每次启动
+# 都会把用户的桌面盖住;随后 `screencapture -x -o -R` 抓取屏幕区域。它不注入全局热键、不激活本 app,
+# 也不改系统偏好,所以既不是 E2E_STEALS_FOCUS 也不是 E2E_CHANGES_PREFS —— 这三件事对使用者是不同的
+# 同意,本场景声明自己那一件。
+# This scenario DOES cover the user's screen: `--panel-backdrop` is a full-screen window ordered to the
+# front, so every launch hides the desktop behind it, and `screencapture -x -o -R` then captures screen
+# content. It injects no global hotkey and changes no system preference, which is why it declares the
+# screen gate rather than one of the other two.
+# E2E_COVERS_SCREEN=1
 set -euo pipefail
 
 # The repository is resolved to an absolute path ONCE, before anything changes directory: a trap that
@@ -36,8 +46,8 @@ restore() {
         exit 1
     }
     if ! scripts/dev-restart.sh --no-onboarding >/dev/null 2>&1; then
-        echo "panel-edge: the clean relaunch FAILED; the app may still carry --panel-backdrop/--panel-outline/--panel-shadow"
-        exit 1
+        echo "panel-edge: the clean relaunch FAILED; the app may still carry --panel-backdrop/--panel-outline/--panel-shadow" >&2
+        [ "$status" -ne 0 ] || status=1
     fi
     # Every process with that name, not just the first: the release and development builds are both
     # `oh-my-tab`, so finding a clean one proves nothing about a development instance still carrying a
@@ -45,8 +55,8 @@ restore() {
     local pid
     for pid in $(pgrep -x oh-my-tab || true); do
         if ps -o command= -p "$pid" | tr ' ' '\n' | grep -qE '^--(panel-backdrop|panel-outline|panel-shadow)'; then
-            echo "panel-edge: pid $pid is still running with a development switch after the restore"
-            exit 1
+            echo "panel-edge: pid $pid is still running with a development switch after the restore" >&2
+            [ "$status" -ne 0 ] || status=1
         fi
     done
     exit "$status"
@@ -133,8 +143,6 @@ launch() {  # <label> <switches...>
     RELAUNCH_SWITCHES=("$@")
     local log
     log="$(mktemp -t panel-edge-launch)"
-    pkill -f "Oh-My-Tab-Dev.app" 2>/dev/null || true
-    sleep 1
     rm -f "$state"
     if ! scripts/dev-restart.sh --no-onboarding --show-clipboard --e2e-state="$state" "$@" >"$log" 2>&1; then
         echo "panel-edge: dev-restart.sh failed for the $label launch:"

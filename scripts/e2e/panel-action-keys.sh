@@ -43,6 +43,7 @@ for arg in "$@"; do
 done
 
 fail() { echo "e2e panel-action-keys: FAIL: $*" >&2; exit 1; }
+controlled_pid=""
 
 # 触发键只支持 Command / Option 两种模式,与 app 的 keyboard.modifier 一致。
 case "$hotkey" in
@@ -81,7 +82,12 @@ tell application "TextEdit"
     end if
 end tell
 APPLESCRIPT
-    pkill -x TextEdit >/dev/null 2>&1 || true
+    # By the pid this scenario recorded, not by name: the scenario refuses to start when TextEdit is
+    # already running, so the pid it captured IS the TextEdit it opened -- but naming the pid keeps the
+    # cleanup honest if that ever changes (a name-based kill would reach an editor the user opened later).
+    if [ -n "${controlled_pid:-}" ] && kill -0 "$controlled_pid" 2>/dev/null; then
+        kill -TERM "$controlled_pid" 2>/dev/null || true
+    fi
     rm -f "$close_file" "$min_file" "$hide_file" "$state_file" "${state_file%.json}.tmp"
     exit $status
 }

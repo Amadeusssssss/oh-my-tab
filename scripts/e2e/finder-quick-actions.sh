@@ -55,13 +55,14 @@ cleanup() {
     if [ "$config_touched" = "1" ]; then
         # Stop the test instance and confirm it is gone: an orderly exit would write its in-memory
         # temporary config back to disk and overwrite the restore below.
-        launchctl bootout "gui/$(id -u)/oh-my-tab-dev" >/dev/null 2>&1 || true
-        pkill -x 'oh-my-tab' >/dev/null 2>&1 || true
-        for _ in $(seq 1 30); do
-            pgrep -x 'oh-my-tab' >/dev/null 2>&1 || break
-            sleep 0.1
-        done
-        if pgrep -x 'oh-my-tab' >/dev/null 2>&1; then
+        # Stop this build under the launcher's own transaction claim (bootout, identity check, TERM, and a
+        # --check relaunch that leaves nothing running). A name-based kill here would also reach the
+        # packaged install under /Applications, which shares the executable name.
+        if ! "$repo_dir/scripts/dev-restart.sh" --check >/dev/null 2>&1; then
+            echo "e2e finder-quick-actions: the test instance did not stop; leaving the config untouched" >&2
+            cleanup_failed=1
+        fi
+        if pgrep -f "$repo_dir/dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab" >/dev/null 2>&1; then
             echo "e2e finder-quick-actions: the test instance did not exit; leaving the config untouched" >&2
             cleanup_failed=1
         else

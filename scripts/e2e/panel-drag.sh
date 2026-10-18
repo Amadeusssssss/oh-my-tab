@@ -13,9 +13,16 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_dir/scripts/lib/e2e-restore.sh"
 
 state="$(mktemp -t panel-drag-state).json"
 config_file="$HOME/.config/oh-my-tab/config.toml"
+focus_before=""
+focus_recorded=0
+cursor_x=""
+cursor_y=""
+to_x=""
+to_y=""
 build_version=""
 fail=0
 
@@ -29,17 +36,47 @@ restore() {
         echo "panel-drag: cannot return to $repo_dir to restore the app"
         exit 1
     }
+    # The pointer goes back first: a synthetic drag leaves the real pointer where it ended, and that is a
+    # disturbance the run itself caused. Conditional like the front restore below: only while it is still
+    # where the drag left it.
+    if [ -n "${cursor_x:-}" ] && [ -n "${cursor_y:-}" ]; then
+        # Captured with `|| rc=$?`: under `set -e` a bare call would end the trap at its first
+        # non-zero return -- the "user took over" code 2 and the failure code 1 alike -- and skip every
+        # restore after it.
+        local cursor_rc=0
+        omt_restore_cursor "${cursor_x}" "${cursor_y}" "${to_x:-}" "${to_y:-}" 12 || cursor_rc=$?
+        case "$cursor_rc" in
+            0|2) ;;
+            *) [ "$status" -ne 0 ] || status=1 ;;
+        esac
+    fi
+    # The clean relaunch runs BEFORE the endpoint is judged, on purpose: the user sees the machine as the
+    # scenario leaves it, cleanup included, so a teardown that fronts the app is part of what this asserts.
     if ! scripts/dev-restart.sh --no-onboarding >/dev/null 2>&1; then
-        echo "panel-drag: the clean relaunch FAILED; the app may still be a --show-clipboard instance"
-        exit 1
+        echo "panel-drag: the clean relaunch FAILED; the app may still be a --show-clipboard instance" >&2
+        [ "$status" -ne 0 ] || status=1
     fi
     local pid
     for pid in $(pgrep -x oh-my-tab || true); do
         if ps -o command= -p "$pid" | tr ' ' '\n' | grep -qE '^--(show-clipboard|e2e-state)'; then
-            echo "panel-drag: pid $pid is still running with a development switch after the restore"
-            exit 1
+            echo "panel-drag: pid $pid is still running with a development switch after the restore" >&2
+            [ "$status" -ne 0 ] || status=1
         fi
     done
+    # The final endpoint, after every cleanup step: the frontmost application must be the one that was in
+    # front before the first launch. Nothing here may exit early, or a failed cleanup would skip the check.
+    if [ -n "$focus_before" ]; then
+        local app_pid
+        app_pid="$(pgrep -x oh-my-tab 2>/dev/null | head -1 || true)"
+        if ! omt_front_unchanged "$focus_before" "${app_pid:-}"; then
+            echo "panel-drag: the scenario changed the frontmost application" >&2
+            [ "$status" -ne 0 ] || status=1
+        fi
+    elif [ "$focus_recorded" = "1" ]; then
+        # Reached the recording point and got no answer: the claim cannot be checked, which is not a pass.
+        echo "panel-drag: the frontmost application was never recorded; the no-focus claim is unverified" >&2
+        [ "$status" -ne 0 ] || status=1
+    fi
     rm -f "$state"
     exit "$status"
 }
@@ -77,7 +114,6 @@ launch() {  # <label>
     local label="$1"
     local log
     log="$(mktemp -t panel-drag-launch)"
-    pkill -f "Oh-My-Tab-Dev.app" 2>/dev/null || true
     sleep 1
     clear_state
     if ! scripts/dev-restart.sh --no-onboarding --show-clipboard --e2e-state="$state" >"$log" 2>&1; then
@@ -183,6 +219,18 @@ print(
 PY
 }
 
+# Before anything of this scenario runs: the app a user is looking at. Read from the system, not from
+# the app's own snapshot, which only exists once the app is up -- a launch that fronted the app would
+# already be outside that window.
+focus_recorded=1
+focus_before="$(omt_front_pid 2>/dev/null)" || focus_before=""
+if [ -z "$focus_before" ]; then
+    # Refused BEFORE anything is launched: once the app is up, this scenario can no longer tell whether
+    # its own launch fronted something, so a baseline taken afterwards would prove nothing.
+    echo "panel-drag: the frontmost application could not be read; refusing to run the no-focus check without a baseline" >&2
+    exit 1
+fi
+
 echo "panel-drag: launching the picker (--show-clipboard)"
 launch baseline
 if ! wait_for_state "(s.get('clipboard_picker') or {}).get('visible')"; then
@@ -238,7 +286,14 @@ to_y="$(python3 -c 'import sys; print(round(float(sys.argv[1]) + float(sys.argv[
 # Where the pointer was before the gesture: a synthetic drag leaves it where it ended, and in the
 # "follow the cursor" mode that alone would move the next summon. Putting it back keeps the relaunch
 # comparison below about persistence and nothing else.
-read -r cursor_x cursor_y < <(cua get_cursor_position '{}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("x",0), d.get("y",0))')
+cursor_px="$(omt_cursor_px 2>/dev/null)" || cursor_px=""
+read -r cursor_x cursor_y <<<"$cursor_px"
+if [ -z "${cursor_x:-}" ] || [ -z "${cursor_y:-}" ]; then
+    # The drag moves the real pointer; without a baseline the restore cannot honour the user's position,
+    # so the run stops before the gesture rather than dragging and then guessing.
+    echo "panel-drag: the pointer position could not be read; refusing to drag without a baseline" >&2
+    exit 1
+fi
 
 echo "  panel (${panel_x},${panel_y}) ${panel_w}x${panel_h}; handle ${grip_w}x${grip_h} at (${grip_x},${grip_y})"
 echo "  gesture in desktop pixels: from (${from_x},${from_y}) by (${delta_x},${delta_y})pt"
@@ -305,10 +360,13 @@ if [ -f "$config_file" ] && grep -qE '^[[:space:]]*panel_position[[:space:]]*=' 
     problem "the drag wrote a panel position into $config_file; the moved position must last one showing only"
 fi
 
-# Put the pointer back: a desktop-scope gesture moves the real pointer, and in the "follow the cursor"
-# mode where it is left would decide the next summon's position -- the relaunch comparison below is about
-# persistence and nothing else. The query reports points and a desktop move takes pixels, so it is scaled.
-cua move_cursor "{\"scope\": \"desktop\", \"x\": $(python3 -c 'import sys; print(round(float(sys.argv[1]) * float(sys.argv[2])))' "${cursor_x:-0}" "$scale"), \"y\": $(python3 -c 'import sys; print(round(float(sys.argv[1]) * float(sys.argv[2])))' "${cursor_y:-0}" "$scale")}" >/dev/null || true
+# Put the pointer back before the relaunch: a desktop-scope gesture moves the real pointer, and in the
+# "follow the cursor" mode where it is left would decide the next summon's position -- the relaunch
+# comparison below is about persistence and nothing else. The trap repeats this on any exit path.
+if [ -n "${cursor_x:-}" ] && [ -n "${cursor_y:-}" ]; then
+    # A "the user moved it" answer (2) is not an error here, and under `set -e` it would abort the run.
+    omt_restore_cursor "${cursor_x}" "${cursor_y}" "${to_x:-}" "${to_y:-}" 12 || true
+fi
 
 # A fresh launch is a fresh showing: the configured mode decides again, so the panel must be back at the
 # baseline. This is the assertion that "one showing" is real, and it is why the baseline is compared

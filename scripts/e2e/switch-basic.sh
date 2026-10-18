@@ -345,6 +345,6 @@ raise SystemExit(1 if problems else 0)
 PY
 status=$?
 if [ "$status" -eq 0 ]; then
-    echo "e2e: snapshot kept at $state_file (dev app left running; stop with: pkill -f Oh-My-Tab-Dev)"
+    echo "e2e: snapshot kept at $state_file (dev app left running; stop with: scripts/dev-restart.sh --check)"
 fi
 exit "$status"

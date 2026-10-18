@@ -28,6 +28,7 @@
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_dir/scripts/lib/e2e-restore.sh"
 state_file="/tmp/omt-e2e-space-desktops.json"
 config="$HOME/.config/oh-my-tab/config.toml"
 config_backup="/tmp/omt-e2e-space-desktops-config.bak"
@@ -60,19 +61,36 @@ cua-driver status >/dev/null 2>&1 || fail "cua-driver daemon is not running"
 
 # Restore in every exit path: the user's config, a usable app, and the desktop they started on.
 front_app_before=""
+rescue_pid_file="$(mktemp -t omt-space-desktops-rescue-pid)"
+restore_failed=0
 restore() {
+    local status=$?
     if [ -f "$config_backup" ]; then
         cp "$config_backup" "$config"
     fi
-    pkill -f 'Oh-My-Tab-Dev' >/dev/null 2>&1 || true
-    for _ in $(seq 1 40); do
-        pgrep -f 'Oh-My-Tab-Dev' >/dev/null 2>&1 || break
-        sleep 0.1
-    done
+    # The relaunch below also stops this build, under the launcher's transaction claim. A stop
+    # issued here first would happen outside that claim, where a concurrent run may be verifying
+    # that very instance.
     "$repo_dir/scripts/dev-restart.sh" --no-onboarding >/dev/null 2>&1 || true
     if [ -n "$front_app_before" ]; then
-        cua-driver bring_to_front "{\"pid\": $front_app_before}" >/dev/null 2>&1 || true
+        # Conditional: a person who switched apps during the run keeps their own choice, and a
+        # restore that was needed and failed is reported rather than swallowed.
+        front_rc=0
+        driven_pid="${target_pid:-}"
+        if [ -s "$rescue_pid_file" ]; then
+            driven_pid="$(cat "$rescue_pid_file" 2>/dev/null)"
+        fi
+        omt_hand_front_back "$front_app_before" "$driven_pid" || front_rc=$?
+        if [ "$front_rc" -eq 1 ]; then
+            echo "e2e space-desktops: could not hand the front back to pid $front_app_before" >&2
+            restore_failed=1
+        fi
     fi
+    rm -f "$rescue_pid_file"
+    if [ "$restore_failed" -ne 0 ]; then
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 trap restore EXIT
 
@@ -1093,15 +1111,15 @@ app_pid="$(printf '%s\n' "$rescue_out" | sed -n 's/^restart ok (app pid \([0-9][
 [ -n "$app_pid" ] || fail "could not read the app pid for the rescue phase"
 rm -f "$state_file" "${state_file%.json}.tmp"
 
-python3 - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$config" "$repo_dir_verdict" <<'PY' >"$phase2_log"
+python3 - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$config" "$repo_dir_verdict" "$rescue_pid_file" <<'PY' >"$phase2_log"
 import ctypes
 import json
 import subprocess
 import sys
 import time
 
-state_file, app_pid, target_wid, target_pid, config, repo_dir_verdict = (
-    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6],
+state_file, app_pid, target_wid, target_pid, config, repo_dir_verdict, rescue_pid_file = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7],
 )
 sys.path.insert(0, repo_dir_verdict)
 from hotkey import chord as chord_for_config  # noqa: E402  (the path above makes it importable)
@@ -1288,6 +1306,13 @@ try:
         print("NOT RUN: phase 4 has no window on another desktop to switch to")
         raise SystemExit(3)
     target_pid, target_wid = rescue_card["pid"], rescue_card["window_id"]
+    # Handed back to the shell: the app this phase rescued may not be the one phase 1 picked,
+    # and the trap must know which app the last phase actually left in front.
+    try:
+        with open(rescue_pid_file, "w") as handle:
+            handle.write(str(target_pid))
+    except OSError:
+        pass
     target = next((c for c in frame.get("cards", []) if c["window_id"] == target_wid), None)
     check(target is not None, "the other-desktop window is a card", f"cards={frame.get('cards')}")
     if target is None:

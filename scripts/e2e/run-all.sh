@@ -8,16 +8,25 @@
 # 使用者明确同意才跑。场景在头部用标记声明自己抢焦点:
 #   # E2E_STEALS_FOCUS=1
 #
+# 第三类打扰是**屏幕**:场景会在用户的屏幕上钉一个覆盖全屏的背景板,或抓取屏幕内容。它既不是
+# "切换前台 app"也不是"改系统偏好",所以有自己的标记与开关,三者可以叠加:
+#   # E2E_COVERS_SCREEN=1      -> 默认跳过,需要 --include-screen
+# 同意其中一件不等于同意另外两件,所以门是分开的:一个场景全部满足才跑。
+#
 # Why this exists: AGENTS.md lists A2 as a pre-handoff/release gate, and a gate you have to invoke
 # script by script will eventually be run incompletely. Any new executable script dropped into
 # scripts/e2e/ is discovered automatically. Scenarios that steal focus declare it in their header
 # with `# E2E_STEALS_FOCUS=1` and are skipped unless --include-focus is given. Scenarios that
 # temporarily change a system preference declare `# E2E_CHANGES_PREFS=1` and are skipped unless
-# --include-prefs is given (they are never run implicitly: they touch global settings).
+# --include-prefs is given (they are never run implicitly: they touch global settings). Scenarios that
+# pin a full-screen backdrop over the user's desktop or capture the screen declare
+# `# E2E_COVERS_SCREEN=1` and are skipped unless --include-screen is given.
 #
 # 用法:
-#   scripts/e2e/run-all.sh                  # 只跑不抢焦点的场景
+#   scripts/e2e/run-all.sh                  # 只跑不抢焦点、不盖屏、不改偏好的场景
 #   scripts/e2e/run-all.sh --include-focus  # 连抢焦点的场景一起跑(会真的切换前台 app)
+#   scripts/e2e/run-all.sh --include-screen # 连会盖住屏幕/抓屏的场景一起跑
+#   scripts/e2e/run-all.sh --include-prefs  # 连会改系统偏好/用户配置的场景一起跑
 #   scripts/e2e/run-all.sh --include-focus --include-prefs  # 运行抢焦点且改系统偏好的场景
 #   scripts/e2e/run-all.sh --list           # 只看本次会跑哪些场景
 #
@@ -29,21 +38,50 @@ repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"
 e2e_dir="$repo_dir/scripts/e2e"
 include_focus=0
 include_prefs=0
+include_screen=0
 list_only=0
 
 for arg in "$@"; do
     case "$arg" in
         --include-focus) include_focus=1 ;;
         --include-prefs) include_prefs=1 ;;
+        --include-screen) include_screen=1 ;;
         --list) list_only=1 ;;
-        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+        # The range tracks the header above: it ends where the prose ends and the script begins.
+        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
 
+# A scenario declares every disturbance it causes, and the gates are independent: one scenario may need
+# two or three of them, and passing one switch must not admit a scenario that also needs another. The
+# declarations are read from the script's own header, one exact line each, so a marker that merely
+# mentions the name in prose cannot turn a gate on or off.
+scenario_marks() {  # <script> -> prints "focus prefs screen" as 0/1
+    local script="$1" focus=0 prefs=0 screen=0
+    grep -q '^# E2E_STEALS_FOCUS=1$' "$script" && focus=1
+    grep -q '^# E2E_CHANGES_PREFS=1$' "$script" && prefs=1
+    grep -q '^# E2E_COVERS_SCREEN=1$' "$script" && screen=1
+    printf '%s %s %s\n' "$focus" "$prefs" "$screen"
+}
+
+# The gates, in one place, so the aggregate and the offline selftest cannot disagree about them. The
+# order the refusal is named in is the order a person would want to be told: the most disruptive first.
+gate_refusal() {  # <focus> <prefs> <screen> -> prints the switch that would admit it, or nothing
+    local focus="$1" prefs="$2" screen="$3"
+    if [ "$focus" = "1" ] && [ "$include_focus" != "1" ]; then
+        echo "--include-focus"
+    elif [ "$screen" = "1" ] && [ "$include_screen" != "1" ]; then
+        echo "--include-screen"
+    elif [ "$prefs" = "1" ] && [ "$include_prefs" != "1" ]; then
+        echo "--include-prefs"
+    fi
+}
+
 scenarios=()
 skipped=()
 skipped_prefs=()
+skipped_screen=()
 for script in "$e2e_dir"/*.sh; do
     name="$(basename "$script")"
     # 聚合器自己不是场景。
@@ -53,15 +91,14 @@ for script in "$e2e_dir"/*.sh; do
         echo "warning: $name is not executable; skipping" >&2
         continue
     }
-    if grep -q '^# E2E_STEALS_FOCUS=1' "$script" && [ "$include_focus" != "1" ]; then
-        skipped+=("$name")
-        continue
-    fi
-    if grep -q '^# E2E_CHANGES_PREFS=1' "$script" && [ "$include_prefs" != "1" ]; then
-        skipped_prefs+=("$name")
-        continue
-    fi
-    scenarios+=("$script")
+    read -r mark_focus mark_prefs mark_screen <<<"$(scenario_marks "$script")"
+    refusal="$(gate_refusal "$mark_focus" "$mark_prefs" "$mark_screen")"
+    case "$refusal" in
+        --include-focus) skipped+=("$name") ;;
+        --include-screen) skipped_screen+=("$name") ;;
+        --include-prefs) skipped_prefs+=("$name") ;;
+        "") scenarios+=("$script") ;;
+    esac
 done
 
 if [ "${#scenarios[@]}" -eq 0 ]; then
@@ -72,12 +109,16 @@ fi
 if [ "$list_only" = "1" ]; then
     printf 'run: %s\n' "${scenarios[@]##*/}"
     [ "${#skipped[@]}" -gt 0 ] && printf 'skip (steals focus): %s\n' "${skipped[@]}"
+    [ "${#skipped_screen[@]}" -gt 0 ] && printf 'skip (covers the screen): %s\n' "${skipped_screen[@]}"
     [ "${#skipped_prefs[@]}" -gt 0 ] && printf 'skip (changes system prefs): %s\n' "${skipped_prefs[@]}"
     exit 0
 fi
 
 for name in "${skipped[@]:-}"; do
     [ -n "$name" ] && echo "e2e run-all: skipping $name (injects a real global hotkey and steals focus; use --include-focus)"
+done
+for name in "${skipped_screen[@]:-}"; do
+    [ -n "$name" ] && echo "e2e run-all: skipping $name (pins a full-screen backdrop or captures the screen; use --include-screen)"
 done
 for name in "${skipped_prefs[@]:-}"; do
     [ -n "$name" ] && echo "e2e run-all: skipping $name (temporarily changes a system preference; use --include-prefs)"
@@ -132,5 +173,5 @@ if [ -n "$leftover" ]; then
     failures=$((failures + 1))
 fi
 
-echo "e2e run-all: $passed passed, $not_run not run, $failures failed, $(( ${#skipped[@]} + ${#skipped_prefs[@]} )) skipped (focus/prefs)"
+echo "e2e run-all: $passed passed, $not_run not run, $failures failed, $(( ${#skipped[@]} + ${#skipped_screen[@]} + ${#skipped_prefs[@]} )) skipped (focus/screen/prefs)"
 [ "$failures" -eq 0 ]

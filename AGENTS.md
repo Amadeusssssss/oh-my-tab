@@ -69,7 +69,7 @@ Three layers, split by **who decides pass/fail** — not by which transport driv
 | Tier | Decides | How | Repeatable | Gate |
 | --- | --- | --- | --- | --- |
 | A1 | script | Pure-headless tests plus `--smoke-*` runners over the real AppKit view tree; GUI-dependent runners require a macOS graphical session | yes | yes, every change (run the applicable tier; an unavailable GUI tier is unrun, not passed) |
-| A2 | script | `scripts/e2e/*.sh`, run through `scripts/e2e/run-all.sh` (the entry point; scenarios that steal focus are skipped unless `--include-focus`), driven by the `cua-driver` CLI and asserting app-written JSON state (`--e2e-state=<path>`) plus real WindowServer state | yes | before handoff/release |
+| A2 | script | `scripts/e2e/*.sh`, run through `scripts/e2e/run-all.sh` (the entry point; a scenario declares each disturbance in its header -- `E2E_STEALS_FOCUS`, `E2E_COVERS_SCREEN`, `E2E_CHANGES_PREFS` -- and each needs its own switch: `--include-focus`, `--include-screen`, `--include-prefs`), driven by the `cua-driver` CLI and asserting app-written JSON state (`--e2e-state=<path>`) plus real WindowServer state | yes | before handoff/release |
 | B | agent or person | MCP tools plus screenshots: taste, first-pass UI review, failure triage, bug investigation | no | never |
 
 - Anything assertable belongs in A: severity is not the split, assertability is.

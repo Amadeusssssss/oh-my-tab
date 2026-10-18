@@ -376,7 +376,7 @@ cargo test settings_layout_smoke -- --ignored
 
 浮窗运行路径也有一个被忽略的子进程冒烟测试。先运行 `cargo build`，再执行 `cargo test overlay_runtime_smoke -- --ignored`；`--smoke-overlay` 会跳过单实例锁，避免已有开发版实例导致测试未执行却误判通过。
 
-**A2 场景**放在 `scripts/e2e/*.sh`，统一通过 `scripts/e2e/run-all.sh` 运行：它会自动发现该目录下所有可执行脚本，按顺序跑选中的那些。场景在头部用 `# E2E_STEALS_FOCUS=1` 声明自己会经系统事件流注入真实全局热键，这类场景默认跳过，需要显式加 `--include-focus`；声明 `# E2E_CHANGES_PREFS=1`（会改系统偏好）的场景同样默认跳过，需要 `--include-prefs`。`--list` 只打印本次会跑哪些场景。应用通过 `--e2e-state=<path>` 写出 JSON 快照，把脚本无法从辅助功能读到的内部事实自己讲出来；脚本对这些快照加真实 WindowServer 状态做断言；断言「已加密」的场景仍必须自己读磁盘文件，因为应用自述不算证据。
+**A2 场景**放在 `scripts/e2e/*.sh`，统一通过 `scripts/e2e/run-all.sh` 运行：它会自动发现该目录下所有可执行脚本，按顺序跑选中的那些。场景在头部声明自己会造成哪种打扰，每种打扰有独立开关，**互不代替、可叠加（全部满足才跑）**：`# E2E_STEALS_FOCUS=1`（经系统事件流注入真实全局热键，或把 app 激活到前台）需要 `--include-focus`；`# E2E_COVERS_SCREEN=1`（在屏幕上钉覆盖全屏的背景板或抓取屏幕内容）需要 `--include-screen`；`# E2E_CHANGES_PREFS=1`（改系统偏好或用户配置）需要 `--include-prefs`。标记必须独占一行，行尾带注释就不再是标记。`--list` 只打印本次会跑哪些场景。应用通过 `--e2e-state=<path>` 写出 JSON 快照，把脚本无法从辅助功能读到的内部事实自己讲出来；脚本对这些快照加真实 WindowServer 状态做断言；断言「已加密」的场景仍必须自己读磁盘文件，因为应用自述不算证据。
 
 ### 本地化与布局 QA
 

@@ -25,6 +25,8 @@
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_dir/scripts/lib/e2e-restore.sh"
+dev_binary="$repo_dir/dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab"
 state_file="/tmp/omt-e2e-space-groups.json"
 title_fullscreen="omt-space-groups-a.txt"
 title_plain="omt-space-groups-b.txt"
@@ -42,14 +44,44 @@ close_targets() {
     rm -f "$file_fullscreen" "$file_plain"
 }
 # 失败也清理:场景真的会改桌面/全屏状态,不能让测试窗口留在用户桌面上。
-trap close_targets EXIT
+# The front app is recorded before anything runs and handed back at the end: this scenario enters a
+# fullscreen Space, and leaving the user on a different desktop is the disturbance the trap exists for.
+front_app_before=""
+# The app this scenario drives is TextEdit (it opens the probe documents and enters fullscreen), so the
+# ownership test for "may I hand the front back?" must be TextEdit's pid, not oh-my-tab's.
+controlled_pid=""
+restore_all() {
+    local status=$?
+    close_targets
+    # Conditional: a person who switched apps during the run is left where they are.
+    if [ -n "$front_app_before" ]; then
+        # The app this scenario drives is TextEdit (`controlled_pid`), not oh-my-tab: passing the wrong
+        # pid would read "TextEdit is still in front" as "the user switched apps" and skip the restore.
+        # Captured with `|| front_rc=$?`: under `set -e` a bare call would end the trap on code 2
+        # ("the user moved on") before the rest of the cleanup ran.
+        local front_rc=0
+        omt_hand_front_back "$front_app_before" "${controlled_pid:-}" || front_rc=$?
+        case "$front_rc" in
+            0|2) ;;
+            *) [ "$status" -ne 0 ] || status=1 ;;
+        esac
+    fi
+    exit "$status"
+}
+trap restore_all EXIT
+trap 'exit 130' INT TERM
+
+front_app_before="$(omt_front_pid 2>/dev/null)" || front_app_before=""
+if [ -z "$front_app_before" ]; then
+    echo "e2e space-groups: the frontmost application could not be read; refusing to run without a baseline" >&2
+    exit 1
+fi
 
 # Kill any earlier dev instance and wait for it to go before clearing the snapshot: the app writes
 # the file on its own events, so a still-running process would recreate it right after the rm and a
 # scenario waiting for "a newer frame" would then compare against the old process's counter.
-pkill -f 'Oh-My-Tab-Dev' >/dev/null 2>&1 || true
 for _ in $(seq 1 40); do
-    pgrep -f 'Oh-My-Tab-Dev' >/dev/null 2>&1 || break
+    pgrep -f "$dev_binary" >/dev/null 2>&1 || break
     sleep 0.1
 done
 rm -f "$state_file" "${state_file%.json}.tmp"
@@ -64,6 +96,7 @@ open -a TextEdit "$file_fullscreen"
 sleep 1
 open -a TextEdit "$file_plain"
 sleep 2
+controlled_pid="$(pgrep -x TextEdit 2>/dev/null | head -1 || true)"
 
 # 带快照开关启动开发版(不带引导,避免模态窗口干扰场景)。
 echo "e2e: starting the dev build with --e2e-state"
@@ -367,6 +400,6 @@ raise SystemExit(1 if problems else 0)
 PY
 status=$?
 if [ "$status" -eq 0 ]; then
-    echo "e2e: snapshot kept at $state_file (dev app left running; stop with: pkill -f Oh-My-Tab-Dev)"
+    echo "e2e: snapshot kept at $state_file (dev app left running; stop with: scripts/dev-restart.sh --check)"
 fi
 exit "$status"

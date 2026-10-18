@@ -12,32 +12,57 @@
 # focus and cannot run unattended. The development switch summons the same panel and leaves it
 # standing, so the gesture works on the real view tree without touching the focused app.
 #
+# 但**这一下点击本身会抢焦点**: 齿轮走产品自己的入口,会激活 app 并把设置窗口置前
+# (src/settings/window.rs 的 show_settings_inner)。这是被测行为,所以本场景按抢焦点场景声明。
+# The CLICK is what fronts the app: the gear goes through the product's own entry, which activates the
+# app and orders the Settings window front. That is the behaviour under test.
+# E2E_STEALS_FOCUS=1
+#
 # Exit code: 0 = every assertion passed; non-zero = failed, with the reason printed.
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_dir/scripts/lib/e2e-restore.sh"
 
 state="$(mktemp -t switcher-settings-state).json"
 build_version=""
 fail=0
 launched=0
+front_app_before=""
 
 restore() {
     local status=$?
+    # No exit before the last restore step: a failed relaunch must not skip the front restore.
     cd "$repo_dir" || { echo "switcher-settings: cannot return to $repo_dir"; exit 1; }
     if [ "$launched" = 1 ]; then
         if ! scripts/dev-restart.sh --no-onboarding >/dev/null 2>&1; then
-            echo "switcher-settings: the clean relaunch FAILED; the app may still be a --show-overlay instance"
-            exit 1
+            echo "switcher-settings: the clean relaunch FAILED; the app may still be a --show-overlay instance" >&2
+            [ "$status" -ne 0 ] || status=1
         fi
     fi
     local pid
     for pid in $(pgrep -x oh-my-tab || true); do
         if ps -o command= -p "$pid" | tr ' ' '\n' | grep -qE '^--(show-overlay|e2e-state)'; then
-            echo "switcher-settings: pid $pid is still running with a development switch after the restore"
-            exit 1
+            echo "switcher-settings: pid $pid is still running with a development switch after the restore" >&2
+            [ "$status" -ne 0 ] || status=1
         fi
     done
+    # The click fronts the app; hand the front back to whoever had it. Declared focus-stealing, so this
+    # is part of the agreement rather than a courtesy.
+    # Conditional, and reported: hand the front back only while it still belongs to the app this
+    # scenario drove. A person who switched apps during the run has made a newer decision.
+    if [ -n "${front_app_before:-}" ]; then
+        local test_pid
+        test_pid="$(pgrep -x oh-my-tab 2>/dev/null | head -1 || true)"
+        # Captured with `|| front_rc=$?`: under `set -e` a bare call would end the trap on code 2
+        # ("the user moved on") before the rest of the cleanup ran.
+        local front_rc=0
+        omt_hand_front_back "$front_app_before" "${test_pid:-}" || front_rc=$?
+        case "$front_rc" in
+            0|2) ;;
+            *) [ "$status" -ne 0 ] || status=1 ;;
+        esac
+    fi
     rm -f "$state"
     exit "$status"
 }
@@ -65,7 +90,6 @@ launch() {  # <label>
     local label="$1"
     local log
     log="$(mktemp -t switcher-settings-launch)"
-    pkill -f "Oh-My-Tab-Dev.app" 2>/dev/null || true
     sleep 1
     echo '{}' > "$state"
     if ! scripts/dev-restart.sh --no-onboarding --show-overlay --e2e-state="$state" >"$log" 2>&1; then
@@ -102,6 +126,12 @@ PY
     done
     return 1
 }
+
+front_app_before="$(omt_front_pid 2>/dev/null)" || front_app_before=""
+if [ -z "$front_app_before" ]; then
+    echo "switcher-settings: the frontmost application could not be read; refusing to run without a baseline" >&2
+    exit 1
+fi
 
 echo "switcher-settings: launching the overlay (--show-overlay)"
 launch baseline

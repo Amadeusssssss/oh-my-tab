@@ -103,7 +103,6 @@ launch() {  # <label> [extra app args...]
     local label="$1"; shift
     local log
     log="$(mktemp -t settings-open-latency-launch)"
-    pkill -f "Oh-My-Tab-Dev.app" 2>/dev/null || true
     sleep 1
     rm -f "$state" "${state%.json}.tmp"
     # --opt: this is a latency measurement, so the build has to be the representative one.

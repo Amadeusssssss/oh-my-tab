@@ -9,34 +9,78 @@
 #
 # Why --show-keystroke-display: the panel otherwise appears only from a key event, which a script
 # cannot produce without stealing focus. The development switch seeds the same panel through the
-# same input queue the tap uses, and it is nonactivating, so nothing is focused by this run.
+# same input queue the tap uses, and it is nonactivating, so the panel itself is shown without
+# focusing anything.
+#
+# 但**这一下点击本身会抢焦点**: 齿轮走的是产品自己的入口, 它会 setActivationPolicy(.regular) +
+# activateIgnoringOtherApps + makeKeyAndOrderFront(见 src/settings/window.rs 的 show_settings_inner),
+# 把设置窗口带到前台。这正是要验证的产品行为,不能为了"不打扰"把它换掉,所以本场景按抢焦点场景声明。
+# The CLICK is what fronts the app: the gear goes through the product's own entry, which activates the
+# app and orders the Settings window front (src/settings/window.rs, show_settings_inner). That is the
+# behaviour under test, so the scenario declares it instead of softening it.
+# E2E_STEALS_FOCUS=1
 #
 # Exit code: 0 = every assertion passed; non-zero = failed, with the reason printed.
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"
+source "$repo_dir/scripts/lib/e2e-restore.sh"
 
 state="$(mktemp -t hud-settings-state).json"
 build_version=""
 fail=0
 launched=0
+cursor_x=""
+cursor_y=""
+click_x=""
+click_y=""
+front_app_before=""
 
 restore() {
     local status=$?
+    # No exit before the last restore step: each of these is independent, so a failed relaunch must not
+    # skip the pointer and front restores behind it. Failures accumulate into `status`.
     cd "$repo_dir" || { echo "hud-settings: cannot return to $repo_dir"; exit 1; }
     if [ "$launched" = 1 ]; then
         if ! scripts/dev-restart.sh --no-onboarding >/dev/null 2>&1; then
-            echo "hud-settings: the clean relaunch FAILED; the app may still be a development instance"
-            exit 1
+            echo "hud-settings: the clean relaunch FAILED; the app may still be a development instance" >&2
+            [ "$status" -ne 0 ] || status=1
         fi
     fi
     local pid
     for pid in $(pgrep -x oh-my-tab || true); do
         if ps -o command= -p "$pid" | tr ' ' '\n' | grep -qE '^--(show-keystroke-display|e2e-state|keystroke-display-force-on)'; then
-            echo "hud-settings: pid $pid is still running with a development switch after the restore"
-            exit 1
+            echo "hud-settings: pid $pid is still running with a development switch after the restore" >&2
+            [ "$status" -ne 0 ] || status=1
         fi
     done
+    # The click moved the real pointer onto the gear; put it back, and give the user's app the front
+    # back. This scenario declares itself focus-stealing, so the restore is the price of that
+    # agreement -- a failed restore is a failure, not a note.
+    # Conditional: put the pointer back only while it is still where this scenario left it (on the
+    # gear). A person who moved the pointer during the run keeps their position.
+    if [ -n "${cursor_x:-}" ] && [ -n "${cursor_y:-}" ]; then
+        local cursor_rc=0
+        omt_restore_cursor "${cursor_x}" "${cursor_y}" "${click_x:-}" "${click_y:-}" 12 || cursor_rc=$?
+        case "$cursor_rc" in
+            0|2) ;;
+            *) [ "$status" -ne 0 ] || status=1 ;;
+        esac
+    fi
+    # Conditional, and reported: hand the front back only while it still belongs to the app this
+    # scenario drove. A person who switched apps during the run has made a newer decision.
+    if [ -n "${front_app_before:-}" ]; then
+        local test_pid
+        test_pid="$(pgrep -x oh-my-tab 2>/dev/null | head -1 || true)"
+        # Captured with `|| front_rc=$?`: under `set -e` a bare call would end the trap on code 2
+        # ("the user moved on") before the rest of the cleanup ran.
+        local front_rc=0
+        omt_hand_front_back "$front_app_before" "${test_pid:-}" || front_rc=$?
+        case "$front_rc" in
+            0|2) ;;
+            *) [ "$status" -ne 0 ] || status=1 ;;
+        esac
+    fi
     rm -f "$state"
     exit "$status"
 }
@@ -64,7 +108,6 @@ launch() {
     local label="$1"
     local log
     log="$(mktemp -t hud-settings-launch)"
-    pkill -f "Oh-My-Tab-Dev.app" 2>/dev/null || true
     sleep 1
     echo '{}' > "$state"
     # keystroke-display-force-on keeps the module active even when the user's config disables it,
@@ -103,6 +146,27 @@ PY
     done
     return 1
 }
+
+# Recorded before the launch: the pointer (a system query reports points, a desktop move takes pixels,
+# so the scale is applied on the way back) and the app a user is looking at.
+# In desktop pixels, which is the space a desktop-scope move takes: the helper compares this with where
+# the click left the pointer, so both sides must already be in pixels.
+cursor_px="$(omt_cursor_px 2>/dev/null)" || cursor_px=""
+read -r cursor_x cursor_y <<<"$cursor_px"
+if [ -z "${cursor_x:-}" ] || [ -z "${cursor_y:-}" ]; then
+    # The click moves the real pointer, so the restore owes the user their position back. Without a
+    # baseline that restore cannot be made: refuse before anything is moved rather than leave the
+    # pointer on a gear and report PASS.
+    echo "hud-settings: the pointer position could not be read; refusing to run without a baseline" >&2
+    exit 1
+fi
+front_app_before="$(omt_front_pid 2>/dev/null)" || front_app_before=""
+if [ -z "$front_app_before" ]; then
+    # This scenario declares itself focus-stealing, so it owes the user their front back. Without a
+    # baseline that restore cannot be honoured: refuse to start rather than disturb and then guess.
+    echo "hud-settings: the frontmost application could not be read; refusing to run without a baseline" >&2
+    exit 1
+fi
 
 echo "hud-settings: launching the key panel (--show-keystroke-display)"
 launch baseline

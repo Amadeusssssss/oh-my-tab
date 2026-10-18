@@ -33,6 +33,7 @@
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"
+dev_binary="$repo_dir/dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab"
 state_file="/tmp/omt-e2e-tab-repeat.json"
 
 fail() { echo "e2e tab-repeat: FAIL: $*" >&2; exit 1; }
@@ -40,9 +41,8 @@ fail() { echo "e2e tab-repeat: FAIL: $*" >&2; exit 1; }
 command -v cua-driver >/dev/null 2>&1 || fail "cua-driver CLI not found in PATH"
 
 # 清掉上一个进程可能留下的快照:否则"等一帧新的"会拿到上一轮的帧。
-pkill -f 'Oh-My-Tab-Dev' >/dev/null 2>&1 || true
 for _ in $(seq 1 40); do
-    pgrep -f 'Oh-My-Tab-Dev' >/dev/null 2>&1 || break
+    pgrep -f "$dev_binary" >/dev/null 2>&1 || break
     sleep 0.1
 done
 rm -f "$state_file" "${state_file%.json}.tmp"
@@ -554,6 +554,6 @@ raise SystemExit(1 if problems else 0)
 PY
 status=$?
 if [ "$status" -eq 0 ]; then
-    echo "e2e: snapshot kept at $state_file (dev app left running; stop with: pkill -f Oh-My-Tab-Dev)"
+    echo "e2e: snapshot kept at $state_file (dev app left running; stop with: scripts/dev-restart.sh --check)"
 fi
 exit "$status"
